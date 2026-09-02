@@ -80,7 +80,30 @@ def _install_codex_unavailable(*, dry_run: bool, force: bool) -> int:
 
 
 def _doctor_unavailable(*, as_json: bool) -> int:
-    return _command_not_available("doctor")
+    from codecortex.infrastructure.repository import find_repository
+    from codecortex.integrations.codex.doctor import run_doctor
+
+    executable = shutil.which("codecortex")
+    try:
+        repository = find_repository(Path.cwd())
+    except CodeCortexError as error:
+        if error.code is not ErrorCode.NOT_INITIALIZED:
+            raise
+        repository = None
+    report = run_doctor(
+        Path.home(),
+        Path(executable) if executable is not None else Path("codecortex"),
+        repository,
+    )
+    if as_json:
+        json.dump(report.to_dict(), sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        for check in report.checks:
+            print(f"{check.status.upper():7} {check.code}: {check.summary}")
+            if check.action:
+                print(f"         hint: {check.action}")
+    return VALIDATION_FAILED_EXIT if report.has_errors else 0
 
 
 def _mcp_unavailable(*, profile: str) -> int:

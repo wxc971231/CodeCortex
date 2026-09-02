@@ -12,6 +12,24 @@ from codecortex.domain.errors import CodeCortexError
 from codecortex.interfaces.mcp import tools
 
 Profile = Literal["main", "analyzer"]
+READ_TOOL_NAMES = frozenset(
+    {
+        "repository_overview",
+        "cognitive_graph",
+        "inspect_node",
+        "history_event",
+        "validate_graph",
+    }
+)
+MAIN_ONLY_TOOL_NAMES = frozenset(
+    {
+        "initialize_repository",
+        "create_cognitive_proposal",
+        "revise_cognitive_proposal",
+        "cognitive_proposal",
+        "apply_cognitive_proposal",
+    }
+)
 
 LOGGER = logging.getLogger(__name__)
 

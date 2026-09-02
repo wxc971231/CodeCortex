@@ -196,20 +196,6 @@ def test_missing_command_prints_usage_and_exits_2(
     assert "usage" in captured.err.lower()
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [["doctor"], ["doctor", "--json"]],
-)
-def test_commands_without_implementation_exit_2(
-    argv: list[str], capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Doctor remains an unavailable scaffold until Task 11 wires it."""
-    assert main(argv) == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "not available in this build" in captured.err
-
-
 def test_install_codex_receives_flags(cli: CliHarness) -> None:
     """The injected installer receives exactly the parsed flags."""
     cli.install_codex.return_value = 0
