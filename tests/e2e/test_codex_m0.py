@@ -5,7 +5,13 @@ import pytest
 
 @pytest.mark.codex_e2e
 def test_native_codex_survives_broken_codecortex(codex_harness: object) -> None:
-    result = codex_harness.run("exec", "--ephemeral", "--json", "Read README.md and return its first heading.")  # type: ignore[union-attr]
+    result = codex_harness.run(  # type: ignore[union-attr]
+        "exec",
+        "--ephemeral",
+        "--json",
+        "Read README.md and return its first heading.",
+        break_codecortex_mcp=True,
+    )
     assert result.returncode == 0, result.stderr
     assert "M0 Fixture" in result.stdout
 

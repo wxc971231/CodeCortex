@@ -15,6 +15,11 @@ artifact directory or repository and disappears with the temporary test tree.
 
 The test-only MCP configuration sets host approval to `approve`; this exists only because non-interactive CLI tests cannot display an approval dialog. It does not bypass CodeCortex's Proposal approval record checks.
 
+The final audit also changes only the temporary `mcp_servers.codecortex.command`
+to `/missing/codecortex`; the native README test still passed with the MCP
+registration present but broken, proving the intended `required = false`
+fallback rather than merely omitting CodeCortex configuration.
+
 ## Manual VS Code gate (default `prompt` mode)
 
 1. Open a temporary Git repository in VS Code and install CodeCortex normally.

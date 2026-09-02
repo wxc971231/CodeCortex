@@ -15,8 +15,28 @@ class CodexHarness:
     def __init__(self, root: Path, home: Path) -> None:
         self.root, self.home = root, home
 
-    def run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["codex", *arguments], cwd=self.root, env={**os.environ, "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex")}, capture_output=True, text=True, check=False, timeout=180)
+    def run(
+        self, *arguments: str, break_codecortex_mcp: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        if break_codecortex_mcp:
+            config = self.home / CONFIG_RELATIVE
+            document = tomlkit.parse(config.read_text(encoding="utf-8"))
+            document["mcp_servers"]["codecortex"]["command"] = "/missing/codecortex"
+            config.write_text(tomlkit.dumps(document), encoding="utf-8")
+        environment = {
+            **os.environ,
+            "HOME": str(self.home),
+            "CODEX_HOME": str(self.home / ".codex"),
+        }
+        return subprocess.run(
+            ["codex", *arguments],
+            cwd=self.root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=180,
+        )
 
 
 @pytest.fixture
