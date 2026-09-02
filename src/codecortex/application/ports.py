@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from codecortex.domain.cognition import FormalState
+from codecortex.domain.proposals import Proposal
 
 LockMode = Literal["shared", "exclusive"]
 
@@ -35,3 +36,19 @@ class FormalStorePort(Protocol):
 
     def formal_file_presence(self) -> dict[str, bool]:
         """Return required formal-file existence by repository-relative path."""
+
+
+class PendingProposalStorePort(Protocol):
+    """Persist the one current snapshot for each machine-local pending proposal."""
+
+    def create(self, proposal: Proposal) -> None:
+        """Persist a new proposal without replacing an existing identity."""
+
+    def load(self, proposal_id: str) -> Proposal:
+        """Load and validate the current pending proposal state."""
+
+    def replace(self, proposal: Proposal) -> None:
+        """Atomically replace an existing proposal's current state."""
+
+    def delete(self, proposal_id: str) -> None:
+        """Remove a consumed pending proposal if present."""
