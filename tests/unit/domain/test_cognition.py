@@ -1,3 +1,6 @@
+from copy import deepcopy
+from dataclasses import replace
+
 import pytest
 
 from codecortex.domain.cognition import (
@@ -10,6 +13,112 @@ from codecortex.domain.cognition import (
     ValidationIssueCode,
     validate_formal_state,
 )
+
+EVENT_ID = "evt_01J00000000000000000000000"
+ENTITY_ID = "ent_01J00000000000000000000000"
+
+
+def approval() -> dict[str, object]:
+    return {"approval_event_id": EVENT_ID}
+
+
+def valid_linked_state() -> FormalState:
+    nodes = (
+        {
+            "id": "responsibility.repository-understanding",
+            "kind": "responsibility",
+            "node_revision": 1,
+            "approval": approval(),
+        },
+        {
+            "id": "behavior.answer-question",
+            "kind": "behavior",
+            "node_revision": 1,
+            "approval": approval(),
+        },
+        {
+            "id": "capability.search-code",
+            "kind": "capability",
+            "node_revision": 1,
+            "evidence": [
+                {
+                    "id": "evid_01J00000000000000000000000",
+                    "relative_path": "src/search.py",
+                }
+            ],
+            "approval": approval(),
+        },
+        {
+            "id": "capability.parse-code",
+            "kind": "capability",
+            "node_revision": 1,
+            "approval": approval(),
+        },
+    )
+    edges = (
+        {
+            "id": "edge_01J00000000000000000000000",
+            "type": "contains",
+            "source_id": "responsibility.repository-understanding",
+            "target_id": "behavior.answer-question",
+            "edge_revision": 1,
+            "approval": approval(),
+        },
+        {
+            "id": "edge_01J00000000000000000000001",
+            "type": "uses",
+            "source_id": "behavior.answer-question",
+            "target_id": "capability.search-code",
+            "edge_revision": 1,
+            "approval": approval(),
+        },
+        {
+            "id": "edge_01J00000000000000000000002",
+            "type": "depends_on",
+            "source_id": "capability.search-code",
+            "target_id": "capability.parse-code",
+            "edge_revision": 1,
+            "approval": approval(),
+        },
+    )
+    flow = {
+        "behavior_id": "behavior.answer-question",
+        "materialization_status": "materialized",
+        "flow_revision": 1,
+        "steps": [
+            {
+                "id": "behavior.answer-question#step.find-context",
+                "order": 1,
+                "uses_capabilities": ["capability.search-code"],
+                "approval": approval(),
+            }
+        ],
+        "approval": approval(),
+    }
+    mapping = {
+        "id": "map_01J00000000000000000000000",
+        "subject_kind": "flow_step",
+        "subject_id": "behavior.answer-question#step.find-context",
+        "entity_uid": ENTITY_ID,
+        "mapping_revision": 1,
+        "approval": approval(),
+    }
+    return FormalState(
+        manifest=Manifest(1, 1, False, None),
+        graph=CognitiveGraph(1, 1, nodes, edges, (flow,), (mapping,)),
+        entity_refs=EntityRefs(
+            schema_version=1,
+            graph_revision=1,
+            entities=(
+                {
+                    "uid": ENTITY_ID,
+                    "relative_path": "src/search.py",
+                },
+            ),
+        ),
+        source_baseline=SourceBaseline.empty(),
+        history_events=(HistoryEventRef(EVENT_ID, "cognitive_proposal_applied"),),
+    )
 
 
 def empty_state(**overrides: object) -> FormalState:
@@ -149,7 +258,7 @@ def test_m0_revision_may_advance_without_claiming_cognition_initialization() -> 
     state = empty_state(
         manifest=Manifest(1, 1, False, None),
         graph=CognitiveGraph(1, 1, (node,), (), (), ()),
-        entity_refs=EntityRefs(schema_version=1, graph_revision=1, entity_refs=()),
+        entity_refs=EntityRefs(schema_version=1, graph_revision=1, entities=()),
         history_events=(HistoryEventRef(event_id, "cognitive_proposal_applied"),),
     )
 
@@ -286,3 +395,109 @@ def test_graph_evidence_paths_must_be_repository_relative() -> None:
     assert ValidationIssueCode.INVALID_RELATIVE_PATH in {
         issue.code for issue in result.issues
     }
+
+
+def test_valid_edge_mapping_evidence_and_entity_namespaces_are_accepted() -> None:
+    """Over-strict namespace or reference checks would reject a fully linked formal graph."""
+    assert validate_formal_state(valid_linked_state()).valid is True
+
+
+@pytest.mark.parametrize(
+    ("collection", "index", "field", "value", "expected_code"),
+    [
+        (
+            "semantic_edges",
+            0,
+            "source_id",
+            ENTITY_ID,
+            "INVALID_ID_NAMESPACE",
+        ),
+        (
+            "semantic_edges",
+            1,
+            "target_id",
+            "capability.missing",
+            "DANGLING_REFERENCE",
+        ),
+        (
+            "implementation_mappings",
+            0,
+            "entity_uid",
+            "prop_01J00000000000000000000000",
+            "INVALID_ID_NAMESPACE",
+        ),
+        (
+            "implementation_mappings",
+            0,
+            "subject_id",
+            "behavior.missing#step.nowhere",
+            "DANGLING_REFERENCE",
+        ),
+    ],
+)
+def test_edges_and_mappings_reject_wrong_namespaces_or_dangling_subjects(
+    collection: str,
+    index: int,
+    field: str,
+    value: str,
+    expected_code: str,
+) -> None:
+    """Skipping reference resolution would admit links to missing or cross-domain subjects."""
+    state = valid_linked_state()
+    records = deepcopy(getattr(state.graph, collection))
+    records[index][field] = value
+    graph = replace(state.graph, **{collection: records})
+
+    result = validate_formal_state(replace(state, graph=graph))
+
+    assert expected_code in {issue.code.value for issue in result.issues}
+
+
+@pytest.mark.parametrize(
+    ("target", "value"),
+    [
+        ("flow_capability", "responsibility.repository-understanding"),
+        ("evidence", "edge_01J00000000000000000000000"),
+        ("entity", "map_01J00000000000000000000000"),
+    ],
+)
+def test_nested_and_entity_identifiers_reject_cross_namespace_values(
+    target: str, value: str
+) -> None:
+    """A namespace check limited to top-level graph records would miss nested identities."""
+    state = valid_linked_state()
+    if target == "flow_capability":
+        flows = deepcopy(state.graph.logical_flows)
+        flows[0]["steps"][0]["uses_capabilities"] = [value]  # type: ignore[index]
+        state = replace(state, graph=replace(state.graph, logical_flows=flows))
+    elif target == "evidence":
+        nodes = deepcopy(state.graph.nodes)
+        nodes[2]["evidence"][0]["id"] = value  # type: ignore[index]
+        state = replace(state, graph=replace(state.graph, nodes=nodes))
+    else:
+        entities = deepcopy(state.entity_refs.entities)
+        entities[0]["uid"] = value
+        state = replace(
+            state,
+            entity_refs=replace(state.entity_refs, entities=entities),
+        )
+
+    result = validate_formal_state(state)
+
+    assert ValidationIssueCode.INVALID_ID_NAMESPACE in {
+        issue.code for issue in result.issues
+    }
+
+
+@pytest.mark.parametrize(("field", "value"), [("epistemic_status", []), ("created_by", {})])
+def test_malformed_nested_node_values_return_validation_issues(
+    field: str, value: object
+) -> None:
+    """Unhashable nested values must be reported rather than escaping as TypeError."""
+    state = valid_linked_state()
+    nodes = deepcopy(state.graph.nodes)
+    nodes[0][field] = value
+
+    result = validate_formal_state(replace(state, graph=replace(state.graph, nodes=nodes)))
+
+    assert ValidationIssueCode.INVALID_NODE in {issue.code for issue in result.issues}

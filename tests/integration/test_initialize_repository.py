@@ -8,6 +8,7 @@ import pytest
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.infrastructure.formal import FormalStore
+from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.repository import Repository
 
@@ -54,6 +55,9 @@ def test_initialize_creates_exact_valid_empty_formal_state(
     assert json.loads(
         (repo_root / ".codecortex/source_baseline.json").read_text()
     )["files"] == []
+    assert json.loads(
+        (repo_root / ".codecortex/entity_refs.json").read_text()
+    ) == {"entities": [], "graph_revision": 0, "schema_version": 1}
     assert {
         path.relative_to(repo_root / ".codecortex").as_posix()
         for path in (repo_root / ".codecortex").rglob("*")
@@ -128,7 +132,7 @@ def test_initialize_refuses_unsupported_schema_without_overwriting(
     manifest_path = repo_root / ".codecortex/manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["schema_version"] = 2
-    manifest_path.write_text(json.dumps(manifest) + "\n")
+    write_json_atomic(manifest_path, manifest)
     before = digest_tree(repo_root / ".codecortex")
 
     with pytest.raises(CodeCortexError) as exc:
@@ -162,9 +166,9 @@ def test_validate_rejects_dangling_approval_event(
     ]
     refs = json.loads(refs_path.read_text())
     refs["graph_revision"] = 1
-    manifest_path.write_text(json.dumps(manifest) + "\n")
-    graph_path.write_text(json.dumps(graph) + "\n")
-    refs_path.write_text(json.dumps(refs) + "\n")
+    write_json_atomic(manifest_path, manifest)
+    write_json_atomic(graph_path, graph)
+    write_json_atomic(refs_path, refs)
 
     with pytest.raises(CodeCortexError) as exc:
         app.validate_graph()
@@ -189,3 +193,139 @@ def test_initialize_refuses_invalid_config_value_types_without_overwriting(
 
     assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
     assert digest_tree(repo_root / ".codecortex") == before
+
+
+@pytest.mark.parametrize(
+    "payload_factory",
+    [
+        lambda payload: b"\xef\xbb\xbf" + payload,
+        lambda payload: payload.decode().encode("utf-16"),
+        lambda payload: payload.decode().encode("utf-32"),
+    ],
+)
+def test_validate_rejects_non_utf8_formal_json(
+    app: ApplicationServices,
+    repo_root: Path,
+    payload_factory,
+) -> None:
+    """Letting JSON auto-detect BOM encodings would violate the UTF-8 formal format."""
+    app.initialize_repository()
+    manifest_path = repo_root / ".codecortex/manifest.json"
+    manifest_path.write_bytes(payload_factory(manifest_path.read_bytes()))
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+@pytest.mark.parametrize(
+    "payload_factory",
+    [
+        lambda value: json.dumps(value, sort_keys=True).encode(),
+        lambda value: canonical_json_bytes(value) + b"\n",
+        lambda value: json.dumps(value, indent=4, sort_keys=True).encode() + b"\n",
+    ],
+)
+def test_validate_rejects_noncanonical_formal_json_bytes(
+    app: ApplicationServices,
+    repo_root: Path,
+    payload_factory,
+) -> None:
+    """Accepting alternate whitespace or terminators would defeat byte-level determinism."""
+    app.initialize_repository()
+    manifest_path = repo_root / ".codecortex/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest_path.write_bytes(payload_factory(manifest))
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+def test_validate_rejects_duplicate_json_object_keys(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """Last-key-wins parsing must not conceal ambiguous formal state."""
+    app.initialize_repository()
+    manifest_path = repo_root / ".codecortex/manifest.json"
+    payload = manifest_path.read_bytes().replace(
+        b'  "graph_revision": 0,\n',
+        b'  "graph_revision": 0,\n  "graph_revision": 0,\n',
+    )
+    manifest_path.write_bytes(payload)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+def test_validate_rejects_unknown_top_level_json_fields(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """Ignoring fields under schema v1 would silently accept an undefined format extension."""
+    app.initialize_repository()
+    manifest_path = repo_root / ".codecortex/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["unexpected"] = True
+    write_json_atomic(manifest_path, manifest)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+@pytest.mark.parametrize(("field", "value"), [("epistemic_status", []), ("created_by", {})])
+def test_validate_wraps_malformed_nested_node_values_as_stable_errors(
+    app: ApplicationServices,
+    repo_root: Path,
+    field: str,
+    value: object,
+) -> None:
+    """Malformed nested values must not leak adapter-unstable Python exceptions."""
+    app.initialize_repository()
+    manifest_path = repo_root / ".codecortex/manifest.json"
+    graph_path = repo_root / ".codecortex/graph.json"
+    refs_path = repo_root / ".codecortex/entity_refs.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["graph_revision"] = 1
+    graph = json.loads(graph_path.read_text())
+    graph["graph_revision"] = 1
+    graph["nodes"] = [
+        {
+            "id": "capability.storage",
+            "kind": "capability",
+            "node_revision": 1,
+            field: value,
+            "approval": {"approval_event_id": "evt_01J00000000000000000000000"},
+        }
+    ]
+    refs = json.loads(refs_path.read_text())
+    refs["graph_revision"] = 1
+    write_json_atomic(manifest_path, manifest)
+    write_json_atomic(graph_path, graph)
+    write_json_atomic(refs_path, refs)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+def test_validate_rejects_complete_snapshot_with_malformed_graph_shape(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """A complete file tree must still pass structural parsing before it is accepted."""
+    app.initialize_repository()
+    graph_path = repo_root / ".codecortex/graph.json"
+    graph = json.loads(graph_path.read_text())
+    graph["nodes"] = ["not-an-object"]
+    write_json_atomic(graph_path, graph)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT

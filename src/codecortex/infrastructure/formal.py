@@ -6,7 +6,7 @@ import tempfile
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import NoReturn
 
 from codecortex.domain.cognition import (
     SCHEMA_VERSION,
@@ -17,10 +17,11 @@ from codecortex.domain.cognition import (
     Manifest,
     SourceBaseline,
     ValidationIssueCode,
+    ValidationResult,
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
-from codecortex.infrastructure.jsonio import write_json_atomic
+from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.repository import Repository
 
 DEFAULT_CONFIG = b"""schema_version = 1
@@ -61,6 +62,42 @@ _FORMAL_DIRECTORIES = (
     "views/behaviors",
     "views/capabilities",
 )
+_MANIFEST_FIELDS = {
+    "schema_version",
+    "minimum_core_version",
+    "graph_revision",
+    "cognition_initialized",
+    "digest_profile_version",
+    "managed_source_set_version",
+    "cognition_baseline",
+}
+_GRAPH_FIELDS = {
+    "schema_version",
+    "graph_revision",
+    "nodes",
+    "semantic_edges",
+    "logical_flows",
+    "implementation_mappings",
+}
+_ENTITY_REFS_FIELDS = {"schema_version", "graph_revision", "entities"}
+_SOURCE_BASELINE_FIELDS = {
+    "schema_version",
+    "digest_profile_version",
+    "managed_source_set_version",
+    "repository_source_digest",
+    "files",
+}
+_JSON_BOMS = (
+    b"\xef\xbb\xbf",
+    b"\xff\xfe\x00\x00",
+    b"\x00\x00\xfe\xff",
+    b"\xff\xfe",
+    b"\xfe\xff",
+)
+
+
+class _DuplicateJsonKeyError(ValueError):
+    pass
 
 
 class FormalStore:
@@ -78,7 +115,7 @@ class FormalStore:
                 self._raise_corrupt("Formal state is only partially initialized")
             return self.load()
 
-        result = validate_formal_state(state)
+        result = self._validate_state(state)
         if not result.valid:
             self._raise_validation(result.issues)
         if state.manifest.graph_revision != 0:
@@ -113,12 +150,18 @@ class FormalStore:
         self._read_text(self._root / "PROJECT.md")
         manifest_data = self._read_object(self._root / "manifest.json")
         self._check_schema(manifest_data, "manifest.json")
+        self._check_fields(manifest_data, _MANIFEST_FIELDS, "manifest.json")
         graph_data = self._read_object(self._root / "graph.json")
         self._check_schema(graph_data, "graph.json")
+        self._check_fields(graph_data, _GRAPH_FIELDS, "graph.json")
         refs_data = self._read_object(self._root / "entity_refs.json")
         self._check_schema(refs_data, "entity_refs.json")
+        self._check_fields(refs_data, _ENTITY_REFS_FIELDS, "entity_refs.json")
         baseline_data = self._read_object(self._root / "source_baseline.json")
         self._check_schema(baseline_data, "source_baseline.json")
+        self._check_fields(
+            baseline_data, _SOURCE_BASELINE_FIELDS, "source_baseline.json"
+        )
 
         try:
             state = FormalState(
@@ -131,7 +174,7 @@ class FormalStore:
         except (KeyError, TypeError, ValueError) as error:
             self._raise_corrupt("Formal state has an invalid data shape", cause=error)
 
-        result = validate_formal_state(state)
+        result = self._validate_state(state)
         if not result.valid:
             self._raise_validation(result.issues)
         self._validate_empty_views(state)
@@ -158,10 +201,25 @@ class FormalStore:
         for relative in _FORMAL_DIRECTORIES:
             (self._root / relative).mkdir(parents=True, exist_ok=True)
 
-    def _read_object(self, path: Path) -> dict[str, Any]:
+    def _read_object(self, path: Path) -> dict[str, object]:
         try:
-            value = json.loads(path.read_bytes())
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            payload = path.read_bytes()
+            if payload.startswith(_JSON_BOMS):
+                raise UnicodeDecodeError(
+                    "utf-8", payload, 0, min(len(payload), 4), "BOM is not permitted"
+                )
+            text = payload.decode("utf-8")
+            value = json.loads(text, object_pairs_hook=_unique_json_object)
+            if canonical_json_bytes(value) != payload:
+                self._raise_corrupt(f"{path.name} is not canonical JSON")
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            _DuplicateJsonKeyError,
+            TypeError,
+            ValueError,
+        ) as error:
             self._raise_corrupt(f"Cannot read valid JSON from {path.name}", cause=error)
         if not isinstance(value, dict):
             self._raise_corrupt(f"{path.name} must contain a JSON object")
@@ -183,6 +241,25 @@ class FormalStore:
                 f"{filename} schema version {schema_version} is unsupported",
                 details={"path": filename, "schema_version": schema_version},
                 suggested_action="Use a compatible CodeCortex Core version",
+            )
+
+    def _check_fields(
+        self,
+        data: Mapping[str, object],
+        expected_fields: set[str],
+        filename: str,
+    ) -> None:
+        if set(data) != expected_fields:
+            self._raise_corrupt(
+                f"{filename} has unknown or missing top-level fields"
+            )
+
+    def _validate_state(self, state: FormalState) -> ValidationResult:
+        try:
+            return validate_formal_state(state)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            self._raise_corrupt(
+                "Formal state contains malformed nested values", cause=error
             )
 
     def _validate_config(self) -> None:
@@ -358,7 +435,7 @@ def _entity_refs_to_json(refs: EntityRefs) -> dict[str, object]:
     return {
         "schema_version": refs.schema_version,
         "graph_revision": refs.graph_revision,
-        "entity_refs": list(refs.entity_refs),
+        "entities": list(refs.entities),
     }
 
 
@@ -366,7 +443,7 @@ def _entity_refs_from_json(data: Mapping[str, object]) -> EntityRefs:
     return EntityRefs(
         schema_version=_integer(data, "schema_version"),
         graph_revision=_integer(data, "graph_revision"),
-        entity_refs=_object_tuple(data, "entity_refs"),
+        entities=_object_tuple(data, "entities"),
     )
 
 
@@ -428,6 +505,15 @@ def _object_tuple(data: Mapping[str, object], key: str) -> tuple[dict[str, objec
 def _is_repository_pattern(value: str) -> bool:
     parts = value.split("/")
     return bool(value) and not value.startswith("/") and "\\" not in value and ".." not in parts
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonKeyError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
 
 
 def _write_bytes_atomic(path: Path, payload: bytes) -> None:

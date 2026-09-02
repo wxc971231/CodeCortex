@@ -56,7 +56,7 @@ class EntityRefs:
 
     schema_version: int
     graph_revision: int
-    entity_refs: tuple[JsonObject, ...]
+    entities: tuple[JsonObject, ...]
 
     @classmethod
     def empty(cls) -> EntityRefs:
@@ -131,6 +131,8 @@ class ValidationIssueCode(StrEnum):
     INVALID_NODE_REVISION = "INVALID_NODE_REVISION"
     MISSING_PROVENANCE = "MISSING_PROVENANCE"
     DANGLING_APPROVAL_EVENT = "DANGLING_APPROVAL_EVENT"
+    DANGLING_REFERENCE = "DANGLING_REFERENCE"
+    INVALID_RELATION = "INVALID_RELATION"
 
 
 @dataclass(frozen=True)
@@ -153,8 +155,8 @@ def validate_formal_state(state: FormalState) -> ValidationResult:
     _validate_revisions(state, issues)
     _validate_baseline(state, issues)
     applied_event_ids = _validate_history(state.history_events, issues)
-    _validate_graph(state.graph, applied_event_ids, issues)
-    _validate_entity_refs(state.entity_refs, issues)
+    entity_ids = _validate_entity_refs(state.entity_refs, issues)
+    _validate_graph(state.graph, applied_event_ids, entity_ids, issues)
     return ValidationResult(valid=not issues, issues=tuple(issues))
 
 
@@ -251,7 +253,7 @@ def _validate_revisions(
             state.graph.semantic_edges,
             state.graph.logical_flows,
             state.graph.implementation_mappings,
-            state.entity_refs.entity_refs,
+            state.entity_refs.entities,
             state.history_events,
         )
     ):
@@ -362,19 +364,22 @@ def _validate_history(
 def _validate_graph(
     graph: CognitiveGraph,
     applied_event_ids: set[str],
+    entity_ids: set[str],
     issues: list[ValidationIssue],
 ) -> None:
     identifiers: set[str] = set()
+    evidence_ids: set[str] = set()
     node_ids: set[str] = set()
+    node_kinds: dict[str, str] = {}
     for index, node in enumerate(graph.nodes):
         location = f"graph.nodes[{index}]"
         identifier = node.get("id")
         kind = node.get("kind")
-        expected_prefix = _NODE_PREFIX_BY_KIND.get(kind) if isinstance(kind, str) else None
         if (
             not isinstance(identifier, str)
-            or expected_prefix is None
-            or not _is_semantic_id(identifier, expected_prefix)
+            or not isinstance(kind, str)
+            or kind not in _NODE_PREFIX_BY_KIND
+            or not _is_semantic_id(identifier, _NODE_PREFIX_BY_KIND[kind])
         ):
             _issue(
                 issues,
@@ -384,6 +389,7 @@ def _validate_graph(
             )
         else:
             node_ids.add(identifier)
+            node_kinds[identifier] = kind
         _validate_unique(identifier, identifiers, location, issues)
         node_revision = node.get("node_revision")
         if (
@@ -399,30 +405,10 @@ def _validate_graph(
             )
         _validate_optional_node_fields(node, location, issues)
         _validate_provenance(node, location, applied_event_ids, issues)
+        _validate_evidence(node, location, evidence_ids, issues)
         _validate_repository_relative_fields(node, location, issues)
 
-    for collection_name, records, prefix in (
-        ("semantic_edges", graph.semantic_edges, "edge"),
-        ("implementation_mappings", graph.implementation_mappings, "map"),
-    ):
-        revision_key = "edge_revision" if prefix == "edge" else "mapping_revision"
-        for index, record in enumerate(records):
-            location = f"graph.{collection_name}[{index}]"
-            identifier = record.get("id")
-            if not isinstance(identifier, str) or not _is_ulid_id(identifier, prefix):
-                _issue(
-                    issues,
-                    ValidationIssueCode.INVALID_ID_NAMESPACE,
-                    f"{location}.id",
-                    f"ID must use the {prefix}_ namespace",
-                )
-            _validate_unique(identifier, identifiers, location, issues)
-            _validate_record_revision(
-                record, revision_key, location, graph.graph_revision, issues
-            )
-            _validate_provenance(record, location, applied_event_ids, issues)
-            _validate_repository_relative_fields(record, location, issues)
-
+    flow_step_ids: set[str] = set()
     for index, flow in enumerate(graph.logical_flows):
         location = f"graph.logical_flows[{index}]"
         behavior_id = flow.get("behavior_id")
@@ -435,10 +421,25 @@ def _validate_graph(
                 f"{location}.behavior_id",
                 "logical flow owner must use the behavior namespace",
             )
+        elif behavior_id not in node_ids:
+            _issue(
+                issues,
+                ValidationIssueCode.DANGLING_REFERENCE,
+                f"{location}.behavior_id",
+                "logical flow owner does not resolve to a graph node",
+            )
+        elif node_kinds.get(behavior_id) != "behavior":
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                f"{location}.behavior_id",
+                "logical flow owner must resolve to a behavior node",
+            )
         _validate_record_revision(
             flow, "flow_revision", location, graph.graph_revision, issues
         )
         _validate_provenance(flow, location, applied_event_ids, issues)
+        _validate_evidence(flow, location, evidence_ids, issues)
         _validate_repository_relative_fields(flow, location, issues)
         steps = flow.get("steps", [])
         if not isinstance(steps, list):
@@ -464,10 +465,277 @@ def _validate_graph(
                     f"{step_location}.id",
                     "flow step ID must belong to its behavior",
                 )
+            elif step_id in flow_step_ids:
+                _issue(
+                    issues,
+                    ValidationIssueCode.DUPLICATE_ID,
+                    f"{step_location}.id",
+                    "flow step IDs must be unique",
+                )
+            else:
+                flow_step_ids.add(step_id)
             if isinstance(step, dict):
                 _validate_provenance(
                     step, step_location, applied_event_ids, issues
                 )
+                _validate_evidence(step, step_location, evidence_ids, issues)
+                _validate_capability_references(
+                    step,
+                    step_location,
+                    node_ids,
+                    node_kinds,
+                    issues,
+                )
+
+    for index, edge in enumerate(graph.semantic_edges):
+        location = f"graph.semantic_edges[{index}]"
+        identifier = edge.get("id")
+        if not isinstance(identifier, str) or not _is_ulid_id(identifier, "edge"):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                f"{location}.id",
+                "ID must use the edge_ namespace",
+            )
+        _validate_unique(identifier, identifiers, location, issues)
+        _validate_record_revision(
+            edge, "edge_revision", location, graph.graph_revision, issues
+        )
+        _validate_provenance(edge, location, applied_event_ids, issues)
+        _validate_evidence(edge, location, evidence_ids, issues)
+        _validate_repository_relative_fields(edge, location, issues)
+        _validate_edge_references(edge, location, node_ids, node_kinds, issues)
+
+    for index, mapping in enumerate(graph.implementation_mappings):
+        location = f"graph.implementation_mappings[{index}]"
+        identifier = mapping.get("id")
+        if not isinstance(identifier, str) or not _is_ulid_id(identifier, "map"):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                f"{location}.id",
+                "ID must use the map_ namespace",
+            )
+        _validate_unique(identifier, identifiers, location, issues)
+        _validate_record_revision(
+            mapping, "mapping_revision", location, graph.graph_revision, issues
+        )
+        _validate_provenance(mapping, location, applied_event_ids, issues)
+        _validate_evidence(mapping, location, evidence_ids, issues)
+        _validate_repository_relative_fields(mapping, location, issues)
+        _validate_mapping_references(
+            mapping,
+            location,
+            node_ids,
+            flow_step_ids,
+            entity_ids,
+            issues,
+        )
+
+
+def _validate_edge_references(
+    edge: JsonObject,
+    location: str,
+    node_ids: set[str],
+    node_kinds: dict[str, str],
+    issues: list[ValidationIssue],
+) -> None:
+    relation = edge.get("type")
+    allowed_kinds = {
+        "contains": ("responsibility", "behavior"),
+        "uses": ("behavior", "capability"),
+        "depends_on": ("capability", "capability"),
+    }
+    expected_kinds = allowed_kinds.get(relation) if isinstance(relation, str) else None
+    if expected_kinds is None:
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_RELATION,
+            f"{location}.type",
+            "semantic edge type is unsupported",
+        )
+    resolved_kinds: list[str | None] = []
+    for field in ("source_id", "target_id"):
+        identifier = edge.get(field)
+        if not isinstance(identifier, str) or not any(
+            _is_semantic_id(identifier, prefix)
+            for prefix in _NODE_PREFIX_BY_KIND.values()
+        ):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                f"{location}.{field}",
+                "semantic edge endpoints must use a node namespace",
+            )
+            resolved_kinds.append(None)
+        elif identifier not in node_ids:
+            _issue(
+                issues,
+                ValidationIssueCode.DANGLING_REFERENCE,
+                f"{location}.{field}",
+                "semantic edge endpoint does not resolve to a graph node",
+            )
+            resolved_kinds.append(None)
+        else:
+            resolved_kinds.append(node_kinds[identifier])
+    if (
+        expected_kinds is not None
+        and tuple(resolved_kinds) != expected_kinds
+        and all(kind is not None for kind in resolved_kinds)
+    ):
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_RELATION,
+            location,
+            "semantic edge endpoint kinds are not allowed for this relation",
+        )
+
+
+def _validate_mapping_references(
+    mapping: JsonObject,
+    location: str,
+    node_ids: set[str],
+    flow_step_ids: set[str],
+    entity_ids: set[str],
+    issues: list[ValidationIssue],
+) -> None:
+    subject_kind = mapping.get("subject_kind")
+    subject_id = mapping.get("subject_id")
+    if subject_kind == "node":
+        valid_namespace = isinstance(subject_id, str) and any(
+            _is_semantic_id(subject_id, prefix)
+            for prefix in _NODE_PREFIX_BY_KIND.values()
+        )
+        subject_ids = node_ids
+    elif subject_kind == "flow_step":
+        valid_namespace = isinstance(subject_id, str) and _is_flow_step_id(subject_id)
+        subject_ids = flow_step_ids
+    else:
+        valid_namespace = False
+        subject_ids = set()
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_RELATION,
+            f"{location}.subject_kind",
+            "mapping subject kind must be node or flow_step",
+        )
+    if not valid_namespace:
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_ID_NAMESPACE,
+            f"{location}.subject_id",
+            "mapping subject ID does not match its subject kind",
+        )
+    elif subject_id not in subject_ids:
+        _issue(
+            issues,
+            ValidationIssueCode.DANGLING_REFERENCE,
+            f"{location}.subject_id",
+            "mapping subject does not resolve to a graph subject",
+        )
+
+    entity_uid = mapping.get("entity_uid")
+    if not isinstance(entity_uid, str) or not _is_ulid_id(entity_uid, "ent"):
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_ID_NAMESPACE,
+            f"{location}.entity_uid",
+            "mapping entity UID must use the ent_ namespace",
+        )
+    elif entity_uid not in entity_ids:
+        _issue(
+            issues,
+            ValidationIssueCode.DANGLING_REFERENCE,
+            f"{location}.entity_uid",
+            "mapping entity UID does not resolve to entity refs",
+        )
+
+
+def _validate_capability_references(
+    step: JsonObject,
+    location: str,
+    node_ids: set[str],
+    node_kinds: dict[str, str],
+    issues: list[ValidationIssue],
+) -> None:
+    capabilities = step.get("uses_capabilities", [])
+    if not isinstance(capabilities, list):
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_NODE,
+            f"{location}.uses_capabilities",
+            "flow step capability references must be a list",
+        )
+        return
+    for index, capability_id in enumerate(capabilities):
+        reference_location = f"{location}.uses_capabilities[{index}]"
+        if not isinstance(capability_id, str) or not _is_semantic_id(
+            capability_id, "capability."
+        ):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                reference_location,
+                "flow step capability references must use the capability namespace",
+            )
+        elif capability_id not in node_ids:
+            _issue(
+                issues,
+                ValidationIssueCode.DANGLING_REFERENCE,
+                reference_location,
+                "flow step capability does not resolve to a graph node",
+            )
+        elif node_kinds.get(capability_id) != "capability":
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                reference_location,
+                "flow step reference does not resolve to a capability node",
+            )
+
+
+def _validate_evidence(
+    owner: JsonObject,
+    location: str,
+    evidence_ids: set[str],
+    issues: list[ValidationIssue],
+) -> None:
+    evidence = owner.get("evidence", [])
+    if not isinstance(evidence, list):
+        _issue(
+            issues,
+            ValidationIssueCode.INVALID_NODE,
+            f"{location}.evidence",
+            "evidence must be a list",
+        )
+        return
+    for index, item in enumerate(evidence):
+        evidence_location = f"{location}.evidence[{index}]"
+        if not isinstance(item, dict):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_NODE,
+                evidence_location,
+                "evidence records must be objects",
+            )
+            continue
+        evidence_id = item.get("id")
+        if not isinstance(evidence_id, str) or not _is_ulid_id(evidence_id, "evid"):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_ID_NAMESPACE,
+                f"{evidence_location}.id",
+                "evidence ID must use the evid_ namespace",
+            )
+        elif evidence_id in evidence_ids:
+            _issue(
+                issues,
+                ValidationIssueCode.DUPLICATE_ID,
+                f"{evidence_location}.id",
+                "evidence IDs must be unique",
+            )
+        else:
+            evidence_ids.add(evidence_id)
 
 
 def _validate_record_revision(
@@ -495,7 +763,9 @@ def _validate_optional_node_fields(
     node: JsonObject, location: str, issues: list[ValidationIssue]
 ) -> None:
     epistemic = node.get("epistemic_status")
-    if epistemic is not None and epistemic not in _EPISTEMIC_VALUES:
+    if epistemic is not None and (
+        not isinstance(epistemic, str) or epistemic not in _EPISTEMIC_VALUES
+    ):
         _issue(
             issues,
             ValidationIssueCode.INVALID_NODE,
@@ -504,7 +774,9 @@ def _validate_optional_node_fields(
         )
     for key in ("created_by", "last_modified_by"):
         actor = node.get(key)
-        if actor is not None and actor not in _ACTOR_VALUES:
+        if actor is not None and (
+            not isinstance(actor, str) or actor not in _ACTOR_VALUES
+        ):
             _issue(
                 issues,
                 ValidationIssueCode.INVALID_NODE,
@@ -539,38 +811,40 @@ def _validate_repository_relative_fields(
 
 def _validate_entity_refs(
     refs: EntityRefs, issues: list[ValidationIssue]
-) -> None:
+) -> set[str]:
     identifiers: set[str] = set()
-    paths: list[str] = []
-    for index, entity in enumerate(refs.entity_refs):
-        location = f"entity_refs.entity_refs[{index}]"
-        identifier = entity.get("entity_id", entity.get("id"))
+    ordered_ids: list[str] = []
+    for index, entity in enumerate(refs.entities):
+        location = f"entity_refs.entities[{index}]"
+        identifier = entity.get("uid")
         if not isinstance(identifier, str) or not _is_ulid_id(identifier, "ent"):
             _issue(
                 issues,
                 ValidationIssueCode.INVALID_ID_NAMESPACE,
-                f"{location}.entity_id",
-                "entity reference ID must use the ent_ namespace",
+                f"{location}.uid",
+                "entity reference UID must use the ent_ namespace",
             )
+        else:
+            ordered_ids.append(identifier)
         _validate_unique(identifier, identifiers, location, issues)
         relative_path = entity.get("relative_path")
-        if relative_path is not None:
-            if not isinstance(relative_path, str) or not _is_relative_path(relative_path):
-                _issue(
-                    issues,
-                    ValidationIssueCode.INVALID_RELATIVE_PATH,
-                    f"{location}.relative_path",
-                    "entity paths must be normalized repository-relative POSIX paths",
-                )
-            else:
-                paths.append(relative_path)
-    if paths != sorted(paths):
+        if relative_path is not None and (
+            not isinstance(relative_path, str) or not _is_relative_path(relative_path)
+        ):
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_RELATIVE_PATH,
+                f"{location}.relative_path",
+                "entity paths must be normalized repository-relative POSIX paths",
+            )
+    if ordered_ids != sorted(ordered_ids):
         _issue(
             issues,
-            ValidationIssueCode.INVALID_RELATIVE_PATH,
-            "entity_refs.entity_refs",
-            "entity references must be sorted by relative path",
+            ValidationIssueCode.INVALID_NODE,
+            "entity_refs.entities",
+            "entity references must be sorted by stable UID",
         )
+    return identifiers
 
 
 def _validate_unique(
@@ -659,6 +933,15 @@ def _is_ulid_id(value: str, prefix: str) -> bool:
 
 def _is_semantic_id(value: str, prefix: str) -> bool:
     return value.startswith(prefix) and _valid_slug(value.removeprefix(prefix))
+
+
+def _is_flow_step_id(value: str) -> bool:
+    behavior_id, separator, slug = value.partition("#step.")
+    return (
+        separator == "#step."
+        and _is_semantic_id(behavior_id, "behavior.")
+        and _valid_slug(slug)
+    )
 
 
 def _valid_slug(value: str) -> bool:
