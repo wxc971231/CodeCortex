@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -11,7 +12,7 @@ from enum import StrEnum
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.ids import IdPrefix, validate_id
 
-type JsonObject = dict[str, object]
+type JsonObject = Mapping[str, object]
 
 SCHEMA_VERSION = 1
 _DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -26,6 +27,39 @@ _NODE_KIND_PREFIX = {
     "behavior": "behavior.",
     "capability": "capability.",
 }
+
+
+class FrozenJsonArray(tuple[object, ...]):
+    """Marker type for an immutable snapshot of a JSON array."""
+
+
+class FrozenJsonObject(Mapping[str, object]):
+    """Small immutable mapping used for domain-owned JSON snapshots."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: tuple[tuple[str, object], ...]) -> None:
+        self._items = items
+
+    def __getitem__(self, key: str) -> object:
+        for candidate, value in self._items:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return dict(self.items()) == dict(other.items())
+
+    def __repr__(self) -> str:
+        return repr(dict(self._items))
 
 
 class ProposalStatus(StrEnum):
@@ -81,7 +115,7 @@ class PatchOperation:
             if self.value is not None:
                 raise _invalid_proposal("Remove operations cannot contain a value")
             return
-        if not isinstance(self.value, dict):
+        if not isinstance(self.value, Mapping):
             raise _invalid_proposal("Add and update operations require an object value")
         if self.value.get("id") != self.target_id:
             raise _invalid_proposal("Patch value ID must match its target ID")
@@ -93,14 +127,18 @@ class PatchOperation:
                 or not self.target_id.startswith(_NODE_KIND_PREFIX[kind_value])
             ):
                 raise _invalid_proposal("Node value kind must match its stable ID")
-        _require_json(self.value, "Patch value")
+        object.__setattr__(
+            self,
+            "value",
+            _freeze_json_object(self.value, "Patch value"),
+        )
 
-    def to_canonical_value(self) -> JsonObject:
+    def to_canonical_value(self) -> dict[str, object]:
         """Return the JSON value covered by the patch digest."""
         return {
             "kind": PatchOperationKind(self.kind).value,
             "target_id": self.target_id,
-            "value": self.value,
+            "value": json_value_to_mutable(self.value),
         }
 
 
@@ -128,11 +166,34 @@ class ProposalRevision:
         _validate_digest(self.previous_patch_digest, nullable=False)
         if not self.previous_operations:
             raise _invalid_proposal("A revision must preserve previous operations")
+        if (
+            canonical_patch_digest(self.previous_operations)
+            != self.previous_patch_digest
+        ):
+            raise _invalid_proposal(
+                "Revision previous patch digest does not match its operations"
+            )
         _validate_digest(self.previous_analyzed_source_digest, nullable=True)
-        _validate_source_preconditions(self.previous_source_preconditions)
+        object.__setattr__(
+            self,
+            "previous_source_preconditions",
+            _freeze_json_objects(
+                self.previous_source_preconditions, "Revision source preconditions"
+            ),
+        )
         _validate_affected_nodes(self.previous_affected_nodes)
-        _validate_json_objects(self.previous_evidence, "Revision evidence")
-        _require_json(list(self.previous_uncertainties), "Revision uncertainties")
+        object.__setattr__(
+            self,
+            "previous_evidence",
+            _freeze_json_objects(self.previous_evidence, "Revision evidence"),
+        )
+        object.__setattr__(
+            self,
+            "previous_uncertainties",
+            _freeze_json_items(
+                self.previous_uncertainties, "Revision uncertainties"
+            ),
+        )
         _validate_rfc3339_utc(self.revised_at)
 
 
@@ -180,15 +241,27 @@ class Proposal:
                 "Base graph revision must be a non-negative integer"
             )
         _validate_digest(self.analyzed_source_digest, nullable=True)
-        _validate_source_preconditions(self.source_preconditions)
+        object.__setattr__(
+            self,
+            "source_preconditions",
+            _freeze_json_objects(self.source_preconditions, "Source preconditions"),
+        )
         if not self.operations:
             raise _invalid_proposal("Proposal operations cannot be empty")
         if not all(isinstance(item, PatchOperation) for item in self.operations):
             raise _invalid_proposal("Proposal operations must be patch operations")
         _validate_affected_nodes(self.affected_nodes)
         _validate_reason(self.reason)
-        _validate_json_objects(self.evidence, "Proposal evidence")
-        _require_json(list(self.uncertainties), "Proposal uncertainties")
+        object.__setattr__(
+            self,
+            "evidence",
+            _freeze_json_objects(self.evidence, "Proposal evidence"),
+        )
+        object.__setattr__(
+            self,
+            "uncertainties",
+            _freeze_json_items(self.uncertainties, "Proposal uncertainties"),
+        )
         if not all(isinstance(item, ProposalRevision) for item in self.revision_log):
             raise _invalid_proposal("Proposal revision log is invalid")
         expected_revision_numbers = tuple(range(1, len(self.revision_log) + 1))
@@ -261,7 +334,14 @@ class Proposal:
                 f"Proposal in {self.status.value} state cannot be revised",
             )
         _validate_reason(reason)
-        effective_revised_at = revised_at or _utc_now_rfc3339()
+        new_patch_digest = canonical_patch_digest(operations)
+        if new_patch_digest == self.patch_digest:
+            raise _invalid_proposal(
+                "A revision must change the current patch digest"
+            )
+        effective_revised_at = (
+            _utc_now_rfc3339() if revised_at is None else revised_at
+        )
         _validate_rfc3339_utc(effective_revised_at)
         revision = ProposalRevision(
             revision_number=len(self.revision_log) + 1,
@@ -299,7 +379,7 @@ class Proposal:
             if uncertainties is None
             else uncertainties,
             revision_log=(*self.revision_log, revision),
-            patch_digest=canonical_patch_digest(operations),
+            patch_digest=new_patch_digest,
         )
 
     def verify_base_graph_revision(self, current_graph_revision: int) -> None:
@@ -317,7 +397,7 @@ class Proposal:
 
     def verify_approval(self, approval: ApprovalRecord) -> None:
         """Verify explicit approval is bound to this current proposal patch."""
-        if self.status not in {ProposalStatus.PROPOSED, ProposalStatus.REVISED}:
+        if self.status is not ProposalStatus.PROPOSED:
             raise CodeCortexError(
                 ErrorCode.APPROVAL_REQUIRED,
                 "Proposal is not in a state that can receive approval",
@@ -395,40 +475,60 @@ def _validate_digest(value: object, *, nullable: bool) -> None:
         raise _invalid_proposal("Digest must be lowercase SHA-256")
 
 
-def _validate_source_preconditions(values: tuple[JsonObject, ...]) -> None:
-    _validate_json_objects(values, "Source preconditions")
-
-
-def _validate_json_objects(values: tuple[JsonObject, ...], label: str) -> None:
+def _freeze_json_objects(
+    values: tuple[JsonObject, ...], label: str
+) -> tuple[FrozenJsonObject, ...]:
     if not isinstance(values, tuple) or not all(
-        isinstance(item, dict) for item in values
+        isinstance(item, Mapping) for item in values
     ):
         raise _invalid_proposal(f"{label} must be a tuple of objects")
-    _require_json(list(values), label)
+    return tuple(_freeze_json_object(item, label) for item in values)
 
 
-def _require_json(value: object, label: str) -> None:
-    if not _is_json_value(value):
+def _freeze_json_items(values: tuple[object, ...], label: str) -> tuple[object, ...]:
+    if not isinstance(values, tuple):
+        raise _invalid_proposal(f"{label} must be a tuple")
+    return tuple(_freeze_json_value(value, label) for value in values)
+
+
+def _freeze_json_object(value: Mapping[str, object], label: str) -> FrozenJsonObject:
+    if isinstance(value, FrozenJsonObject):
+        return value
+    if not isinstance(value, dict):
         raise _invalid_proposal(f"{label} must contain only JSON-native values")
-    try:
-        json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
-    except (TypeError, ValueError) as error:
-        raise _invalid_proposal(f"{label} must contain finite JSON values") from error
+    items: list[tuple[str, object]] = []
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise _invalid_proposal(f"{label} must use string object keys")
+        items.append((key, _freeze_json_value(item, label)))
+    return FrozenJsonObject(tuple(items))
 
 
-def _is_json_value(value: object) -> bool:
+def _freeze_json_value(value: object, label: str) -> object:
+    if isinstance(value, (FrozenJsonObject, FrozenJsonArray)):
+        return value
     if value is None or type(value) in {bool, str, int}:
-        return True
+        return value
     if type(value) is float:
-        return math.isfinite(value)
+        if not math.isfinite(value):
+            raise _invalid_proposal(f"{label} must contain finite JSON numbers")
+        return value
     if isinstance(value, list):
-        return all(_is_json_value(item) for item in value)
+        return FrozenJsonArray(_freeze_json_value(item, label) for item in value)
     if isinstance(value, dict):
-        return all(
-            isinstance(key, str) and _is_json_value(item)
-            for key, item in value.items()
-        )
-    return False
+        return _freeze_json_object(value, label)
+    raise _invalid_proposal(f"{label} must contain only JSON-native values")
+
+
+def json_value_to_mutable(value: object) -> object:
+    """Thaw a domain JSON snapshot only for a serialization boundary."""
+    if isinstance(value, FrozenJsonObject):
+        return {
+            key: json_value_to_mutable(item) for key, item in value.items()
+        }
+    if isinstance(value, FrozenJsonArray):
+        return [json_value_to_mutable(item) for item in value]
+    return value
 
 
 def _validate_rfc3339_utc(value: object) -> None:

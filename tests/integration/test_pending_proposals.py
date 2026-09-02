@@ -1,12 +1,13 @@
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
-from codecortex.domain.proposals import PatchOperation, ProposalStatus
+from codecortex.domain.proposals import ApprovalRecord, PatchOperation, ProposalStatus
 from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
@@ -140,3 +141,149 @@ def test_pending_lookup_rejects_wrong_id_namespace_without_path_access(
 
     assert exc.value.code is ErrorCode.INVALID_ID
     assert not (repo_root / ".codecortex/.cache/pending_proposals").exists()
+
+
+def test_create_rejects_an_explicit_blank_timestamp(
+    app: ApplicationServices,
+) -> None:
+    """Application create must preserve explicit invalid input for domain validation."""
+    app.initialize_repository()
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.create_cognitive_proposal(
+            operations=(add_node(),),
+            affected_nodes=("behavior.answer-question",),
+            reason="Create with invalid time",
+            proposal_id=PROPOSAL_ID,
+            created_at="",
+        )
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_revise_rejects_an_explicit_blank_timestamp(
+    app: ApplicationServices,
+) -> None:
+    """Application revise must not replace a supplied blank time with its clock."""
+    app.initialize_repository()
+    app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Initial proposal",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.revise_cognitive_proposal(
+            PROPOSAL_ID,
+            operations=(add_node("behavior.revised"),),
+            reason="Revision with invalid time",
+            revised_at="",
+        )
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_persisted_revised_status_cannot_receive_approval(
+    app: ApplicationServices,
+) -> None:
+    """Only canonical persisted PROPOSED state may enter approval verification."""
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Initial proposal",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    revised_state = replace(proposal, status=ProposalStatus.REVISED)
+    assert app.pending_proposals is not None
+    app.pending_proposals.replace(revised_state)
+    restored = app.cognitive_proposal(PROPOSAL_ID)
+    approval = ApprovalRecord(
+        proposal_id=restored.proposal_id,
+        patch_digest=restored.patch_digest,
+        approved_by="user",
+        approved_at="2026-09-02T02:00:00Z",
+        approval_summary="Approve current patch",
+    )
+
+    with pytest.raises(CodeCortexError) as exc:
+        restored.verify_approval(approval)
+
+    assert exc.value.code is ErrorCode.APPROVAL_REQUIRED
+
+
+@pytest.mark.parametrize("operation", ["create", "load", "replace", "delete"])
+def test_pending_final_path_rejects_symlink_escape_for_every_operation(
+    app: ApplicationServices,
+    repo_root: Path,
+    operation: str,
+) -> None:
+    """Following a final symlink could read or mutate a proposal outside the repository."""
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Symlink safety fixture",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    assert app.pending_proposals is not None
+    pending_path = (
+        repo_root / f".codecortex/.cache/pending_proposals/{PROPOSAL_ID}.json"
+    )
+    outside_path = repo_root.parent / "outside-proposal.json"
+    outside_payload = pending_path.read_bytes()
+    outside_path.write_bytes(outside_payload)
+    pending_path.unlink()
+    pending_path.symlink_to(outside_path)
+
+    with pytest.raises(CodeCortexError) as exc:
+        if operation == "create":
+            app.pending_proposals.create(proposal)
+        elif operation == "load":
+            app.pending_proposals.load(PROPOSAL_ID)
+        elif operation == "replace":
+            app.pending_proposals.replace(proposal)
+        else:
+            app.pending_proposals.delete(PROPOSAL_ID)
+
+    assert exc.value.code is ErrorCode.PATH_OUTSIDE_REPOSITORY
+    assert outside_path.read_bytes() == outside_payload
+    assert pending_path.is_symlink()
+
+
+def test_pending_delete_normalizes_unlink_failure(
+    app: ApplicationServices,
+    repo_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filesystem delete failure must remain a stable adapter-facing Core error."""
+    app.initialize_repository()
+    app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Delete failure fixture",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    assert app.pending_proposals is not None
+    pending_path = (
+        repo_root / f".codecortex/.cache/pending_proposals/{PROPOSAL_ID}.json"
+    )
+    real_unlink = Path.unlink
+
+    def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == pending_path:
+            raise PermissionError("injected unlink failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.pending_proposals.delete(PROPOSAL_ID)
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+    assert pending_path.is_file()

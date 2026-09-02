@@ -1,6 +1,8 @@
 """Machine-local deterministic persistence for pending cognitive proposals."""
 
 import json
+import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -12,6 +14,7 @@ from codecortex.domain.proposals import (
     Proposal,
     ProposalRevision,
     ProposalStatus,
+    json_value_to_mutable,
 )
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.repository import Repository
@@ -52,6 +55,7 @@ class PendingProposalStore:
     """Store current proposal snapshots under the repository's deletable cache."""
 
     def __init__(self, repository: Repository) -> None:
+        self._repository = repository
         self._directory = repository.resolve_relative(
             ".codecortex/.cache/pending_proposals"
         )
@@ -59,18 +63,24 @@ class PendingProposalStore:
     def create(self, proposal: Proposal) -> None:
         """Create a pending file without silently replacing an existing proposal."""
         path = self._path(proposal.proposal_id)
-        if path.exists():
+        if os.path.lexists(path):
             raise CodeCortexError(
                 ErrorCode.ANALYSIS_REPORT_INVALID,
                 "A pending proposal with this ID already exists",
             )
-        self._directory.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(path, _proposal_to_json(proposal))
+        try:
+            self._directory.mkdir(parents=True, exist_ok=True)
+            self._ensure_safe_path(path)
+            write_json_atomic(path, _proposal_to_json(proposal))
+        except CodeCortexError:
+            raise
+        except OSError as error:
+            raise _pending_io_error("create", proposal.proposal_id) from error
 
     def load(self, proposal_id: str) -> Proposal:
         """Load a canonical pending snapshot and restore domain invariants."""
         path = self._path(proposal_id)
-        if not path.is_file():
+        if not _is_regular_file(path):
             raise CodeCortexError(
                 ErrorCode.PROPOSAL_STALE,
                 "Pending cognitive proposal was not found",
@@ -78,7 +88,7 @@ class PendingProposalStore:
                 suggested_action="Recreate the proposal",
             )
         try:
-            payload = path.read_bytes()
+            payload = _read_bytes_no_follow(path)
             data = json.loads(payload)
             if canonical_json_bytes(data) != payload:
                 raise ValueError("pending proposal is not canonical JSON")
@@ -104,22 +114,50 @@ class PendingProposalStore:
     def replace(self, proposal: Proposal) -> None:
         """Atomically replace only the current file for an existing identity."""
         path = self._path(proposal.proposal_id)
-        if not path.is_file():
+        if not _is_regular_file(path):
             raise CodeCortexError(
                 ErrorCode.PROPOSAL_STALE,
                 "Pending cognitive proposal was not found",
                 details={"proposal_id": proposal.proposal_id},
                 suggested_action="Recreate the proposal",
             )
-        write_json_atomic(path, _proposal_to_json(proposal))
+        try:
+            write_json_atomic(path, _proposal_to_json(proposal))
+        except OSError as error:
+            raise _pending_io_error("replace", proposal.proposal_id) from error
 
     def delete(self, proposal_id: str) -> None:
         """Remove a consumed pending proposal without touching other cache state."""
-        self._path(proposal_id).unlink(missing_ok=True)
+        path = self._path(proposal_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise _pending_io_error("delete", proposal_id) from error
 
     def _path(self, proposal_id: str) -> Path:
         validate_id(proposal_id, IdPrefix.PROPOSAL)
-        return self._directory / f"{proposal_id}.json"
+        path = self._directory / f"{proposal_id}.json"
+        self._ensure_safe_path(path)
+        return path
+
+    def _ensure_safe_path(self, path: Path) -> None:
+        self._repository.to_relative(path)
+        relative = path.relative_to(self._repository.root)
+        cursor = self._repository.root
+        for part in relative.parts:
+            cursor /= part
+            try:
+                mode = cursor.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise _pending_io_error("inspect", path.stem) from error
+            if stat.S_ISLNK(mode):
+                raise CodeCortexError(
+                    ErrorCode.PATH_OUTSIDE_REPOSITORY,
+                    "Pending proposal path cannot contain symbolic links",
+                    details={"path": relative.as_posix()},
+                )
 
 
 def _proposal_to_json(proposal: Proposal) -> dict[str, object]:
@@ -129,12 +167,16 @@ def _proposal_to_json(proposal: Proposal) -> dict[str, object]:
         "status": proposal.status.value,
         "base_graph_revision": proposal.base_graph_revision,
         "analyzed_source_digest": proposal.analyzed_source_digest,
-        "source_preconditions": list(proposal.source_preconditions),
+        "source_preconditions": [
+            json_value_to_mutable(item) for item in proposal.source_preconditions
+        ],
         "operations": [_operation_to_json(item) for item in proposal.operations],
         "affected_nodes": list(proposal.affected_nodes),
         "reason": proposal.reason,
-        "evidence": list(proposal.evidence),
-        "uncertainties": list(proposal.uncertainties),
+        "evidence": [json_value_to_mutable(item) for item in proposal.evidence],
+        "uncertainties": [
+            json_value_to_mutable(item) for item in proposal.uncertainties
+        ],
         "revision_log": [_revision_to_json(item) for item in proposal.revision_log],
         "patch_digest": proposal.patch_digest,
         "created_at": proposal.created_at,
@@ -191,10 +233,17 @@ def _revision_to_json(revision: ProposalRevision) -> dict[str, object]:
             _operation_to_json(item) for item in revision.previous_operations
         ],
         "previous_analyzed_source_digest": revision.previous_analyzed_source_digest,
-        "previous_source_preconditions": list(revision.previous_source_preconditions),
+        "previous_source_preconditions": [
+            json_value_to_mutable(item)
+            for item in revision.previous_source_preconditions
+        ],
         "previous_affected_nodes": list(revision.previous_affected_nodes),
-        "previous_evidence": list(revision.previous_evidence),
-        "previous_uncertainties": list(revision.previous_uncertainties),
+        "previous_evidence": [
+            json_value_to_mutable(item) for item in revision.previous_evidence
+        ],
+        "previous_uncertainties": [
+            json_value_to_mutable(item) for item in revision.previous_uncertainties
+        ],
         "revised_at": revision.revised_at,
     }
 
@@ -270,3 +319,28 @@ def _string_tuple(data: Mapping[str, object], key: str) -> tuple[str, ...]:
     if not all(isinstance(item, str) for item in values):
         raise TypeError(f"{key} must be a list of strings")
     return tuple(cast(list[str], values))
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise _pending_io_error("inspect", path.stem) from error
+
+
+def _read_bytes_no_follow(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as stream:
+        return stream.read()
+
+
+def _pending_io_error(operation: str, proposal_id: str) -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.ANALYSIS_REPORT_INVALID,
+        f"Pending proposal {operation} failed",
+        details={"proposal_id": proposal_id},
+        suggested_action="Retry or recreate the pending proposal",
+    )

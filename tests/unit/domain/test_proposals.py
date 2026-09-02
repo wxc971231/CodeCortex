@@ -245,6 +245,56 @@ def test_revision_changes_patch_digest_and_invalidates_old_approval() -> None:
     assert exc.value.code is ErrorCode.APPROVAL_MISMATCH
 
 
+def test_revision_rejects_a_reason_only_change_with_the_same_patch() -> None:
+    """A reason-only revision must not leave an old patch approval reusable."""
+    proposal = make_proposal()
+
+    with pytest.raises(CodeCortexError) as exc:
+        proposal.revise(
+            proposal.operations,
+            reason="Only the explanation changed",
+            revised_at=REVISED_AT,
+        )
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_revision_rejects_an_evidence_only_change_with_the_same_patch() -> None:
+    """Evidence-only revision cannot claim to invalidate an unchanged patch digest."""
+    proposal = make_proposal()
+
+    with pytest.raises(CodeCortexError) as exc:
+        proposal.revise(
+            proposal.operations,
+            reason="Replace supporting evidence",
+            evidence=({"summary": "Different evidence"},),
+            revised_at=REVISED_AT,
+        )
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_revision_rejects_equivalent_new_operations_with_the_same_digest() -> None:
+    """Rebuilding equal operations must not disguise a no-op revision."""
+    proposal = make_proposal()
+    equivalent = PatchOperation(
+        "add_node",
+        "behavior.answer-question",
+        {
+            "title": "Answer a repository question",
+            "kind": "behavior",
+            "id": "behavior.answer-question",
+        },
+    )
+
+    with pytest.raises(CodeCortexError) as exc:
+        proposal.revise(
+            (equivalent,), reason="Equivalent operation", revised_at=REVISED_AT
+        )
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
 def test_revision_supplies_a_strict_utc_time_when_caller_omits_it() -> None:
     """Requiring adapters to invent revision timestamps would fragment the domain API."""
     revised = make_proposal().revise(
@@ -254,6 +304,20 @@ def test_revision_supplies_a_strict_utc_time_when_caller_omits_it() -> None:
 
     assert revised.revision_log[-1].revised_at.endswith("Z")
     assert "+00:00" not in revised.revision_log[-1].revised_at
+
+
+def test_revision_rejects_an_explicit_blank_time() -> None:
+    """A supplied blank timestamp must not be replaced with the current clock."""
+    proposal = make_proposal()
+
+    with pytest.raises(CodeCortexError) as exc:
+        proposal.revise(
+            (PatchOperation("remove_node", "behavior.answer-question", None),),
+            reason="Remove behavior after discussion",
+            revised_at="",
+        )
+
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
 
 
 @pytest.mark.parametrize(
@@ -320,13 +384,65 @@ def test_approval_accepts_strict_utc_time_and_500_unicode_code_points() -> None:
     proposal.verify_approval(approval)
 
 
-def test_approval_rejects_operations_mutated_after_the_digest_was_created() -> None:
-    """A mutable nested patch must not allow applying content outside the approved digest."""
-    proposal = make_proposal()
-    assert proposal.operations[0].value is not None
-    proposal.operations[0].value["title"] = "Tampered after proposal creation"
+def test_proposal_deep_snapshots_json_before_and_after_approval_verification() -> None:
+    """Caller-owned nested containers must never mutate an approved Proposal snapshot."""
+    aliases = ["ask"]
+    operation_value = node_payload()
+    operation_value["metadata"] = {"aliases": aliases}
+    operation = PatchOperation("add_node", "behavior.answer-question", operation_value)
+    fingerprints = ["fp-one"]
+    source_precondition = {
+        "relative_path": "src/query.py",
+        "fingerprints": fingerprints,
+    }
+    locations = ["src/query.py:10"]
+    evidence = {"summary": "Query behavior", "locations": locations}
+    questions = ["Does fallback apply?"]
+    uncertainty = {"questions": questions}
+    proposal = Proposal.create(
+        proposal_id=PROPOSAL_ID,
+        base_graph_revision=0,
+        analyzed_source_digest=None,
+        source_preconditions=(source_precondition,),
+        operations=(operation,),
+        affected_nodes=("behavior.answer-question",),
+        reason="Snapshot nested candidate data",
+        evidence=(evidence,),
+        uncertainties=(uncertainty,),
+        created_at=CREATED_AT,
+    )
+    approval = approval_for(proposal)
+
+    aliases.append("explain-before")
+    fingerprints.append("fp-two")
+    proposal.verify_approval(approval)
+    locations.append("src/query.py:20")
+    questions.append("Was the graph consulted?")
+    proposal.verify_approval(approval)
+
+    assert proposal.operations[0].to_canonical_value()["value"] == {
+        "id": "behavior.answer-question",
+        "kind": "behavior",
+        "metadata": {"aliases": ["ask"]},
+        "title": "Answer a repository question",
+    }
+    assert proposal.source_preconditions[0]["fingerprints"] == ("fp-one",)
+    assert proposal.evidence[0]["locations"] == ("src/query.py:10",)
+    assert proposal.uncertainties[0]["questions"] == ("Does fallback apply?",)
+
+
+def test_revision_validates_the_preserved_operations_digest() -> None:
+    """A forged revision record must not detach its previous digest from its patch."""
+    revised = make_proposal().revise(
+        (PatchOperation("remove_node", "behavior.answer-question", None),),
+        reason="Remove behavior",
+        revised_at=REVISED_AT,
+    )
 
     with pytest.raises(CodeCortexError) as exc:
-        proposal.verify_approval(approval_for(proposal))
+        replace(
+            revised.revision_log[0],
+            previous_patch_digest="sha256:" + "f" * 64,
+        )
 
-    assert exc.value.code is ErrorCode.APPROVAL_MISMATCH
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID

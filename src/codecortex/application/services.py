@@ -95,7 +95,9 @@ class ApplicationServices:
                 reason=reason,
                 evidence=evidence,
                 uncertainties=uncertainties,
-                created_at=created_at or _utc_now_rfc3339(),
+                created_at=(
+                    _utc_now_rfc3339() if created_at is None else created_at
+                ),
             )
             store.create(proposal)
             return proposal
@@ -122,7 +124,9 @@ class ApplicationServices:
             revised = current.revise(
                 operations,
                 reason=reason,
-                revised_at=revised_at or _utc_now_rfc3339(),
+                revised_at=(
+                    _utc_now_rfc3339() if revised_at is None else revised_at
+                ),
                 analyzed_source_digest=analyzed_source_digest,
                 source_preconditions=source_preconditions,
                 affected_nodes=affected_nodes,
