@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.infrastructure import locking
 from codecortex.infrastructure.locking import RepositoryLock
 
 
@@ -123,3 +124,59 @@ def test_lock_file_is_private_and_persists_after_release(repo_path: Path) -> Non
         assert lock_path.stat().st_mode & 0o777 == 0o600
 
     assert lock_path.is_file()
+
+
+def test_permission_setting_failure_closes_lock_descriptor(
+    repo_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission-setting failure must not leak the newly opened descriptor."""
+    closed_descriptors: list[int] = []
+    close_descriptor = locking.os.close
+
+    def fail_permission_setting(*_args: object) -> None:
+        raise OSError("permission setting failed")
+
+    def record_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        close_descriptor(descriptor)
+
+    monkeypatch.setattr(locking.os, "chmod", fail_permission_setting)
+    monkeypatch.setattr(locking.os, "fchmod", fail_permission_setting)
+    monkeypatch.setattr(locking.os, "close", record_close)
+
+    with (
+        pytest.raises(OSError, match="permission setting failed"),
+        RepositoryLock(repo_path).acquire("exclusive", timeout_seconds=0.05),
+    ):
+        pass
+
+    assert len(closed_descriptors) == 1
+
+
+def test_unlock_failure_still_closes_lock_descriptor(
+    repo_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unlock error must not prevent the descriptor from being closed."""
+    closed_descriptors: list[int] = []
+    close_descriptor = locking.os.close
+    flock = locking.fcntl.flock
+
+    def fail_unlock(descriptor: int, operation: int) -> None:
+        if operation == locking.fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        flock(descriptor, operation)
+
+    def record_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        close_descriptor(descriptor)
+
+    monkeypatch.setattr(locking.fcntl, "flock", fail_unlock)
+    monkeypatch.setattr(locking.os, "close", record_close)
+
+    with (
+        pytest.raises(OSError, match="unlock failed"),
+        RepositoryLock(repo_path).acquire("exclusive", timeout_seconds=0.05),
+    ):
+        pass
+
+    assert len(closed_descriptors) == 1

@@ -25,11 +25,11 @@ class RepositoryLock:
         lock_path = self._repository_root / ".codecortex" / ".cache" / "repository.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        os.chmod(lock_path, 0o600)
-        flag = fcntl.LOCK_SH if mode == "shared" else fcntl.LOCK_EX
-        deadline = time.monotonic() + timeout_seconds
 
         try:
+            os.fchmod(descriptor, 0o600)
+            flag = fcntl.LOCK_SH if mode == "shared" else fcntl.LOCK_EX
+            deadline = time.monotonic() + timeout_seconds
             while True:
                 try:
                     fcntl.flock(descriptor, flag | fcntl.LOCK_NB)
@@ -43,5 +43,7 @@ class RepositoryLock:
                     time.sleep(0.01)
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
