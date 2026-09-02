@@ -33,13 +33,11 @@ class FrozenJsonArray(tuple[object, ...]):
     """Marker type for an immutable snapshot of a JSON array."""
 
 
+@dataclass(frozen=True, slots=True, eq=False)
 class FrozenJsonObject(Mapping[str, object]):
     """Small immutable mapping used for domain-owned JSON snapshots."""
 
-    __slots__ = ("_items",)
-
-    def __init__(self, items: tuple[tuple[str, object], ...]) -> None:
-        self._items = items
+    _items: tuple[tuple[str, object], ...]
 
     def __getitem__(self, key: str) -> object:
         for candidate, value in self._items:
@@ -492,21 +490,25 @@ def _freeze_json_items(values: tuple[object, ...], label: str) -> tuple[object, 
 
 
 def _freeze_json_object(value: Mapping[str, object], label: str) -> FrozenJsonObject:
-    if isinstance(value, FrozenJsonObject):
-        return value
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise _invalid_proposal(f"{label} must contain only JSON-native values")
     items: list[tuple[str, object]] = []
+    keys: set[str] = set()
     for key, item in value.items():
         if not isinstance(key, str):
             raise _invalid_proposal(f"{label} must use string object keys")
+        if key in keys:
+            raise _invalid_proposal(f"{label} must use unique object keys")
+        keys.add(key)
         items.append((key, _freeze_json_value(item, label)))
     return FrozenJsonObject(tuple(items))
 
 
 def _freeze_json_value(value: object, label: str) -> object:
-    if isinstance(value, (FrozenJsonObject, FrozenJsonArray)):
-        return value
+    if isinstance(value, FrozenJsonObject):
+        return _freeze_json_object(value, label)
+    if isinstance(value, FrozenJsonArray):
+        return FrozenJsonArray(_freeze_json_value(item, label) for item in value)
     if value is None or type(value) in {bool, str, int}:
         return value
     if type(value) is float:

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -273,17 +274,71 @@ def test_pending_delete_normalizes_unlink_failure(
     pending_path = (
         repo_root / f".codecortex/.cache/pending_proposals/{PROPOSAL_ID}.json"
     )
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
 
-    def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        if path == pending_path:
+    def fail_target_unlink(
+        path: str | bytes | Path,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if Path(path).name == pending_path.name:
             raise PermissionError("injected unlink failure")
-        real_unlink(path, *args, **kwargs)
+        real_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+    monkeypatch.setattr(os, "unlink", fail_target_unlink)
 
     with pytest.raises(CodeCortexError) as exc:
         app.pending_proposals.delete(PROPOSAL_ID)
 
     assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
     assert pending_path.is_file()
+
+
+def test_pending_load_anchors_parent_directory_against_replacement(
+    app: ApplicationServices,
+    repo_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent swap at final open must not redirect a read outside the repository."""
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Parent replacement fixture",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    assert isinstance(app.pending_proposals, PendingProposalStore)
+    store = app.pending_proposals
+    pending_directory = repo_root / ".codecortex/.cache/pending_proposals"
+    parked_directory = repo_root / ".codecortex/.cache/pending_proposals-held"
+    outside_directory = repo_root.parent / f"{repo_root.name}-outside"
+    outside_directory.mkdir()
+    outside_path = outside_directory / f"{PROPOSAL_ID}.json"
+    outside_payload = b"outside target must not be read or changed\n"
+    outside_path.write_bytes(outside_payload)
+    real_os_open = os.open
+    replaced = False
+
+    def replace_parent_at_final_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if not replaced and Path(path).name == f"{PROPOSAL_ID}.json":
+            pending_directory.rename(parked_directory)
+            pending_directory.symlink_to(outside_directory, target_is_directory=True)
+            replaced = True
+        return real_os_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replace_parent_at_final_open)
+
+    restored = store.load(PROPOSAL_ID)
+
+    assert replaced
+    assert restored == proposal
+    assert outside_path.read_bytes() == outside_payload
+    assert (parked_directory / f"{PROPOSAL_ID}.json").is_file()

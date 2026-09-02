@@ -1,9 +1,12 @@
 """Machine-local deterministic persistence for pending cognitive proposals."""
 
+import errno
 import json
 import os
+import secrets
 import stat
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -16,7 +19,7 @@ from codecortex.domain.proposals import (
     ProposalStatus,
     json_value_to_mutable,
 )
-from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
+from codecortex.infrastructure.jsonio import canonical_json_bytes
 from codecortex.infrastructure.repository import Repository
 
 _PROPOSAL_FIELDS = {
@@ -49,6 +52,24 @@ _REVISION_FIELDS = {
     "previous_uncertainties",
     "revised_at",
 }
+_PENDING_DIRECTORY_PARTS = (".codecortex", ".cache", "pending_proposals")
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_READ_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+_WRITE_OPEN_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_UNSAFE_PATH_ERRNOS = {errno.ELOOP, errno.ENOTDIR}
 
 
 class PendingProposalStore:
@@ -63,15 +84,21 @@ class PendingProposalStore:
     def create(self, proposal: Proposal) -> None:
         """Create a pending file without silently replacing an existing proposal."""
         path = self._path(proposal.proposal_id)
-        if os.path.lexists(path):
-            raise CodeCortexError(
-                ErrorCode.ANALYSIS_REPORT_INVALID,
-                "A pending proposal with this ID already exists",
-            )
+        filename = path.name
         try:
-            self._directory.mkdir(parents=True, exist_ok=True)
-            self._ensure_safe_path(path)
-            write_json_atomic(path, _proposal_to_json(proposal))
+            with self._open_pending_directory(
+                create=True, proposal_id=proposal.proposal_id
+            ) as directory_fd:
+                if _entry_mode(directory_fd, filename, proposal.proposal_id) is not None:
+                    raise CodeCortexError(
+                        ErrorCode.ANALYSIS_REPORT_INVALID,
+                        "A pending proposal with this ID already exists",
+                    )
+                _write_json_atomic_at(
+                    directory_fd,
+                    filename,
+                    _proposal_to_json(proposal),
+                )
         except CodeCortexError:
             raise
         except OSError as error:
@@ -80,15 +107,27 @@ class PendingProposalStore:
     def load(self, proposal_id: str) -> Proposal:
         """Load a canonical pending snapshot and restore domain invariants."""
         path = self._path(proposal_id)
-        if not _is_regular_file(path):
-            raise CodeCortexError(
-                ErrorCode.PROPOSAL_STALE,
-                "Pending cognitive proposal was not found",
-                details={"proposal_id": proposal_id},
-                suggested_action="Recreate the proposal",
-            )
+        filename = path.name
         try:
-            payload = _read_bytes_no_follow(path)
+            with self._open_pending_directory(
+                create=False, proposal_id=proposal_id
+            ) as directory_fd:
+                mode = _entry_mode(directory_fd, filename, proposal_id)
+                if mode is None or not stat.S_ISREG(mode):
+                    raise _missing_pending_proposal(proposal_id)
+                payload = _read_bytes_no_follow(directory_fd, filename)
+        except FileNotFoundError as error:
+            raise _missing_pending_proposal(proposal_id) from error
+        except CodeCortexError:
+            raise
+        except OSError as error:
+            raise CodeCortexError(
+                ErrorCode.ANALYSIS_REPORT_INVALID,
+                "Pending cognitive proposal is invalid",
+                details={"proposal_id": proposal_id},
+                suggested_action="Delete or recreate the pending proposal",
+            ) from error
+        try:
             data = json.loads(payload)
             if canonical_json_bytes(data) != payload:
                 raise ValueError("pending proposal is not canonical JSON")
@@ -114,23 +153,43 @@ class PendingProposalStore:
     def replace(self, proposal: Proposal) -> None:
         """Atomically replace only the current file for an existing identity."""
         path = self._path(proposal.proposal_id)
-        if not _is_regular_file(path):
-            raise CodeCortexError(
-                ErrorCode.PROPOSAL_STALE,
-                "Pending cognitive proposal was not found",
-                details={"proposal_id": proposal.proposal_id},
-                suggested_action="Recreate the proposal",
-            )
+        filename = path.name
         try:
-            write_json_atomic(path, _proposal_to_json(proposal))
+            with self._open_pending_directory(
+                create=False, proposal_id=proposal.proposal_id
+            ) as directory_fd:
+                mode = _entry_mode(directory_fd, filename, proposal.proposal_id)
+                if mode is None or not stat.S_ISREG(mode):
+                    raise _missing_pending_proposal(proposal.proposal_id)
+                _write_json_atomic_at(
+                    directory_fd,
+                    filename,
+                    _proposal_to_json(proposal),
+                )
+        except FileNotFoundError as error:
+            raise _missing_pending_proposal(proposal.proposal_id) from error
+        except CodeCortexError:
+            raise
         except OSError as error:
             raise _pending_io_error("replace", proposal.proposal_id) from error
 
     def delete(self, proposal_id: str) -> None:
         """Remove a consumed pending proposal without touching other cache state."""
         path = self._path(proposal_id)
+        filename = path.name
         try:
-            path.unlink(missing_ok=True)
+            with self._open_pending_directory(
+                create=False, proposal_id=proposal_id
+            ) as directory_fd:
+                mode = _entry_mode(directory_fd, filename, proposal_id)
+                if mode is None:
+                    return
+                os.unlink(filename, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+        except FileNotFoundError:
+            return
+        except CodeCortexError:
+            raise
         except OSError as error:
             raise _pending_io_error("delete", proposal_id) from error
 
@@ -158,6 +217,35 @@ class PendingProposalStore:
                     "Pending proposal path cannot contain symbolic links",
                     details={"path": relative.as_posix()},
                 )
+
+    @contextmanager
+    def _open_pending_directory(
+        self, *, create: bool, proposal_id: str
+    ) -> Iterator[int]:
+        descriptors: list[int] = []
+        try:
+            descriptors.append(os.open(self._repository.root, _DIRECTORY_OPEN_FLAGS))
+            for part in _PENDING_DIRECTORY_PARTS:
+                parent_fd = descriptors[-1]
+                try:
+                    child_fd = os.open(part, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    try:
+                        os.mkdir(part, mode=0o755, dir_fd=parent_fd)
+                    except FileExistsError:
+                        pass
+                    child_fd = os.open(part, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+                descriptors.append(child_fd)
+            yield descriptors[-1]
+        except OSError as error:
+            if error.errno in _UNSAFE_PATH_ERRNOS:
+                raise _unsafe_pending_path(proposal_id) from error
+            raise
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
 
 def _proposal_to_json(proposal: Proposal) -> dict[str, object]:
@@ -321,20 +409,81 @@ def _string_tuple(data: Mapping[str, object], key: str) -> tuple[str, ...]:
     return tuple(cast(list[str], values))
 
 
-def _is_regular_file(path: Path) -> bool:
+def _entry_mode(directory_fd: int, filename: str, proposal_id: str) -> int | None:
     try:
-        return stat.S_ISREG(path.lstat().st_mode)
+        mode = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False).st_mode
     except FileNotFoundError:
-        return False
-    except OSError as error:
-        raise _pending_io_error("inspect", path.stem) from error
+        return None
+    if stat.S_ISLNK(mode):
+        raise _unsafe_pending_path(proposal_id)
+    return mode
 
 
-def _read_bytes_no_follow(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+def _read_bytes_no_follow(directory_fd: int, filename: str) -> bytes:
+    descriptor = os.open(filename, _READ_OPEN_FLAGS, dir_fd=directory_fd)
     with os.fdopen(descriptor, "rb") as stream:
         return stream.read()
+
+
+def _write_json_atomic_at(
+    directory_fd: int, filename: str, value: object
+) -> None:
+    payload = canonical_json_bytes(value)
+    temporary_name: str | None = None
+    temporary_fd: int | None = None
+    for _ in range(10):
+        candidate = f".{filename}.{secrets.token_hex(8)}.tmp"
+        try:
+            temporary_fd = os.open(
+                candidate,
+                _WRITE_OPEN_FLAGS,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        temporary_name = candidate
+        break
+    if temporary_name is None or temporary_fd is None:
+        raise OSError(errno.EEXIST, "Could not allocate pending proposal temp file")
+
+    installed = False
+    try:
+        with os.fdopen(temporary_fd, "wb") as temporary_file:
+            temporary_file.write(payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        installed = True
+        os.fsync(directory_fd)
+    finally:
+        if not installed:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _missing_pending_proposal(proposal_id: str) -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.PROPOSAL_STALE,
+        "Pending cognitive proposal was not found",
+        details={"proposal_id": proposal_id},
+        suggested_action="Recreate the proposal",
+    )
+
+
+def _unsafe_pending_path(proposal_id: str) -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.PATH_OUTSIDE_REPOSITORY,
+        "Pending proposal path cannot contain symbolic links",
+        details={"proposal_id": proposal_id},
+    )
 
 
 def _pending_io_error(operation: str, proposal_id: str) -> CodeCortexError:

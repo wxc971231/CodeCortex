@@ -1,10 +1,12 @@
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.proposals import (
     ApprovalRecord,
+    FrozenJsonArray,
+    FrozenJsonObject,
     PatchOperation,
     Proposal,
     ProposalStatus,
@@ -446,3 +448,75 @@ def test_revision_validates_the_preserved_operations_digest() -> None:
         )
 
     assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_existing_frozen_json_is_resnapshotted_before_approval_and_history() -> None:
+    """Treating a caller-made frozen container as trusted could mutate approved history."""
+    alias = {"name": "ask"}
+    external = FrozenJsonObject(
+        (
+            ("id", "behavior.answer-question"),
+            ("kind", "behavior"),
+            (
+                "metadata",
+                FrozenJsonObject(
+                    (("aliases", FrozenJsonArray((alias,))),)
+                ),
+            ),
+            ("title", "Answer a repository question"),
+        )
+    )
+    proposal = make_proposal(
+        operations=(
+            PatchOperation("add_node", "behavior.answer-question", external),
+        )
+    )
+    approval = approval_for(proposal)
+
+    alias["name"] = "changed-before-verification"
+    proposal.verify_approval(approval)
+    revised = proposal.revise(
+        (PatchOperation("remove_node", "behavior.answer-question", None),),
+        reason="Remove the behavior",
+        revised_at=REVISED_AT,
+    )
+    alias["name"] = "changed-after-verification"
+
+    history = revised.revision_log[0]
+    assert canonical_patch_digest(history.previous_operations) == (
+        history.previous_patch_digest
+    )
+    assert history.previous_operations[0].to_canonical_value()["value"] == {
+        "id": "behavior.answer-question",
+        "kind": "behavior",
+        "metadata": {"aliases": [{"name": "ask"}]},
+        "title": "Answer a repository question",
+    }
+    revised.verify_approval(approval_for(revised))
+
+
+def test_frozen_json_object_rejects_normal_reassignment_before_and_after_use() -> None:
+    """A writable frozen-object attribute would let callers replace domain JSON state."""
+    external = FrozenJsonObject((("summary", "Initial evidence"),))
+
+    with pytest.raises((FrozenInstanceError, AttributeError)):
+        external._items = (("summary", "mutated before use"),)  # type: ignore[misc]
+
+    proposal = Proposal.create(
+        proposal_id=PROPOSAL_ID,
+        base_graph_revision=0,
+        analyzed_source_digest=None,
+        source_preconditions=(),
+        operations=(add_node_operation(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Keep evidence immutable",
+        evidence=(external,),
+        uncertainties=(),
+        created_at=CREATED_AT,
+    )
+    proposal.verify_approval(approval_for(proposal))
+
+    with pytest.raises((FrozenInstanceError, AttributeError)):
+        external._items = (("summary", "mutated after use"),)  # type: ignore[misc]
+
+    assert proposal.evidence[0]["summary"] == "Initial evidence"
