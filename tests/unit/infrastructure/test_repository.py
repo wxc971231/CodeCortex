@@ -76,7 +76,7 @@ def test_rejects_path_to_external_file(repository, tmp_path):
 
 
 def test_missing_git_root_is_not_initialized():
-    with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
         start = Path(temporary) / "not-a-repo" / "src"
         start.mkdir(parents=True)
 
