@@ -11,6 +11,7 @@ from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.repository import Repository
+from codecortex.infrastructure.views import render_views
 
 
 @pytest.fixture
@@ -28,6 +29,7 @@ def app(repo_root: Path) -> ApplicationServices:
         repository=repository,
         formal_store=FormalStore(repository),
         repository_lock=RepositoryLock(repo_root),
+        view_renderer=render_views,
     )
 
 

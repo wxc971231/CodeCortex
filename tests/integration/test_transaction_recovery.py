@@ -15,6 +15,7 @@ from codecortex.infrastructure.jsonio import canonical_json_bytes
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
 from codecortex.infrastructure.repository import Repository
+from codecortex.infrastructure.views import render_views
 
 PROPOSAL_ID = "prop_01J00000000000000000000000"
 CREATED_AT = "2026-09-02T01:23:45Z"
@@ -74,6 +75,7 @@ class TransactionFixture:
             formal_store=formal_store,
             repository_lock=RepositoryLock(self.repo_root),
             pending_proposals=PendingProposalStore(self.repository),
+            view_renderer=render_views,
         )
 
     def crash_after(self, stage: str) -> None:

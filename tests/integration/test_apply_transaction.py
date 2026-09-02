@@ -38,6 +38,7 @@ def app(repo_root: Path) -> ApplicationServices:
         formal_store=FormalStore(repository),
         repository_lock=RepositoryLock(repo_root),
         pending_proposals=PendingProposalStore(repository),
+        view_renderer=render_views,
     )
 
 
@@ -334,3 +335,200 @@ def test_commit_refuses_to_overwrite_an_existing_history_event(
 
     assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
     assert digest_tree(repo_root / ".codecortex") == before
+
+
+def source_file_precondition(root: Path, relative: str) -> dict[str, object]:
+    """Build a verifiable source precondition for the file's current bytes."""
+    payload = (root / relative).read_bytes()
+    return {
+        "relative_path": relative,
+        "content_digest": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+    }
+
+
+def write_source_file(root: Path, relative: str, content: bytes) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def test_apply_passes_when_source_preconditions_match_current_files(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """Verifiable preconditions that still hold must not block the apply."""
+    write_source_file(repo_root, "src/answer.py", b"def answer():\n    return 42\n")
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Add repository question behavior",
+        source_preconditions=(
+            source_file_precondition(repo_root, "src/answer.py"),
+        ),
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+
+    result = app.apply_cognitive_proposal(
+        proposal.proposal_id, approval_for(proposal)
+    )
+
+    assert result.graph_revision == 1
+    assert app.validate_graph().valid is True
+
+
+def test_apply_fails_when_a_precondition_file_changed(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """A file modified after proposal creation makes the proposal stale."""
+    write_source_file(repo_root, "src/answer.py", b"def answer():\n    return 42\n")
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Add repository question behavior",
+        source_preconditions=(
+            source_file_precondition(repo_root, "src/answer.py"),
+        ),
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    write_source_file(repo_root, "src/answer.py", b"def answer():\n    return 43\n")
+    before = digest_tree(repo_root / ".codecortex")
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+
+    assert exc.value.code is ErrorCode.PROPOSAL_STALE
+    assert exc.value.suggested_action == "Revise or recreate the proposal"
+    assert digest_tree(repo_root / ".codecortex") == before
+    assert app.cognitive_proposal(proposal.proposal_id).proposal_id == PROPOSAL_ID
+
+
+def test_apply_fails_when_a_precondition_file_is_missing(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """A deleted precondition file can no longer prove the proposal current."""
+    write_source_file(repo_root, "src/answer.py", b"def answer():\n    return 42\n")
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Add repository question behavior",
+        source_preconditions=(
+            source_file_precondition(repo_root, "src/answer.py"),
+        ),
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    (repo_root / "src/answer.py").unlink()
+    before = digest_tree(repo_root / ".codecortex")
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+
+    assert exc.value.code is ErrorCode.PROPOSAL_STALE
+    assert digest_tree(repo_root / ".codecortex") == before
+
+
+def test_apply_fails_when_analyzed_source_digest_cannot_be_reverified(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    """M0 has no Digest Profile, so a pinned source digest is unverifiable."""
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Add repository question behavior",
+        analyzed_source_digest=f"sha256:{'0' * 64}",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    before = digest_tree(repo_root / ".codecortex")
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+
+    assert exc.value.code is ErrorCode.PROPOSAL_STALE
+    assert digest_tree(repo_root / ".codecortex") == before
+
+
+VALID_CONTENT_DIGEST = f"sha256:{'1' * 64}"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"relative_path": "src/answer.py"},
+        {"relative_path": "src/answer.py", "content_digest": "not-a-digest"},
+        {"relative_path": "/etc/hostname", "content_digest": VALID_CONTENT_DIGEST},
+        {"relative_path": "../outside.py", "content_digest": VALID_CONTENT_DIGEST},
+    ],
+    ids=["missing-digest", "bad-digest", "absolute-path", "escaping-path"],
+)
+def test_apply_fails_when_a_precondition_entry_cannot_be_verified(
+    app: ApplicationServices, repo_root: Path, entry: dict[str, object]
+) -> None:
+    """Entries the applier cannot verify must fail closed, never commit."""
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Add repository question behavior",
+        source_preconditions=(entry,),
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+    before = digest_tree(repo_root / ".codecortex")
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+
+    assert exc.value.code is ErrorCode.PROPOSAL_STALE
+    assert digest_tree(repo_root / ".codecortex") == before
+
+
+def test_apply_requires_a_configured_view_renderer(repo_root: Path) -> None:
+    """View rendering is an injected port, not an application-layer import."""
+    repository = Repository(repo_root)
+    app = ApplicationServices(
+        repository=repository,
+        formal_store=FormalStore(repository),
+        repository_lock=RepositoryLock(repo_root),
+        pending_proposals=PendingProposalStore(repository),
+    )
+    app.initialize_repository()
+    proposal = app.create_cognitive_proposal(
+        operations=(add_node(),),
+        affected_nodes=("behavior.answer-question",),
+        reason="Add repository question behavior",
+        proposal_id=PROPOSAL_ID,
+        created_at=CREATED_AT,
+    )
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+
+    assert exc.value.code is ErrorCode.NOT_INITIALIZED
+
+
+def test_commit_requires_the_state_to_reference_its_event(
+    app: ApplicationServices, approved_proposal: Proposal
+) -> None:
+    """A commit whose event is not in the state is a caller bug, not corruption."""
+    result = app.apply_cognitive_proposal(
+        approved_proposal.proposal_id, approval_for(approved_proposal)
+    )
+    assert isinstance(app.formal_store, FormalStore)
+    state = app.formal_store.load()
+    dangling_event = {
+        "schema_version": 1,
+        "event_id": "evt_01J00000000000000000000000",
+        "event_type": "cognitive_proposal_applied",
+    }
+    assert dangling_event["event_id"] != result.event_id
+
+    with pytest.raises(ValueError, match="does not reference its event"):
+        app.formal_store.commit(
+            state, event=dangling_event, views=render_views(state.graph)
+        )

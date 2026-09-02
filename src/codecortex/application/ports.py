@@ -1,12 +1,12 @@
 """Application-layer contracts for infrastructure adapters."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from codecortex.domain.cognition import FormalState
+from codecortex.domain.cognition import CognitiveGraph, FormalState
 from codecortex.domain.proposals import Proposal
 
 LockMode = Literal["shared", "exclusive"]
@@ -25,6 +25,10 @@ class RepositoryContextPort(Protocol):
     """Expose the stable root needed by repository-scoped application results."""
 
     root: Path
+
+
+ViewRendererPort = Callable[[CognitiveGraph], Mapping[str, bytes]]
+"""Render the deterministic view set for one committed graph revision."""
 
 
 @dataclass(frozen=True)

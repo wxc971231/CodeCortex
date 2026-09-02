@@ -13,6 +13,7 @@ from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
 from codecortex.infrastructure.repository import Repository
+from codecortex.infrastructure.views import render_views
 
 PROPOSAL_ID = "prop_01J00000000000000000000000"
 CREATED_AT = "2026-09-02T01:23:45Z"
@@ -35,6 +36,7 @@ def app(repo_root: Path) -> ApplicationServices:
         formal_store=FormalStore(repository),
         repository_lock=RepositoryLock(repo_root),
         pending_proposals=PendingProposalStore(repository),
+        view_renderer=render_views,
     )
 
 

@@ -1,14 +1,19 @@
 """Application use cases coordinating formal state and repository locking."""
 
+import hashlib
+import os
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import cast
+from pathlib import Path
 
 from codecortex.application.ports import (
     FormalStorePort,
     PendingProposalStorePort,
     RepositoryContextPort,
     RepositoryLockPort,
+    ViewRendererPort,
 )
 from codecortex.domain.cognition import (
     CognitiveGraph,
@@ -30,7 +35,6 @@ from codecortex.domain.proposals import (
     ProposalStatus,
     json_value_to_mutable,
 )
-from codecortex.infrastructure.views import render_views
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ class ApplicationServices:
     repository_lock: RepositoryLockPort
     lock_timeout_seconds: float = 10
     pending_proposals: PendingProposalStorePort | None = None
+    view_renderer: ViewRendererPort | None = None
 
     def initialize_repository(self) -> RepositoryOverview:
         """Idempotently establish the revision-zero technical skeleton."""
@@ -185,6 +190,7 @@ class ApplicationServices:
             proposal = store.load(proposal_id)
             proposal.verify_approval(approval)
             proposal.verify_base_graph_revision(state.graph.graph_revision)
+            _verify_source_preconditions(self.repository.root, proposal)
             event_id = new_id(IdPrefix.EVENT)
             new_revision = state.graph.graph_revision + 1
             applied = _applied_formal_state(state, proposal, event_id, new_revision)
@@ -203,7 +209,7 @@ class ApplicationServices:
                     },
                     suggested_action="Revise or recreate the proposal",
                 )
-            views = render_views(applied.graph)
+            views = self._view_renderer()(applied.graph)
             event = _history_event(proposal, approval, event_id, new_revision)
             self.formal_store.commit(applied, event, views)
             store.delete(proposal_id)
@@ -221,6 +227,14 @@ class ApplicationServices:
             )
         return self.pending_proposals
 
+    def _view_renderer(self) -> ViewRendererPort:
+        if self.view_renderer is None:
+            raise CodeCortexError(
+                ErrorCode.NOT_INITIALIZED,
+                "View rendering is not configured",
+            )
+        return self.view_renderer
+
     def _overview(self, state: FormalState) -> RepositoryOverview:
         return RepositoryOverview(
             repository_root=self.repository.root.as_posix(),
@@ -233,6 +247,69 @@ class ApplicationServices:
 
 def _utc_now_rfc3339() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+_CONTENT_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def _stale_proposal(message: str) -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.PROPOSAL_STALE,
+        message,
+        suggested_action="Revise or recreate the proposal",
+    )
+
+
+def _verify_source_preconditions(root: Path, proposal: Proposal) -> None:
+    """Re-verify every source precondition against the current repository.
+
+    M0 can recompute plain SHA-256 file digests but has no Digest Profile
+    to recompute a comparable repository digest, so a proposal pinning
+    ``analyzed_source_digest`` is unverifiable and fails closed as stale.
+    """
+    if proposal.analyzed_source_digest is not None:
+        raise _stale_proposal(
+            "Proposal analyzed source digest cannot be re-verified in M0"
+        )
+    for entry in proposal.source_preconditions:
+        _verify_source_precondition(root, entry)
+
+
+def _verify_source_precondition(root: Path, entry: Mapping[str, object]) -> None:
+    if not isinstance(entry, Mapping) or set(entry) != {
+        "relative_path",
+        "content_digest",
+    }:
+        raise _stale_proposal("Source precondition has an unverifiable shape")
+    relative = entry["relative_path"]
+    expected = entry["content_digest"]
+    if not isinstance(relative, str) or not relative:
+        raise _stale_proposal("Source precondition path is not verifiable")
+    if not isinstance(expected, str) or (
+        _CONTENT_DIGEST_PATTERN.fullmatch(expected) is None
+    ):
+        raise _stale_proposal("Source precondition digest is not verifiable")
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise _stale_proposal(
+            f"Source precondition path escapes the repository: {relative}"
+        )
+    resolved = (root / candidate).resolve()
+    if os.path.commonpath((str(root), str(resolved))) != str(root):
+        raise _stale_proposal(
+            f"Source precondition path escapes the repository: {relative}"
+        )
+    try:
+        payload = resolved.read_bytes()
+    except OSError as error:
+        raise _stale_proposal(
+            f"Source precondition file is unreadable: {relative}"
+        ) from error
+    actual = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    if actual != expected:
+        raise _stale_proposal(
+            f"Source precondition file changed since proposal creation: {relative}"
+        )
 
 
 def _applied_formal_state(
@@ -325,7 +402,11 @@ def _patched_record(
     *,
     revision_key: str = "node_revision",
 ) -> dict[str, object]:
-    value = cast(dict[str, object], json_value_to_mutable(operation.value))
+    value = json_value_to_mutable(operation.value)
+    if not isinstance(value, dict):
+        raise _invalid_patch(
+            f"Patch value must be an object: {operation.target_id}"
+        )
     record = dict(value)
     record["approval"] = dict(provenance)
     record[revision_key] = new_revision

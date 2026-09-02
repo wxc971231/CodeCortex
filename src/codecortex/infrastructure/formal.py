@@ -245,7 +245,7 @@ class FormalStore:
             )
         validate_id(event_id, IdPrefix.EVENT)
         if event_id not in {ref.event_id for ref in state.history_events}:
-            self._raise_corrupt("Committed state does not reference its event")
+            raise ValueError("Committed state does not reference its event")
         event_relative = f"history/events/{event_id}.json"
         if (self._root / event_relative).exists():
             raise CodeCortexError(
