@@ -198,12 +198,12 @@ def test_missing_command_prints_usage_and_exits_2(
 
 @pytest.mark.parametrize(
     "argv",
-    [["install-codex"], ["doctor"], ["doctor", "--json"]],
+    [["doctor"], ["doctor", "--json"]],
 )
 def test_commands_without_implementation_exit_2(
     argv: list[str], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Scaffolding defaults fail loudly on stderr until Tasks 10-11 wire them."""
+    """Doctor remains an unavailable scaffold until Task 11 wires it."""
     assert main(argv) == 2
     captured = capsys.readouterr()
     assert captured.out == ""

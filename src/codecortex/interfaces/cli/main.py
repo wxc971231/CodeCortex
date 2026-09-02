@@ -8,6 +8,7 @@ and tracebacks always go to stderr.
 """
 
 import json
+import shutil
 import sys
 import traceback
 from argparse import ArgumentParser, Namespace
@@ -62,7 +63,20 @@ def _command_not_available(name: str) -> int:
 
 
 def _install_codex_unavailable(*, dry_run: bool, force: bool) -> int:
-    return _command_not_available("install-codex")
+    from codecortex.integrations.codex.install import install_codex
+
+    executable = shutil.which("codecortex")
+    if executable is None:
+        return _command_not_available("install-codex")
+    result = install_codex(
+        Path.home(), Path(executable), dry_run=dry_run, force=force
+    )
+    action = "would update" if result.dry_run else "updated"
+    if not result.changed:
+        print("CodeCortex Codex integration is already current")
+    else:
+        print(f"CodeCortex {action}: {', '.join(result.changed_paths)}")
+    return 0
 
 
 def _doctor_unavailable(*, as_json: bool) -> int:

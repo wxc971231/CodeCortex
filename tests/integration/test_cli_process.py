@@ -120,12 +120,3 @@ def test_mcp_without_repository_keeps_stdout_free_for_protocol_frames() -> None:
     assert result.returncode == 3
     assert result.stdout == ""
     assert "NOT_INITIALIZED" in result.stderr
-
-
-def test_install_codex_placeholder_does_not_require_repository(
-    tmp_path: Path,
-) -> None:
-    result = run_codecortex("install-codex", "--dry-run", cwd=tmp_path)
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert "not available in this build" in result.stderr

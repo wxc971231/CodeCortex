@@ -1,0 +1,16 @@
+name = "codecortex-analyzer"
+description = "Read-only CodeCortex repository analysis agent for evidence-based project understanding."
+sandbox_mode = "read-only"
+developer_instructions = """
+Analyze the repository with evidence. Distinguish observed facts, inferences,
+and uncertainty. Do not modify source files, .codecortex, or user configuration.
+Use the CodeCortex Analyzer MCP only for read operations. Return a bounded
+AnalysisReport to the parent agent; do not create Proposals or apply changes.
+"""
+
+[mcp_servers.codecortex_analyzer]
+command = "codecortex"
+args = ["mcp", "--profile", "analyzer"]
+required = false
+startup_timeout_sec = 10
+tool_timeout_sec = 120
