@@ -186,13 +186,15 @@ Domain 不读取文件、不执行 SQL、不依赖 MCP、Codex 或 Pydantic。Ap
 
 ### 7.1 正式真相
 
-- `manifest.json`：schema、graph revision、Digest Profile、Managed Source Set 规则和 cognition baseline；
+- `manifest.json`：schema、graph revision、`cognition_initialized`、Digest Profile、Managed Source Set 规则和 cognition baseline；
 - `graph.json`：唯一规范认知图；
 - `entity_refs.json`：正式图实际引用的稳定 CodeEntity 身份和最后已知地址；
 - `source_baseline.json`：与 cognition baseline 对应的受管理文件路径和逐文件内容摘要，用于 cache 删除或跨机器后的精确文件级差异重建；
 - `history/events/`：不可变正式事件；
 - `PROJECT.md`：用户手工维护的项目背景；
 - `views/`：可重建但提交 Git 的人类可读投影。
+
+`cognition_initialized=false` 时 baseline digest 必须为 null，source baseline 文件必须为空；M0 可以为持久化链路测试推进 graph revision，但不能把它标记为真实项目认知。首次 M1a 初始化 apply 在同一正式事务把该字段设为 true 并建立非空 source baseline。字段为 true 后 baseline 不得为空。
 
 ### 7.2 查询副本
 

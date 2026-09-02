@@ -64,7 +64,7 @@ cognition_baseline:
   accepted_event_id: evt_...
 ```
 
-baseline 表示“正式认知已经针对这份源码状态完成语义处理”，不是最后一次 Git commit。graph revision 可以不变而 baseline 推进，例如确认代码重构没有改变认知语义。
+本节所有 Freshness 流程都要求 manifest `cognition_initialized=true`。baseline 表示“正式认知已经针对这份源码状态完成语义处理”，不是最后一次 Git commit。graph revision 可以不变而 baseline 推进，例如确认代码重构没有改变认知语义；若该标志为 false，M1b 工具返回 `NOT_INITIALIZED`，不得把 M0 技术 revision 当成可查询认知。
 
 `.codecortex/source_baseline.json` 与 manifest baseline 属于同一正式状态，保存当时全部 Managed Source Set 的规范化相对路径和逐文件 digest。manifest 提供快速总摘要，source baseline 提供 cache 删除或跨机器恢复时的文件级比较依据；两者不一致属于 `FORMAL_STATE_CORRUPT`。它不保存源码、AST 或每个历史版本，只保存当前正式 baseline。
 

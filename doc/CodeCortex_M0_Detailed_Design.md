@@ -216,6 +216,7 @@ M1a/M1b 增加的工具在各自文档定义。profile 工具列表使用测试�
 
 ```text
 manifest.graph_revision = 0
+manifest.cognition_initialized = false
 graph.nodes = []
 graph.semantic_edges = []
 graph.logical_flows = []
@@ -225,7 +226,7 @@ source_baseline.repository_source_digest = null
 source_baseline.files = []
 ```
 
-同时创建默认 `config.toml`、空 `source_baseline.json`、`PROJECT.md` 模板和空 Views。revision 0 的 source baseline 允许摘要为 null，且 manifest cognition baseline 也必须为 null；它不声称已经理解项目，也不推进 cognition baseline。重复执行返回现有状态；发现半初始化或非法正式文件时拒绝覆盖。
+同时创建默认 `config.toml`、空 `source_baseline.json`、`PROJECT.md` 模板和空 Views。`cognition_initialized=false` 时 source baseline 摘要和 manifest cognition baseline 必须同时为 null；它不声称已经理解项目，也不推进 cognition baseline。重复执行返回现有状态；发现半初始化或非法正式文件时拒绝覆盖。
 
 M1a 的 `$codecortex init` 在 revision 0 上完成真实 AST、Analyzer 和初始化 Proposal，批准后产生 revision 1。
 
@@ -291,6 +292,8 @@ Core 不独立验证自然语言消息作者；Skill/Main 是否如实构造 rec
 6. 按技术架构事务协议提交；
 7. 将 pending Proposal 标记为 applied 或删除；正式 Event 已包含完整快照。
 
+M0 的最小 Proposal 只验证技术链路，即使 graph revision 变为 1，也必须保持 `cognition_initialized=false` 和空 source baseline。首次真实项目理解只能由 M1a 初始化流程建立。
+
 失败不得暴露一半 revision。apply 返回：
 
 ```json
@@ -329,6 +332,7 @@ Core 不独立验证自然语言消息作者；Skill/Main 是否如实构造 rec
 - canonical Patch digest；
 - approval mismatch、revision conflict；
 - History 引用完整性。
+- `cognition_initialized=false` 与空 baseline 的一致性，且 M0 apply 不改变该标志；
 
 ### 14.2 集成测试
 

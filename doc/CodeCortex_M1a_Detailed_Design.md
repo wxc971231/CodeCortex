@@ -79,7 +79,7 @@ files:
 
 `files` 按规范化相对路径排序且路径唯一。文件中的仓库摘要必须与 manifest cognition baseline 相同。它只在初始化 apply、带图修改的 apply 或 baseline advance 正式事务中整体替换；普通 Fact Sync 绝不改它。这样 SQLite 被删除或换机器后，Core 仍能从“已接受的逐文件基线”与当前源码精确恢复 added/modified/deleted 文件集合。
 
-唯一例外是 M0 revision 0：manifest cognition baseline 和 `repository_source_digest` 同时为 null，`files=[]`。首次真实初始化 apply 后不再允许 null。
+当 manifest `cognition_initialized=false` 时，cognition baseline 和 `repository_source_digest` 必须同时为 null，`files=[]`；M0 技术验收即使推进 graph revision 也保持该状态。首次真实初始化 apply 原子设置 `cognition_initialized=true` 并建立非空 baseline，此后不再允许 null。
 
 ## 3. AST 解析
 
@@ -652,7 +652,7 @@ M1a 正式事件：
 
 节点/边/Flow/Mapping 的 approval 指向最新改变它的 applied Event；Event 内保存 Proposal ID，形成 `Object → Event → Proposal Snapshot`。
 
-初始化 apply 以及后续认知 Proposal apply，都把已经重新核验的当前 source digest 设为 cognition baseline，并从当前排序后的逐文件摘要在同一正式事务生成对应 `source_baseline.json`。History Event 不可修改；cache 中的 pending Proposal 可以删除。
+初始化 apply 原子设置 `cognition_initialized=true`，并和后续认知 Proposal apply 一样，把已经重新核验的当前 source digest 设为 cognition baseline，从当前排序后的逐文件摘要在同一正式事务生成对应 `source_baseline.json`。History Event 不可修改；cache 中的 pending Proposal 可以删除。
 
 ## 15. 原子 apply
 
@@ -736,6 +736,7 @@ M0 Proposal 工具扩展为完整 M1a schema。所有列表返回 cursor 和 `tr
 - apply 故障注入和 History 不可变；
 - View 可重复生成。
 - source baseline 与 manifest digest 一致，事务失败不会只推进其中一方；
+- 首次初始化同时设置 `cognition_initialized=true`；M0 技术状态即使 revision 大于 0 仍可明确识别为未初始化；
 - Analyzer 开始后源码变化时 AnalysisReport 被拒绝；
 
 ### 18.4 真实初始化

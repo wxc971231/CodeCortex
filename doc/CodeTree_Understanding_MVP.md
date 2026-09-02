@@ -1,6 +1,6 @@
 # CodeCortex 项目理解系统 MVP
 
-## 设计规格 v0.6.1
+## 设计规格 v0.6.2
 
 **状态：** Implementation Baseline 已冻结
 
@@ -686,7 +686,7 @@ Core 能验证 Proposal、approval record、base graph revision、source precond
 ### 12.2 真相来源
 
 - `graph.json` 是语义认知图的规范数据；
-- `manifest.json` 保存 schema、受管理源码规则，以及与当前 graph revision 对应的 cognition baseline 摘要；
+- `manifest.json` 保存 schema、受管理源码规则、`cognition_initialized`，以及与当前 graph revision 对应的 cognition baseline 摘要；
 - `entity_refs.json` 保存认知图实际引用的稳定 CodeEntity 身份；
 - `source_baseline.json` 保存与正式 cognition baseline 对应的受管理文件路径和逐文件内容摘要，不保存源码或 AST；
 - `PROJECT.md` 保存用户可手工维护的项目背景和目标；
@@ -712,7 +712,7 @@ files:
 
 文件按规范化相对路径稳定排序且路径唯一。普通 Fact Sync 只更新 cache，不能修改 source baseline；只有初始化 apply、认知 Proposal apply 或 cognition baseline advance 的正式事务才能整体替换它。
 
-M0 revision 0 是唯一空基线：manifest cognition baseline 与 `repository_source_digest` 同时为 null，`files=[]`；首次真实初始化 apply 后不再允许 null。
+`cognition_initialized=false` 表示只完成 M0 技术骨架，manifest cognition baseline 与 `repository_source_digest` 必须同时为 null，`files=[]`；M0 的持久化验收可以推进 graph revision，但不得把该标志改成 true。首次真实 M1a 初始化 apply 必须原子设置 `cognition_initialized=true` 并建立非空基线；此后不再允许 null。这样 graph revision 只表示正式状态版本，不被误当成“已经完成项目理解”。
 
 MVP 只持久化两类 History Event：
 
