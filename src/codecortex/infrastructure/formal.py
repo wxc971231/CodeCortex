@@ -2,12 +2,15 @@
 
 import json
 import os
+import shutil
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from codecortex.application.ports import RecoveryResult
 from codecortex.domain.cognition import (
     SCHEMA_VERSION,
     CognitiveGraph,
@@ -21,6 +24,7 @@ from codecortex.domain.cognition import (
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.ids import IdPrefix, validate_id
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.repository import Repository
 
@@ -94,18 +98,52 @@ _JSON_BOMS = (
     b"\xff\xfe",
     b"\xfe\xff",
 )
+_COMMIT_STAGE_ORDER = ("event", "graph", "entity_refs", "source_baseline", "views")
+_JOURNAL_FIELDS = {
+    "schema_version",
+    "transaction_id",
+    "event_id",
+    "base_graph_revision",
+    "target_graph_revision",
+    "targets",
+    "removals",
+}
+_JOURNAL_TARGET_FIELDS = {"path", "existed_before"}
+_JOURNAL_REMOVAL_FIELDS = {"path"}
 
 
 class _DuplicateJsonKeyError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class _JournalTarget:
+    path: str
+    existed_before: bool
+
+
+@dataclass(frozen=True)
+class _Journal:
+    transaction_id: str
+    event_id: str
+    base_graph_revision: int
+    target_graph_revision: int
+    targets: tuple[_JournalTarget, ...]
+    removals: tuple[str, ...]
+
+
 class FormalStore:
     """Load and initialize Git-portable formal files for one repository."""
 
-    def __init__(self, repository: Repository) -> None:
+    def __init__(
+        self,
+        repository: Repository,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> None:
         self._repository = repository
         self._root = repository.resolve_relative(".codecortex")
+        self._crash_hook = crash_hook
 
     def initialize(self, state: FormalState) -> FormalState:
         """Create formal revision zero, or return an existing valid state unchanged."""
@@ -185,6 +223,290 @@ class FormalStore:
         return {
             relative: (self._root / relative).is_file() for relative in _FORMAL_FILES
         }
+
+    def commit(
+        self,
+        state: FormalState,
+        event: Mapping[str, object],
+        views: Mapping[str, bytes],
+    ) -> None:
+        """Commit one validated formal revision as a journaled transaction.
+
+        All targets are staged and fsynced, old-file backups and a journal
+        are persisted, and the manifest is replaced last as the commit
+        marker, so an interruption is recoverable to either the complete
+        old or the complete new revision. History events are immutable:
+        an event file that already exists is never overwritten.
+        """
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str):
+            raise CodeCortexError(
+                ErrorCode.INVALID_ID, "History event ID must be text"
+            )
+        validate_id(event_id, IdPrefix.EVENT)
+        if event_id not in {ref.event_id for ref in state.history_events}:
+            self._raise_corrupt("Committed state does not reference its event")
+        event_relative = f"history/events/{event_id}.json"
+        if (self._root / event_relative).exists():
+            raise CodeCortexError(
+                ErrorCode.ANALYSIS_REPORT_INVALID,
+                "History events are immutable and cannot be overwritten",
+                details={"event_id": event_id},
+            )
+        base_revision = self._manifest_revision()
+        if state.manifest.graph_revision != base_revision + 1:
+            self._raise_corrupt(
+                "Commit revision does not follow the on-disk graph revision"
+            )
+
+        payloads: dict[str, bytes] = {
+            event_relative: canonical_json_bytes(dict(event)),
+            "graph.json": canonical_json_bytes(_graph_to_json(state.graph)),
+            "entity_refs.json": canonical_json_bytes(
+                _entity_refs_to_json(state.entity_refs)
+            ),
+            "source_baseline.json": canonical_json_bytes(
+                _source_baseline_to_json(state.source_baseline)
+            ),
+            "manifest.json": canonical_json_bytes(_manifest_to_json(state.manifest)),
+        }
+        for relative, payload in views.items():
+            if not relative.startswith("views/"):
+                self._raise_corrupt("Rendered view paths must stay under views/")
+            payloads[relative] = payload
+        for relative in payloads:
+            _checked_relative(self._root, relative)
+        removals = self._view_removals(set(views))
+
+        transaction_root = self._transactions_root()
+        transaction_directory = transaction_root / event_id
+        if transaction_directory.exists():
+            self._raise_corrupt("A transaction with this event ID already exists")
+        staged_root = transaction_directory / "staged"
+        for relative, payload in payloads.items():
+            _write_staged(staged_root / relative, payload)
+        _fsync_tree(staged_root)
+        _fsync_directory(transaction_directory)
+        self._crash("staged")
+
+        backup_root = transaction_directory / "backup"
+        journal_targets = [
+            {
+                "path": relative,
+                "existed_before": self._backup_existing(backup_root, relative),
+            }
+            for relative in payloads
+        ]
+        journal_removals = []
+        for relative in removals:
+            self._backup_existing(backup_root, relative)
+            journal_removals.append({"path": relative})
+        _fsync_tree(backup_root)
+        journal = {
+            "schema_version": SCHEMA_VERSION,
+            "transaction_id": event_id,
+            "event_id": event_id,
+            "base_graph_revision": base_revision,
+            "target_graph_revision": state.manifest.graph_revision,
+            "targets": journal_targets,
+            "removals": journal_removals,
+        }
+        write_json_atomic(transaction_directory / "journal.json", journal)
+        _fsync_directory(transaction_directory)
+        self._crash("journal")
+
+        stage_targets: dict[str, list[str]] = {
+            "event": [event_relative],
+            "graph": ["graph.json"],
+            "entity_refs": ["entity_refs.json"],
+            "source_baseline": ["source_baseline.json"],
+            "views": sorted(views),
+        }
+        for stage in _COMMIT_STAGE_ORDER:
+            for relative in stage_targets[stage]:
+                os.replace(staged_root / relative, self._root / relative)
+            if stage == "views":
+                for relative in removals:
+                    (self._root / relative).unlink(missing_ok=True)
+            self._crash(stage)
+        os.replace(staged_root / "manifest.json", self._root / "manifest.json")
+        self._crash("manifest")
+
+        self._fsync_formal_parents((*payloads, *removals))
+        shutil.rmtree(transaction_directory)
+        _fsync_directory(transaction_root)
+
+    def recover(self) -> RecoveryResult:
+        """Resolve interrupted formal transactions to a provable revision.
+
+        A manifest still at the base revision rolls the transaction back
+        from its backups; a manifest at the target revision means the
+        commit marker landed and only cleanup remains. A journal-less
+        staging directory never began replacements and is discarded after
+        the formal state is proven intact. Anything that cannot be proven
+        consistent raises FORMAL_STATE_CORRUPT instead of being repaired.
+        """
+        transaction_root = self._transactions_root()
+        restored: list[str] = []
+        completed: list[str] = []
+        if transaction_root.is_dir():
+            for directory in sorted(
+                (path for path in transaction_root.iterdir() if path.is_dir()),
+                key=lambda path: path.name,
+            ):
+                self._recover_transaction(directory, restored, completed)
+        state = self.load()
+        return RecoveryResult(
+            visible_revision=state.manifest.graph_revision,
+            is_internally_consistent=True,
+            restored_transactions=tuple(restored),
+            completed_transactions=tuple(completed),
+        )
+
+    def _recover_transaction(
+        self,
+        transaction_directory: Path,
+        restored: list[str],
+        completed: list[str],
+    ) -> None:
+        journal_path = transaction_directory / "journal.json"
+        if not journal_path.is_file():
+            self.load()
+            shutil.rmtree(transaction_directory)
+            _fsync_directory(self._transactions_root())
+            completed.append(transaction_directory.name)
+            return
+        journal = self._read_journal(journal_path, transaction_directory.name)
+        current_revision = self._manifest_revision()
+        if current_revision == journal.base_graph_revision:
+            self._rollback(transaction_directory, journal)
+            restored.append(transaction_directory.name)
+        elif current_revision == journal.target_graph_revision:
+            completed.append(transaction_directory.name)
+        else:
+            self._raise_corrupt(
+                "Interrupted transaction matches neither the old "
+                "nor the new graph revision"
+            )
+        shutil.rmtree(transaction_directory)
+        _fsync_directory(self._transactions_root())
+
+    def _rollback(self, transaction_directory: Path, journal: _Journal) -> None:
+        backup_root = transaction_directory / "backup"
+        for target in journal.targets:
+            formal_path = _checked_relative(self._root, target.path)
+            if target.existed_before:
+                backup_path = _checked_relative(backup_root, target.path)
+                if not backup_path.is_file():
+                    self._raise_corrupt("Transaction backup is missing")
+                _write_bytes_atomic(formal_path, backup_path.read_bytes())
+            else:
+                formal_path.unlink(missing_ok=True)
+        for removal in journal.removals:
+            backup_path = _checked_relative(backup_root, removal)
+            if not backup_path.is_file():
+                self._raise_corrupt("Transaction backup is missing")
+            _write_bytes_atomic(
+                _checked_relative(self._root, removal), backup_path.read_bytes()
+            )
+        self._fsync_formal_parents(
+            [target.path for target in journal.targets] + list(journal.removals)
+        )
+
+    def _read_journal(self, path: Path, transaction_id: str) -> _Journal:
+        try:
+            data = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError) as error:
+            self._raise_corrupt("Transaction journal is unreadable", cause=error)
+        if not isinstance(data, dict) or set(data) != _JOURNAL_FIELDS:
+            self._raise_corrupt("Transaction journal fields are invalid")
+        if data["schema_version"] != SCHEMA_VERSION:
+            self._raise_corrupt("Transaction journal schema version is unsupported")
+        if data["transaction_id"] != transaction_id:
+            self._raise_corrupt("Transaction journal does not match its directory")
+        event_id = data["event_id"]
+        if not isinstance(event_id, str):
+            self._raise_corrupt("Transaction journal event ID must be text")
+        base_revision = data["base_graph_revision"]
+        target_revision = data["target_graph_revision"]
+        if (
+            type(base_revision) is not int
+            or type(target_revision) is not int
+            or base_revision < 0
+            or target_revision != base_revision + 1
+        ):
+            self._raise_corrupt("Transaction journal revisions are invalid")
+        targets = data["targets"]
+        removals = data["removals"]
+        if not isinstance(targets, list) or not all(
+            isinstance(item, dict) and set(item) == _JOURNAL_TARGET_FIELDS
+            for item in targets
+        ):
+            self._raise_corrupt("Transaction journal targets are invalid")
+        if not isinstance(removals, list) or not all(
+            isinstance(item, dict) and set(item) == _JOURNAL_REMOVAL_FIELDS
+            for item in removals
+        ):
+            self._raise_corrupt("Transaction journal removals are invalid")
+        journal_targets = []
+        for item in targets:
+            _checked_relative(self._root, item["path"])
+            if type(item["existed_before"]) is not bool:
+                self._raise_corrupt("Transaction journal backup flags are invalid")
+            journal_targets.append(
+                _JournalTarget(item["path"], item["existed_before"])
+            )
+        journal_removals = []
+        for item in removals:
+            _checked_relative(self._root, item["path"])
+            journal_removals.append(item["path"])
+        return _Journal(
+            transaction_id=transaction_id,
+            event_id=event_id,
+            base_graph_revision=base_revision,
+            target_graph_revision=target_revision,
+            targets=tuple(journal_targets),
+            removals=tuple(journal_removals),
+        )
+
+    def _manifest_revision(self) -> int:
+        data = self._read_object(self._root / "manifest.json")
+        revision = data.get("graph_revision")
+        if type(revision) is not int:
+            self._raise_corrupt("manifest.json graph_revision must be an integer")
+        return revision
+
+    def _transactions_root(self) -> Path:
+        return self._root / ".cache" / "transactions"
+
+    def _view_removals(self, rendered: set[str]) -> list[str]:
+        managed = {"views/TREE.md"}
+        for directory in ("responsibilities", "behaviors", "capabilities"):
+            view_directory = self._root / "views" / directory
+            if view_directory.is_dir():
+                managed.update(
+                    f"views/{directory}/{path.name}"
+                    for path in view_directory.glob("*.md")
+                )
+        return sorted(managed - rendered)
+
+    def _backup_existing(self, backup_root: Path, relative: str) -> bool:
+        source = _checked_relative(self._root, relative)
+        if not source.is_file():
+            return False
+        _write_staged(_checked_relative(backup_root, relative), source.read_bytes())
+        return True
+
+    def _fsync_formal_parents(self, relatives: Iterable[str]) -> None:
+        directories = {self._root}
+        for relative in relatives:
+            directories.add(_checked_relative(self._root, relative).parent)
+        for directory in sorted(directories):
+            _fsync_directory(directory)
+
+    def _crash(self, stage: str) -> None:
+        if self._crash_hook is not None:
+            self._crash_hook(stage)
 
     def _formal_presence(self) -> bool:
         if not self._root.exists():
@@ -530,3 +852,49 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+
+
+def _checked_relative(root: Path, relative: object) -> Path:
+    if not isinstance(relative, str):
+        raise CodeCortexError(
+            ErrorCode.FORMAL_STATE_CORRUPT, "Transaction path must be text"
+        )
+    candidate = Path(relative)
+    if not relative or candidate.is_absolute() or ".." in candidate.parts:
+        raise CodeCortexError(
+            ErrorCode.FORMAL_STATE_CORRUPT,
+            "Transaction path escapes the formal state root",
+            details={"path": relative},
+        )
+    resolved = (root / candidate).resolve()
+    if os.path.commonpath((str(root), str(resolved))) != str(root):
+        raise CodeCortexError(
+            ErrorCode.FORMAL_STATE_CORRUPT,
+            "Transaction path escapes the formal state root",
+            details={"path": relative},
+        )
+    return root / candidate
+
+
+def _write_staged(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    for current, directories, _files in os.walk(root, topdown=False):
+        for name in directories:
+            _fsync_directory(Path(current) / name)
+    _fsync_directory(root)

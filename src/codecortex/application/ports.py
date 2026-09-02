@@ -1,6 +1,8 @@
 """Application-layer contracts for infrastructure adapters."""
 
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -25,8 +27,18 @@ class RepositoryContextPort(Protocol):
     root: Path
 
 
+@dataclass(frozen=True)
+class RecoveryResult:
+    """The outcome of resolving interrupted formal transactions at startup."""
+
+    visible_revision: int
+    is_internally_consistent: bool
+    restored_transactions: tuple[str, ...] = ()
+    completed_transactions: tuple[str, ...] = ()
+
+
 class FormalStorePort(Protocol):
-    """Load and initialize complete formal snapshots."""
+    """Load, initialize, and atomically commit complete formal snapshots."""
 
     def initialize(self, state: FormalState) -> FormalState:
         """Create initial formal state or load an existing valid state."""
@@ -36,6 +48,17 @@ class FormalStorePort(Protocol):
 
     def formal_file_presence(self) -> dict[str, bool]:
         """Return required formal-file existence by repository-relative path."""
+
+    def commit(
+        self,
+        state: FormalState,
+        event: Mapping[str, object],
+        views: Mapping[str, bytes],
+    ) -> None:
+        """Commit one validated formal revision as a journaled transaction."""
+
+    def recover(self) -> RecoveryResult:
+        """Resolve interrupted transactions to a complete old or new revision."""
 
 
 class PendingProposalStorePort(Protocol):
