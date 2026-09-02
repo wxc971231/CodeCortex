@@ -8,7 +8,7 @@
 
 **Tech Stack:** Completed M0/M1a stack, SQLite fact/baseline snapshots, deterministic source digests, Codex Skill routing, subprocess-based isolated `codex exec` evaluation, JSONL trace parsing, pytest benchmark fixtures.
 
-**Spec:** `doc/CodeCortex_M1b_Detailed_Design.md`, `doc/CodeCortex_Technical_Architecture.md`, and `doc/CodeTree_Understanding_MVP.md` v0.6.2.
+**Spec:** `docs/CodeCortex_M1b_Detailed_Design.md`, `docs/CodeCortex_Technical_Architecture.md`, and `docs/CodeTree_Understanding_MVP.md` v0.6.2.
 
 ## Global Constraints
 
@@ -46,7 +46,7 @@ tests/fixtures/m1b_repo/                        mutable freshness/discussion fix
 tests/benchmark/questions.yaml                  frozen question and evidence oracle
 tests/e2e/test_codex_m1b.py
 scripts/run_codecortex_benchmark.py
-doc/testing/M1B_ACCEPTANCE.md
+docs/testing/M1B_ACCEPTANCE.md
 tests/conftest.py                               real repository/formal/cache fixtures inherited from M1a
 ```
 
@@ -610,7 +610,7 @@ git commit -m "feat: recover cognition cache across machines"
 - Create: `tests/benchmark/scoring.py`
 - Create: `tests/benchmark/test_scoring.py`
 - Create: `tests/fixtures/m1b_repo/`
-- Create: `doc/testing/BENCHMARK_PROTOCOL.md`
+- Create: `docs/testing/BENCHMARK_PROTOCOL.md`
 
 **Interfaces:**
 - Produces: `BenchmarkCase`, `EvidenceExpectation`, `ScoreCard`
@@ -657,7 +657,7 @@ Expected: duplicate IDs, missing state/tree digest/evidence, post-hoc threshold 
 - [ ] **Step 5: Commit benchmark protocol**
 
 ```bash
-git add tests/benchmark tests/fixtures/m1b_repo doc/testing/BENCHMARK_PROTOCOL.md
+git add tests/benchmark tests/fixtures/m1b_repo docs/testing/BENCHMARK_PROTOCOL.md
 git commit -m "test: freeze CodeCortex benchmark corpus"
 ```
 
@@ -667,7 +667,7 @@ git commit -m "test: freeze CodeCortex benchmark corpus"
 - Create: `scripts/run_codecortex_benchmark.py`
 - Create: `tests/e2e/test_codex_m1b.py`
 - Create: `tests/e2e/trace.py`
-- Create: `doc/testing/M1B_ACCEPTANCE.md`
+- Create: `docs/testing/M1B_ACCEPTANCE.md`
 
 **Interfaces:**
 - Produces: `run_benchmark(config: BenchmarkConfig) -> BenchmarkReport`
@@ -724,7 +724,7 @@ Expected: deterministic tests pass; all three repetitions are recorded; stale co
 - [ ] **Step 5: Commit the M1b evaluation harness**
 
 ```bash
-git add scripts/run_codecortex_benchmark.py tests/e2e doc/testing/M1B_ACCEPTANCE.md
+git add scripts/run_codecortex_benchmark.py tests/e2e docs/testing/M1B_ACCEPTANCE.md
 git commit -m "test: evaluate persistent CodeCortex understanding"
 ```
 

@@ -8,7 +8,7 @@
 
 **Tech Stack:** M0 stack plus Python 3.14 standard-library `ast`, `tokenize`, `sqlite3`, Git subprocesses without a shell, Pydantic DTO boundaries, pytest fixtures for Python 3.9–3.14 syntax.
 
-**Spec:** `doc/CodeCortex_M1a_Detailed_Design.md`, `doc/CodeCortex_Technical_Architecture.md`, and `doc/CodeTree_Understanding_MVP.md` v0.6.2.
+**Spec:** `docs/CodeCortex_M1a_Detailed_Design.md`, `docs/CodeCortex_Technical_Architecture.md`, and `docs/CodeTree_Understanding_MVP.md` v0.6.2.
 
 ## Global Constraints
 
@@ -751,7 +751,7 @@ git commit -m "feat: render and inspect cognitive views"
 - Create: `tests/fixtures/m1a_repo/`
 - Create: `tests/e2e/test_codex_m1a.py`
 - Create: `scripts/run_m1a_acceptance.py`
-- Create: `doc/testing/M1A_ACCEPTANCE.md`
+- Create: `docs/testing/M1A_ACCEPTANCE.md`
 
 **Interfaces:**
 - Produces Skill flows `$codecortex init`, `inspect`, `reinitialize`
@@ -809,7 +809,7 @@ Expected: all deterministic checks pass; configured Child Codex produces one bou
 - [ ] **Step 5: Commit M1a acceptance**
 
 ```bash
-git add src/codecortex/application/initialize.py src/codecortex/integrations/codex/resources/SKILL.md tests/fixtures/m1a_repo tests/e2e/test_codex_m1a.py scripts/run_m1a_acceptance.py doc/testing/M1A_ACCEPTANCE.md
+git add src/codecortex/application/initialize.py src/codecortex/integrations/codex/resources/SKILL.md tests/fixtures/m1a_repo tests/e2e/test_codex_m1a.py scripts/run_m1a_acceptance.py docs/testing/M1A_ACCEPTANCE.md
 git commit -m "test: add M1a repository understanding gate"
 ```
 

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.14, Conda, Hatchling, Pydantic 2, MCP Python SDK 2.x (`mcp>=2,<3`, `MCPServer` API), tomlkit, pytest, pytest-cov, Ruff, mypy, standard-library `fcntl` and filesystem primitives.
 
-**Spec:** `doc/CodeCortex_M0_Detailed_Design.md`, `doc/CodeCortex_Technical_Architecture.md`, and `doc/CodeTree_Understanding_MVP.md` v0.6.2.
+**Spec:** `docs/CodeCortex_M0_Detailed_Design.md`, `docs/CodeCortex_Technical_Architecture.md`, and `docs/CodeTree_Understanding_MVP.md` v0.6.2.
 
 ## Global Constraints
 
@@ -52,7 +52,7 @@ src/codecortex/integrations/codex/install.py idempotent user configuration insta
 src/codecortex/integrations/codex/doctor.py installation diagnostics
 src/codecortex/integrations/codex/resources/SKILL.md
 src/codecortex/integrations/codex/resources/codecortex-analyzer.toml
-doc/INSTALL.md                       pipx user install and Conda contributor workflow
+docs/INSTALL.md                      pipx user install and Conda contributor workflow
 tests/unit/                         pure unit tests
 tests/integration/                  filesystem, process, MCP, locking, recovery tests
 tests/e2e/                          real Codex harness, opt-in marker
@@ -695,7 +695,7 @@ git commit -m "feat: expose main and analyzer MCP profiles"
 - Create: `src/codecortex/integrations/codex/install.py`
 - Create: `src/codecortex/integrations/codex/resources/SKILL.md`
 - Create: `src/codecortex/integrations/codex/resources/codecortex-analyzer.toml`
-- Create: `doc/INSTALL.md`
+- Create: `docs/INSTALL.md`
 - Create: `tests/unit/integrations/test_codex_install.py`
 - Create: `tests/integration/test_codex_install_files.py`
 
@@ -756,7 +756,7 @@ Expected: comments and unknown keys survive; second install is byte-identical; a
 - [ ] **Step 5: Commit Codex installation**
 
 ```bash
-git add src/codecortex/integrations/codex pyproject.toml doc/INSTALL.md tests
+git add src/codecortex/integrations/codex pyproject.toml docs/INSTALL.md tests
 git commit -m "feat: install CodeCortex into Codex"
 ```
 
@@ -825,7 +825,7 @@ git commit -m "feat: diagnose CodeCortex Codex integration"
 - Create: `tests/e2e/test_codex_m0.py`
 - Create: `tests/fixtures/m0_repo/README.md`
 - Create: `scripts/run_codex_e2e.py`
-- Create: `doc/testing/M0_ACCEPTANCE.md`
+- Create: `docs/testing/M0_ACCEPTANCE.md`
 
 **Interfaces:**
 - Consumes: installed `codex` CLI, packaged CodeCortex, temporary user configuration
@@ -878,12 +878,12 @@ python scripts/run_codex_e2e.py --artifact-dir /tmp/codecortex-m0-artifacts
 git status --short
 ```
 
-Expected: unit/integration tests pass; configured Child Codex cases pass; repository status is clean; manual VS Code host-prompt result is recorded in `doc/testing/M0_ACCEPTANCE.md` before declaring M0 complete.
+Expected: unit/integration tests pass; configured Child Codex cases pass; repository status is clean; manual VS Code host-prompt result is recorded in `docs/testing/M0_ACCEPTANCE.md` before declaring M0 complete.
 
 - [ ] **Step 5: Commit the M0 acceptance harness**
 
 ```bash
-git add tests/e2e tests/fixtures scripts/run_codex_e2e.py doc/testing/M0_ACCEPTANCE.md
+git add tests/e2e tests/fixtures scripts/run_codex_e2e.py docs/testing/M0_ACCEPTANCE.md
 git commit -m "test: add M0 Codex acceptance gate"
 ```
 

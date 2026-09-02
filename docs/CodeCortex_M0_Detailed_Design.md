@@ -44,7 +44,7 @@ CodeCortex/
 │   ├── unit/
 │   ├── integration/
 │   └── e2e/
-└── doc/
+└── docs/
 ```
 
 ### 2.1 Python 与依赖
