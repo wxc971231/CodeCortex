@@ -95,6 +95,16 @@ class ApplicationServices:
             state = self.formal_store.load()
             return self._overview(state)
 
+    def cognitive_graph(self) -> CognitiveGraph:
+        """Load the complete formal graph under a shared repository lock."""
+        with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+            return self.formal_store.load().graph
+
+    def history_event(self, event_id: str) -> dict[str, object]:
+        """Load one immutable History event under a shared repository lock."""
+        with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+            return self.formal_store.read_history_event(event_id)
+
     def create_cognitive_proposal(
         self,
         *,

@@ -224,6 +224,23 @@ class FormalStore:
             relative: (self._root / relative).is_file() for relative in _FORMAL_FILES
         }
 
+    def read_history_event(self, event_id: str) -> dict[str, object]:
+        """Read one immutable event from a fully validated formal snapshot."""
+        validate_id(event_id, IdPrefix.EVENT)
+        state = self.load()
+        if event_id not in {event.event_id for event in state.history_events}:
+            raise CodeCortexError(
+                ErrorCode.ANALYSIS_REPORT_INVALID,
+                f"History event does not exist: {event_id}",
+                suggested_action="Use a History event ID returned by CodeCortex",
+            )
+        path = self._root / "history/events" / f"{event_id}.json"
+        data = self._read_object(path)
+        self._check_schema(data, path.relative_to(self._root).as_posix())
+        if data.get("event_id") != event_id:
+            self._raise_corrupt("History event identity does not match its filename")
+        return data
+
     def commit(
         self,
         state: FormalState,

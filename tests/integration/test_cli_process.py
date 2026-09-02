@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -110,14 +111,15 @@ def test_mcp_rejects_unknown_profile(tmp_path: Path) -> None:
     assert result.stdout == ""
 
 
-def test_mcp_placeholder_keeps_stdout_free_for_protocol_frames(
-    tmp_path: Path,
-) -> None:
-    """Until Task 9 wires the server, mcp fails on stderr with exit 2."""
-    result = run_codecortex("mcp", "--profile", "main", cwd=tmp_path)
-    assert result.returncode == 2
+def test_mcp_without_repository_keeps_stdout_free_for_protocol_frames() -> None:
+    """The real Task 9 server rejects a non-repository before protocol startup."""
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
+        result = run_codecortex(
+            "mcp", "--profile", "main", cwd=Path(temporary)
+        )
+    assert result.returncode == 3
     assert result.stdout == ""
-    assert "not available in this build" in result.stderr
+    assert "NOT_INITIALIZED" in result.stderr
 
 
 def test_install_codex_placeholder_does_not_require_repository(

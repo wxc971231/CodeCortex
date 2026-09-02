@@ -50,6 +50,9 @@ class FormalStorePort(Protocol):
     def load(self) -> FormalState:
         """Load one complete validated formal-state snapshot."""
 
+    def read_history_event(self, event_id: str) -> dict[str, object]:
+        """Read one immutable event after validating the formal state."""
+
     def formal_file_presence(self) -> dict[str, bool]:
         """Return required formal-file existence by repository-relative path."""
 

@@ -70,7 +70,9 @@ def _doctor_unavailable(*, as_json: bool) -> int:
 
 
 def _mcp_unavailable(*, profile: str) -> int:
-    return _command_not_available("mcp")
+    from codecortex.interfaces.mcp.server import run_stdio
+
+    return run_stdio(profile, _default_services)
 
 
 def _default_services() -> ApplicationServices:
