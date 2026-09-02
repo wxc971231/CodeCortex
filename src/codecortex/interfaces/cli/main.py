@@ -160,7 +160,9 @@ def _validate(
     arguments: Namespace,
     services_factory: Callable[[], ApplicationServices],
 ) -> int:
-    result = services_factory().validate_graph()
+    services = services_factory()
+    services.recover_formal_state()
+    result = services.validate_graph()
     if arguments.json:
         payload = {
             "valid": result.valid,

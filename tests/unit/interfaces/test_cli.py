@@ -129,6 +129,18 @@ def test_validate_json_prints_validation_result(
     assert captured.err == ""
 
 
+def test_validate_recovers_interrupted_formal_state_before_reading(
+    cli: CliHarness,
+) -> None:
+    """The CLI must not report a transient transaction mixture as corruption."""
+    cli.services.validate_graph.return_value = ValidationResult(valid=True, issues=())
+
+    assert cli.run(["validate", "--json"]) == 0
+
+    cli.services.recover_formal_state.assert_called_once_with()
+    cli.services.validate_graph.assert_called_once_with()
+
+
 def test_validate_json_reports_issues_and_exits_4(
     cli: CliHarness, capsys: pytest.CaptureFixture[str]
 ) -> None:

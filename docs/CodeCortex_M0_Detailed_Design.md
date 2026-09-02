@@ -228,7 +228,7 @@ source_baseline.files = []
 
 同时创建默认 `config.toml`、空 `source_baseline.json`、`PROJECT.md` 模板和空 Views。`cognition_initialized=false` 时 source baseline 摘要和 manifest cognition baseline 必须同时为 null；它不声称已经理解项目，也不推进 cognition baseline。重复执行返回现有状态；发现半初始化或非法正式文件时拒绝覆盖。
 
-M1a 的 `$codecortex init` 在 revision 0 上完成真实 AST、Analyzer 和初始化 Proposal，批准后产生 revision 1。
+M1a 的 `$codecortex init` 在 `cognition_initialized=false` 的当前正式状态上完成真实 AST、Analyzer 和初始化 Proposal；它以当前 graph revision 为 base，批准后产生 `current + 1`。全新 revision-0 skeleton 的结果才恰好是 revision 1。
 
 ## 10. M0 最小 Proposal
 

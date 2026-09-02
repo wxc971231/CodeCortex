@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import tomllib
@@ -25,6 +26,7 @@ from codecortex.domain.cognition import (
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.ids import IdPrefix, validate_id
+from codecortex.domain.proposals import PatchOperation, canonical_patch_digest
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.repository import Repository
 
@@ -110,6 +112,51 @@ _JOURNAL_FIELDS = {
 }
 _JOURNAL_TARGET_FIELDS = {"path", "existed_before"}
 _JOURNAL_REMOVAL_FIELDS = {"path"}
+_APPLIED_EVENT_REQUIRED_FIELDS = {
+    "schema_version",
+    "event_id",
+    "event_type",
+    "proposal_id",
+    "base_graph_revision",
+    "graph_revision",
+    "reason",
+    "patch_digest",
+    "affected_nodes",
+    "proposal_snapshot",
+    "approval",
+    "change_set_summary",
+    "applied_at",
+}
+_PROPOSAL_SNAPSHOT_REQUIRED_FIELDS = {
+    "schema_version",
+    "proposal_id",
+    "status",
+    "base_graph_revision",
+    "analyzed_source_digest",
+    "source_preconditions",
+    "operations",
+    "affected_nodes",
+    "reason",
+    "evidence",
+    "uncertainties",
+    "revision_log",
+    "patch_digest",
+    "created_at",
+}
+_CHANGE_SET_SUMMARY_REQUIRED_FIELDS = {
+    "before_source_digest",
+    "after_source_digest",
+    "changed_files",
+    "changed_entities",
+    "affected_nodes",
+    "scope_confidence",
+    "unmapped_changes",
+}
+_OPERATION_FIELDS = {"kind", "target_id", "value"}
+_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SEMANTIC_NODE_ID_PATTERN = re.compile(
+    r"(?:responsibility|behavior|capability)\.[a-z0-9]+(?:-[a-z0-9]+)*\Z"
+)
 
 
 class _DuplicateJsonKeyError(ValueError):
@@ -672,8 +719,139 @@ class FormalStore:
                 self._raise_corrupt("History event identity or type is invalid", cause=error)
             if path.stem != event_id:
                 self._raise_corrupt("History event filename does not match its event ID")
+            self._validate_applied_event(data)
             events.append(HistoryEventRef(event_id, event_type))
         return tuple(events)
+
+    def _validate_applied_event(self, event: Mapping[str, object]) -> None:
+        """Validate the M0 audit payload, not merely its filename and type.
+
+        A graph record's provenance is meaningful only when the referenced
+        event still contains the reviewed Proposal snapshot and approval that
+        caused it. Later milestones may add fields, but cannot omit any M0
+        audit field or break the cross-field identity and digest bindings.
+        """
+        missing = _APPLIED_EVENT_REQUIRED_FIELDS - set(event)
+        if missing:
+            self._raise_corrupt("History event is missing required audit fields")
+        if event.get("event_type") != "cognitive_proposal_applied":
+            self._raise_corrupt("History event type is unsupported")
+        event_id = event.get("event_id")
+        proposal_id = event.get("proposal_id")
+        if not _is_id(event_id, IdPrefix.EVENT) or not _is_id(
+            proposal_id, IdPrefix.PROPOSAL
+        ):
+            self._raise_corrupt("History event IDs use invalid namespaces")
+        base_revision = event.get("base_graph_revision")
+        graph_revision = event.get("graph_revision")
+        if (
+            type(base_revision) is not int
+            or type(graph_revision) is not int
+            or base_revision < 0
+            or graph_revision != base_revision + 1
+        ):
+            self._raise_corrupt("History event revisions are invalid")
+        reason = event.get("reason")
+        patch_digest = event.get("patch_digest")
+        if not isinstance(reason, str) or not reason.strip() or not _is_digest(
+            patch_digest
+        ):
+            self._raise_corrupt("History event reason or patch digest is invalid")
+        affected_nodes = event.get("affected_nodes")
+        if (
+            not isinstance(affected_nodes, list)
+            or not all(
+                isinstance(node_id, str)
+                and _SEMANTIC_NODE_ID_PATTERN.fullmatch(node_id)
+                for node_id in affected_nodes
+            )
+            or len(set(affected_nodes)) != len(affected_nodes)
+        ):
+            self._raise_corrupt("History event affected-node scope is invalid")
+        snapshot = event.get("proposal_snapshot")
+        if not isinstance(snapshot, Mapping) or (
+            snapshot.get("proposal_id") != proposal_id
+            or snapshot.get("base_graph_revision") != base_revision
+            or snapshot.get("patch_digest") != patch_digest
+            or snapshot.get("status") != "applied"
+            or snapshot.get("reason") != reason
+            or snapshot.get("affected_nodes") != affected_nodes
+        ):
+            self._raise_corrupt("History event proposal snapshot is inconsistent")
+        self._validate_proposal_snapshot(snapshot, patch_digest)
+        approval = event.get("approval")
+        if not isinstance(approval, Mapping) or (
+            approval.get("proposal_id") != proposal_id
+            or approval.get("patch_digest") != patch_digest
+            or approval.get("approved_by") != "user"
+            or not isinstance(approval.get("approved_at"), str)
+            or not approval["approved_at"].endswith("Z")
+            or not isinstance(approval.get("approval_summary"), str)
+            or not approval["approval_summary"].strip()
+        ):
+            self._raise_corrupt("History event approval is inconsistent")
+        change_set_summary = event.get("change_set_summary")
+        if not isinstance(change_set_summary, Mapping) or (
+            _CHANGE_SET_SUMMARY_REQUIRED_FIELDS - set(change_set_summary)
+        ):
+            self._raise_corrupt("History event change-set summary is invalid")
+        if change_set_summary.get("affected_nodes") != affected_nodes:
+            self._raise_corrupt("History event change-set scope is inconsistent")
+        for key in ("before_source_digest", "after_source_digest"):
+            digest = change_set_summary.get(key)
+            if digest is not None and not _is_digest(digest):
+                self._raise_corrupt("History event change-set digest is invalid")
+        if not all(
+            isinstance(change_set_summary.get(key), list)
+            for key in ("changed_files", "changed_entities", "unmapped_changes")
+        ) or not isinstance(change_set_summary.get("scope_confidence"), str):
+            self._raise_corrupt("History event change-set summary is invalid")
+        applied_at = event.get("applied_at")
+        if not isinstance(applied_at, str) or not applied_at.endswith("Z"):
+            self._raise_corrupt("History event application time is invalid")
+
+    def _validate_proposal_snapshot(
+        self, snapshot: Mapping[str, object], patch_digest: object
+    ) -> None:
+        """Verify that the immutable snapshot still describes its approved patch."""
+        if _PROPOSAL_SNAPSHOT_REQUIRED_FIELDS - set(snapshot):
+            self._raise_corrupt("History event proposal snapshot is incomplete")
+        created_at = snapshot.get("created_at")
+        if (
+            snapshot.get("schema_version") != SCHEMA_VERSION
+            or not isinstance(created_at, str)
+            or not created_at.endswith("Z")
+        ):
+            self._raise_corrupt("History event proposal snapshot is invalid")
+        for key in (
+            "source_preconditions",
+            "operations",
+            "affected_nodes",
+            "evidence",
+            "uncertainties",
+            "revision_log",
+        ):
+            if not isinstance(snapshot.get(key), list):
+                self._raise_corrupt("History event proposal snapshot is invalid")
+        operations = snapshot["operations"]
+        assert isinstance(operations, list)
+        try:
+            parsed_operations = tuple(
+                PatchOperation(
+                    _string(operation, "kind"),
+                    _string(operation, "target_id"),
+                    operation.get("value"),
+                )
+                for operation in operations
+                if isinstance(operation, Mapping)
+                and set(operation) == _OPERATION_FIELDS
+            )
+        except (CodeCortexError, KeyError, TypeError) as error:
+            self._raise_corrupt("History event proposal operations are invalid", cause=error)
+        if len(parsed_operations) != len(operations) or not parsed_operations:
+            self._raise_corrupt("History event proposal operations are invalid")
+        if canonical_patch_digest(parsed_operations) != patch_digest:
+            self._raise_corrupt("History event proposal digest is inconsistent")
 
     def _validate_empty_views(self, state: FormalState) -> None:
         if state.graph.graph_revision != 0:
@@ -844,6 +1022,20 @@ def _object_tuple(data: Mapping[str, object], key: str) -> tuple[dict[str, objec
 def _is_repository_pattern(value: str) -> bool:
     parts = value.split("/")
     return bool(value) and not value.startswith("/") and "\\" not in value and ".." not in parts
+
+
+def _is_id(value: object, prefix: IdPrefix) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        validate_id(value, prefix)
+    except CodeCortexError:
+        return False
+    return True
+
+
+def _is_digest(value: object) -> bool:
+    return isinstance(value, str) and _DIGEST_PATTERN.fullmatch(value) is not None
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

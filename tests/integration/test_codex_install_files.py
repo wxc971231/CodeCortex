@@ -1,6 +1,8 @@
 """Installed file and package-resource integration coverage."""
 
 import importlib.resources
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -31,8 +33,25 @@ def test_packaged_resources_are_available_to_installed_code() -> None:
     assert resources.joinpath("codecortex-analyzer.toml").is_file()
 
 
-def test_built_wheel_contains_both_codex_resources() -> None:
-    wheel = next(Path("dist").glob("codecortex-*.whl"))
+def test_built_wheel_contains_both_codex_resources(tmp_path: Path) -> None:
+    """Build in an isolated test directory; never depend on a prior build."""
+    project_root = Path(__file__).resolve().parents[2]
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(tmp_path),
+        ],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheel = next(tmp_path.glob("codecortex-*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
     assert any(name.endswith("resources/SKILL.md") for name in names)

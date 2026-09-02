@@ -8,7 +8,7 @@ from typing import Literal, cast
 from mcp.server import MCPServer
 
 from codecortex.application.services import ApplicationServices
-from codecortex.domain.errors import CodeCortexError
+from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.interfaces.mcp import tools
 
 Profile = Literal["main", "analyzer"]
@@ -54,10 +54,25 @@ def run_stdio(
         raise ValueError(f"Unsupported MCP profile: {profile}")
     checked_profile = cast(Profile, profile)
     _configure_stderr_logging()
-    server = build_server(checked_profile, services_factory())
+    services = services_factory()
+    _recover_main_formal_state(checked_profile, services)
+    server = build_server(checked_profile, services)
     LOGGER.info("CodeCortex MCP server started with %s profile", checked_profile)
     server.run(transport="stdio")
     return 0
+
+
+def _recover_main_formal_state(profile: Profile, services: ApplicationServices) -> None:
+    """Recover once for Main without granting Analyzer a write path."""
+    if profile != "main":
+        return
+    try:
+        services.recover_formal_state()
+    except CodeCortexError as error:
+        # An uninitialized repository has no transaction to recover. Init remains
+        # an ordinary Main MCP tool call; any other recovery failure is unsafe.
+        if error.code is not ErrorCode.NOT_INITIALIZED:
+            raise
 
 
 def _register_read_tools(server: MCPServer, services: ApplicationServices) -> None:

@@ -11,6 +11,7 @@ from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.proposals import ApprovalRecord, PatchOperation, Proposal
 from codecortex.infrastructure.formal import FormalStore
+from codecortex.infrastructure.jsonio import write_json_atomic
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
 from codecortex.infrastructure.repository import Repository
@@ -310,6 +311,42 @@ def test_history_events_are_immutable_across_later_applies(
         f"{second.event_id}.json",
     ]
     assert app.validate_graph().valid is True
+
+
+def test_validate_rejects_history_event_without_its_audit_snapshot(
+    app: ApplicationServices, repo_root: Path, approved_proposal: Proposal
+) -> None:
+    """An event ID alone cannot prove that an approved Proposal was applied."""
+    result = app.apply_cognitive_proposal(
+        approved_proposal.proposal_id, approval_for(approved_proposal)
+    )
+    event_path = repo_root / f".codecortex/history/events/{result.event_id}.json"
+    event = json.loads(event_path.read_text())
+    del event["proposal_snapshot"]
+    write_json_atomic(event_path, event)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+def test_validate_recomputes_the_history_snapshot_patch_digest(
+    app: ApplicationServices, repo_root: Path, approved_proposal: Proposal
+) -> None:
+    """A stored digest cannot stand in for the actual reviewed operation list."""
+    result = app.apply_cognitive_proposal(
+        approved_proposal.proposal_id, approval_for(approved_proposal)
+    )
+    event_path = repo_root / f".codecortex/history/events/{result.event_id}.json"
+    event = json.loads(event_path.read_text())
+    event["proposal_snapshot"]["operations"][0]["value"]["title"] = "Tampered"
+    write_json_atomic(event_path, event)
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.validate_graph()
+
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
 
 
 def test_commit_refuses_to_overwrite_an_existing_history_event(

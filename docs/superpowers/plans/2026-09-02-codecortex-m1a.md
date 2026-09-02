@@ -26,6 +26,34 @@
 
 ---
 
+## Task 0: Harden M0 Boundaries Before M1a
+
+**Purpose:** Remove M0 assumptions that would otherwise invalidate persistent M1a facts. This task is intentionally small and must land before Task 1.
+
+**Files:**
+- Modify: `src/codecortex/application/services.py`
+- Modify: `src/codecortex/interfaces/mcp/server.py`
+- Modify: `src/codecortex/interfaces/cli/main.py`
+- Modify: `src/codecortex/infrastructure/formal.py`
+- Modify: `pyproject.toml`
+- Modify: `tests/unit/interfaces/test_cli.py`
+- Modify: `tests/unit/interfaces/test_mcp_profiles.py`
+- Modify: `tests/integration/test_transaction_recovery.py`
+- Modify: `tests/integration/test_apply_transaction.py`
+- Modify: `tests/integration/test_codex_install_files.py`
+- Modify: `docs/CodeCortex_M1a_Detailed_Design.md`
+- Modify: `docs/CodeTree_Understanding_MVP.md`
+
+- [x] Add explicit `recover_formal_state()` under the exclusive repository lock. Main STDIO startup and `codecortex validate` invoke it before serving formal state; Analyzer never invokes it, so its read-only contract remains intact. Test interrupted-transaction recovery through the public Main entry rather than through a direct `FormalStore` call.
+- [x] Validate every required M0 `cognitive_proposal_applied` audit field and its cross-field bindings: Event/Proposal namespace, revisions, digest, affected scope, Proposal snapshot, and user approval. Future M1a event extensions may add fields but must not weaken this baseline.
+- [x] Make the wheel-resource test self-contained by building into `tmp_path`; declare `hatchling` in the development extra so its required no-isolation build is reproducible after `conda env update`.
+- [x] Define, in the detailed and system specifications, that first cognition initialization keys off `cognition_initialized`, uses current revision `r` and commits `r + 1`, and preserves any M0-approved objects unless an approved Proposal explicitly changes them.
+- [x] Define `view_manifest.json` and legacy-M0 admission: the first M1a approved apply validates old rendered views and atomically adds digests; normal reads never rewrite legacy state. Define that M0's unbounded `cognitive_graph()` is compatibility-only and must be capped in Task 8.
+
+**Verification:** `ruff check src tests`, `mypy src`, `python -m build`, and `pytest -q` must run successfully from a freshly created `codecortex-dev` environment. The two Codex E2E tests remain opt-in.
+
+---
+
 ## Planned File Map
 
 ```text
@@ -637,7 +665,7 @@ def test_approved_initialization_advances_all_formal_state(m1a_app, approved_ini
     proposal = m1a_app.create_proposal_from_analysis(approved_initial_report, "initialize understanding")
     result = m1a_app.apply_cognitive_proposal(proposal.id, approval_for(proposal))
     state = m1a_app.formal_store.load()
-    assert result.graph_revision == 1
+    assert result.graph_revision == approved_initial_report.base_graph_revision + 1
     assert state.manifest.cognition_initialized is True
     assert state.manifest.cognition_baseline.source_digest == approved_initial_report.analyzed_source_digest
     assert state.source_baseline.repository_source_digest == approved_initial_report.analyzed_source_digest
@@ -720,7 +748,7 @@ Expected: golden views or current-source fields fail.
 
 - [ ] **Step 3: Implement deterministic projection and UID-first resolution**
 
-Render sorted Responsibility→Behavior hierarchy, shared Capability links, summary/intent/observed/epistemic status, Flow, mappings, evidence, approval event, and repository-relative source links. `inspect_node` loads formal graph, resolves entity UID against current facts, falls back to address/fingerprint, preserves last known location when unresolved, and returns stale status rather than rewriting formal mapping. Detect manual view modifications through stored digest and regenerate from graph.
+Render sorted Responsibility→Behavior hierarchy, shared Capability links, summary/intent/observed/epistemic status, Flow, mappings, evidence, approval event, and repository-relative source links. `inspect_node` loads formal graph, resolves entity UID against current facts, falls back to address/fingerprint, preserves last known location when unresolved, and returns stale status rather than rewriting formal mapping. Create and validate the formal `view_manifest.json` alongside every M1a apply; for a legacy M0 state, verify the old generated views before the first approved migration rather than silently overwriting hand edits.
 
 ```python
 def resolve_mapping(mapping: ImplementationMapping, facts: FactsDatabase, refs: EntityRefs) -> ResolvedMapping:

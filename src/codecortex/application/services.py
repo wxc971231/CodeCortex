@@ -11,6 +11,7 @@ from pathlib import Path
 from codecortex.application.ports import (
     FormalStorePort,
     PendingProposalStorePort,
+    RecoveryResult,
     RepositoryContextPort,
     RepositoryLockPort,
     ViewRendererPort,
@@ -82,6 +83,17 @@ class ApplicationServices:
                 FormalState.empty(manifest=manifest, source_baseline=baseline)
             )
             return self._overview(state)
+
+    def recover_formal_state(self) -> RecoveryResult:
+        """Recover an interrupted transaction before a Main entry serves state.
+
+        Recovery may replace or remove files, so it is deliberately an explicit
+        Main-process preparation step instead of an implicit action on every
+        read. Analyzer processes remain read-only: they either see a state
+        prepared by Main or fail closed on an interrupted transaction.
+        """
+        with self.repository_lock.acquire("exclusive", self.lock_timeout_seconds):
+            return self.formal_store.recover()
 
     def validate_graph(self) -> ValidationResult:
         """Load and validate the complete formal state under a shared lock."""

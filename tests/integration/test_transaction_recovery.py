@@ -196,6 +196,24 @@ def test_recovery_without_interrupted_transactions_is_a_noop(
     assert recovered.completed_transactions == ()
 
 
+def test_main_recovery_entry_repairs_state_before_later_reads(
+    transaction_fixture: TransactionFixture,
+) -> None:
+    """Main's startup entry, not a hidden apply retry, owns recovery."""
+    transaction_fixture.crash_after("graph")
+    app = transaction_fixture.healthy_app()
+
+    with pytest.raises(CodeCortexError) as exc:
+        app.repository_overview()
+    assert exc.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+    recovered = app.recover_formal_state()
+
+    assert recovered.visible_revision == 0
+    assert app.repository_overview().graph_revision == 0
+    assert app.validate_graph().valid is True
+
+
 def test_recovery_is_idempotent_after_a_rollback(
     transaction_fixture: TransactionFixture,
 ) -> None:

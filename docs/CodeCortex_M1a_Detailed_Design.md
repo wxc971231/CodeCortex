@@ -81,6 +81,19 @@ files:
 
 当 manifest `cognition_initialized=false` 时，cognition baseline 和 `repository_source_digest` 必须同时为 null，`files=[]`；M0 技术验收即使推进 graph revision 也保持该状态。首次真实初始化 apply 原子设置 `cognition_initialized=true` 并建立非空 baseline，此后不再允许 null。
 
+### 2.3 首次认知初始化与 revision
+
+是否已经完成项目理解只能由 `cognition_initialized` 判断，不能由 `graph_revision` 判断。M0 允许用户为审批链路测试创建正式节点，因此一个尚未理解项目的仓库可以处于任意 `r >= 0` 的 graph revision，同时仍满足 `cognition_initialized=false`。
+
+M1a 的首次认知初始化规则为：
+
+- formal state 不存在时，先执行幂等 `initialize_repository`，得到 revision 0 技术骨架；
+- formal state 已存在且 `cognition_initialized=false` 时，以当前 revision `r` 为 AnalysisReport 和 Proposal 的 base revision；
+- 初始化 Proposal 的 apply 产生 `r + 1`，并在同一事务设置 `cognition_initialized=true` 与非空 source baseline；只有从全新 skeleton 初始化时，这个值才恰好为 1；
+- 已由 M0 审批写入的节点、边和 History 都是现有正式状态。Analyzer 可以建议删除、替换或保留它们，但必须作为当前 Proposal 的显式操作并经用户批准；M1a 不得为了“重新初始化”而静默清空它们。
+
+因此，任何缓存 metadata、AnalysisReport、Proposal 或验收 fixture 都必须使用实际 current graph revision，而不是写死 0 或 1。
+
 ## 3. AST 解析
 
 ### 3.1 支持范围
@@ -577,7 +590,7 @@ Analyzer 通过 Codex subagent 返回一份完整、压缩、结构化报告。�
 
 ```yaml
 schema_version: 1
-base_graph_revision: 0
+base_graph_revision: <当前 graph_revision>
 analyzed_source_digest: "sha256:..."
 analysis_scope:
   mode: repository
@@ -604,7 +617,7 @@ diagnostics: []
 
 ```text
 $codecortex init
-→ initialize_repository（若尚未 revision 0）
+→ initialize_repository（若 formal state 尚不存在）
 → sync_repository_facts（全量）
 → analysis_scope（推荐分区）
 → Main 强制派生 Analyzer
@@ -613,7 +626,7 @@ $codecortex init
 → Main 创建整体 Proposal
 → 用户查看 Big Picture、讨论和修订
 → 用户批准 current patch_digest
-→ apply 产生 graph revision 1 和 cognition baseline
+→ apply 产生当前 revision + 1 和 cognition baseline
 ```
 
 Analyzer 顺序：项目文档/入口 → package/module 分区 → 分区职责行为 → 跨区依赖 → 关键 Capability → 全局汇总。初始化优先生成 L0/L1 和关键 L2，不为每个函数制造 Capability。
@@ -684,6 +697,20 @@ TREE 展示 Responsibility → Behavior 和共享 Capability 引用。节点页�
 
 Markdown 是 graph 的确定性投影。Core 保存 view digest；手工修改被检测并提示，重新生成以 graph 为准。用户手工背景写 `PROJECT.md`。
 
+View digest 使用 Git 携带的 `.codecortex/view_manifest.json`，而不是 SQLite：
+
+```yaml
+schema_version: 1
+graph_revision: 7
+files:
+  - relative_path: views/TREE.md
+    content_digest: sha256:...
+```
+
+`files` 按 relative POSIX path 排序且必须精确覆盖 `views/` 中由 Core 管理的文件。每次 M1a 正式 apply 在渲染 Markdown 后一起写入该 manifest；读取正式状态时重新计算字节摘要，缺失、额外、符号链接或摘要不一致都属于 formal state corruption。`PROJECT.md` 不在其中，始终允许用户编辑。
+
+旧 M0 technical state 没有 `view_manifest.json`。M1a 必须把它识别为只读 legacy state：在第一次 M1a Proposal apply 之前先以 M0 renderer 验证现有 View 与 graph 一致；验证通过后，才把新的 View manifest 与该 approved apply 一起写入。验证失败时不得静默覆盖手工修改，必须要求用户恢复 View 或重新生成后重试。不得通过普通读请求自动迁移、重写 View 或推进 graph revision。
+
 `inspect_node` 返回 node、父子/依赖、Flow、Mapping、证据、materialization、freshness 占位和 truncation。L3 由 Mapping + SQLite 当前实体动态投影；L4 始终读取真实源码，不复制到图。
 
 ## 17. M1a MCP 增量
@@ -701,6 +728,8 @@ Markdown 是 graph 的确定性投影。Core 保存 view digest；手工修改�
 - `sync_repository_facts(mode = "auto" | "full")`
 
 M0 Proposal 工具扩展为完整 M1a schema。所有列表返回 cursor 和 `truncated`。
+
+M0 的无界 `cognitive_graph()` 仅保留为兼容诊断入口：M1a 自身的 Skill、Main 和 Analyzer 不得用它加载全图。Task 8 必须给它增加受配置上限保护；超过上限时返回明确错误并要求使用 `search_cognitive_graph`、`get_discussion_context` 或其他带 cursor/limit 的接口。新增和扩展的所有列表接口都必须返回 `cursor` 与 `truncated`，不能以 M0 兼容为由绕过上下文上限。
 
 ## 18. 测试
 
@@ -741,7 +770,7 @@ M0 Proposal 工具扩展为完整 M1a schema。所有列表返回 cursor 和 `tr
 
 ### 18.4 真实初始化
 
-在中型 Python fixture repo 运行 Child Codex：Analyzer 返回完整报告，Main 创建 Proposal，用户模拟批准后生成 revision 1；检查关键结论能跳转到真实源码，且原始大范围探索未进入 Main 输出。
+在中型 Python fixture repo 运行 Child Codex：Analyzer 返回完整报告，Main 创建 Proposal，用户模拟批准后产生 base revision + 1；检查关键结论能跳转到真实源码，且原始大范围探索未进入 Main 输出。另以含 M0 审批测试节点、但 `cognition_initialized=false` 的仓库覆盖首次认知初始化，确认它不会静默清空既有正式对象。
 
 ## 19. M1a 完成条件
 

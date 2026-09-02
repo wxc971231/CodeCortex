@@ -8,7 +8,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from codecortex.application.services import RepositoryOverview
 from codecortex.domain.errors import CodeCortexError, ErrorCode
-from codecortex.interfaces.mcp.server import build_server
+from codecortex.interfaces.mcp.server import _recover_main_formal_state, build_server
 
 ANALYZER_TOOLS = {
     "repository_overview",
@@ -101,3 +101,38 @@ async def test_domain_error_is_a_stable_structured_tool_error(
     assert payload["schema_version"] == 1
     assert payload["error"]["code"] == "NOT_INITIALIZED"
     assert payload["error"]["suggested_action"] == "Run initialize_repository first"
+
+
+def test_main_process_recovers_before_registering_tools(services: MagicMock) -> None:
+    """A restarted Main server repairs a prior interrupted transaction once."""
+    _recover_main_formal_state("main", services)
+
+    services.recover_formal_state.assert_called_once_with()
+
+
+def test_analyzer_process_never_attempts_recovery_writes(services: MagicMock) -> None:
+    """Analyzer keeps its read-only contract even when Main can recover."""
+    _recover_main_formal_state("analyzer", services)
+
+    services.recover_formal_state.assert_not_called()
+
+
+def test_main_process_allows_uninitialized_repository(services: MagicMock) -> None:
+    """Main must still start so its initialize tool can create the skeleton."""
+    services.recover_formal_state.side_effect = CodeCortexError(
+        ErrorCode.NOT_INITIALIZED, "not initialized"
+    )
+
+    _recover_main_formal_state("main", services)
+
+    services.recover_formal_state.assert_called_once_with()
+
+
+def test_main_process_refuses_unsafe_recovery_failure(services: MagicMock) -> None:
+    """A corrupt journal is never hidden behind an apparently healthy server."""
+    services.recover_formal_state.side_effect = CodeCortexError(
+        ErrorCode.FORMAL_STATE_CORRUPT, "unprovable transaction"
+    )
+
+    with pytest.raises(CodeCortexError, match="unprovable transaction"):
+        _recover_main_formal_state("main", services)

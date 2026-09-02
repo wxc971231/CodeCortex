@@ -666,6 +666,7 @@ Core 能验证 Proposal、approval record、base graph revision、source precond
 ├── graph.json
 ├── entity_refs.json
 ├── source_baseline.json
+├── view_manifest.json       # M1a 起，Core 管理 View 的字节摘要
 ├── PROJECT.md
 ├── history/
 │   └── events/
@@ -691,7 +692,7 @@ Core 能验证 Proposal、approval record、base graph revision、source precond
 - `source_baseline.json` 保存与正式 cognition baseline 对应的受管理文件路径和逐文件内容摘要，不保存源码或 AST；
 - `PROJECT.md` 保存用户可手工维护的项目背景和目标；
 - `history/events/` 保存已经影响正式状态的不可变审计事件；
-- `views/` 是从 graph 确定性生成的人类可读投影；
+- `views/` 是从 graph 确定性生成的人类可读投影；M1a 起 `.codecortex/view_manifest.json` 保存每个 Core 管理 View 的 raw-byte digest 与对应 graph revision，用于检测缺失、额外或被手工修改的 View。`PROJECT.md` 不属于该 manifest，始终允许用户编辑；
 - `.cache/` 是可删除、可重建的机器状态。
 
 `facts.sqlite3` 保存代码事实和正式认知的本机查询副本，用于按路径、实体、关系、认知节点和 Mapping 高效索引。它不是第二套真相：每次查询必须核对 cache schema、parser version、当前源码摘要和 graph revision；任一不匹配时禁止返回混合数据并重建 cache。正式状态以 Git 中的 graph、entity refs、source baseline、manifest 和 History 为准。
@@ -712,7 +713,7 @@ files:
 
 文件按规范化相对路径稳定排序且路径唯一。普通 Fact Sync 只更新 cache，不能修改 source baseline；只有初始化 apply、认知 Proposal apply 或 cognition baseline advance 的正式事务才能整体替换它。
 
-`cognition_initialized=false` 表示只完成 M0 技术骨架，manifest cognition baseline 与 `repository_source_digest` 必须同时为 null，`files=[]`；M0 的持久化验收可以推进 graph revision，但不得把该标志改成 true。首次真实 M1a 初始化 apply 必须原子设置 `cognition_initialized=true` 并建立非空基线；此后不再允许 null。这样 graph revision 只表示正式状态版本，不被误当成“已经完成项目理解”。
+`cognition_initialized=false` 表示只完成 M0 技术骨架，manifest cognition baseline 与 `repository_source_digest` 必须同时为 null，`files=[]`；M0 的持久化验收可以推进 graph revision，但不得把该标志改成 true。首次真实 M1a 初始化 apply 必须以当前 graph revision 为 Proposal base，并原子产生 `current + 1`、设置 `cognition_initialized=true` 与建立非空基线；只有新建 revision-0 skeleton 时结果才是 revision 1。此后不再允许 null。这样 graph revision 只表示正式状态版本，不被误当成“已经完成项目理解”；已有 M0 正式对象不能被 init 静默清空。
 
 MVP 只持久化两类 History Event：
 
