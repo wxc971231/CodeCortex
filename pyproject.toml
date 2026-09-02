@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codecortex"
+version = "0.1.0"
+requires-python = ">=3.14,<3.15"
+dependencies = ["mcp>=2,<3", "pydantic>=2,<3", "tomlkit>=0.13,<1"]
+
+[project.optional-dependencies]
+dev = ["build>=1,<2", "pytest>=8,<9", "pytest-cov>=6,<7", "ruff>=0.12,<1", "mypy>=1.17,<2"]
+
+[project.scripts]
+codecortex = "codecortex.interfaces.cli.main:entrypoint"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["codex_e2e: requires an installed Codex CLI and configured model access"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codecortex"]

@@ -49,6 +49,8 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 cover/
 
 # Translations
@@ -152,6 +154,7 @@ activemq-data/
 .envrc
 .venv
 .worktrees/
+.codecortex/.cache/
 env/
 venv/
 ENV/
