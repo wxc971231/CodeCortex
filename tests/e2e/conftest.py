@@ -26,11 +26,19 @@ def codex_harness(tmp_path: Path) -> CodexHarness:
     executable = shutil.which("codecortex")
     if executable is None:
         pytest.skip("CodeCortex CLI is not installed on PATH")
+    if os.environ.get("CODECORTEX_E2E_COPY_AUTH") != "1":
+        pytest.skip("Set CODECORTEX_E2E_COPY_AUTH=1 to copy browser auth into the temporary Codex home")
+    auth_source = Path.home() / ".codex" / "auth.json"
+    if not auth_source.is_file() or auth_source.is_symlink():
+        pytest.skip("Browser authentication file is unavailable for isolated E2E")
     root, home = tmp_path / "fixture", tmp_path / "codex-home"
     root.mkdir(); home.mkdir()
     (root / "README.md").write_text("# M0 Fixture\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     install_codex(home, Path(executable), dry_run=False, force=False)
+    auth_target = home / ".codex" / "auth.json"
+    shutil.copyfile(auth_source, auth_target)
+    auth_target.chmod(0o600)
     config = home / CONFIG_RELATIVE
     document = tomlkit.parse(config.read_text(encoding="utf-8"))
     document["mcp_servers"]["codecortex"]["tools"]["apply_cognitive_proposal"]["approval_mode"] = "approve"
