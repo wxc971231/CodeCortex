@@ -1,6 +1,6 @@
 # CodeCortex 项目理解系统 MVP
 
-## 设计规格 v0.6
+## 设计规格 v0.6.1
 
 **状态：** Implementation Baseline 已冻结
 
@@ -48,7 +48,7 @@ CodeCortex 的核心定位不是替代 Codex 的代码搜索、源码读取和�
 - Codex 显式触发的初始化、查询、局部展开、认知同步和全局重新分析；
 - 基于认知图的问题讨论、连续追问和原生 Codex fallback；
 - 每次 CodeCortex 工作前的源码事实收敛和查询级影响范围判断；
-- 专用只读 CodeCortex Analyzer；
+- 专用 CodeCortex Analyzer，以及由只读 MCP profile 强制执行的正式状态写隔离；
 - Proposal、讨论、审批和应用两阶段认知写入；
 - 结构化规范数据与自动生成的 Markdown Views；
 - 全局工具安装与仓库内认知状态；
@@ -88,7 +88,7 @@ Main Codex
   ├─ 用户批准后的认知写入
   └─ 大范围分析时派生 CodeCortex Analyzer
                        │
-                       └─ 只读分析
+                       └─ 默认只读分析
   │
   └──────────── MCP ────────────┐
                                 ▼
@@ -120,9 +120,11 @@ Main Codex
 - 执行全仓或大范围 read-heavy 分析；
 - 通过只读 MCP 获取代码事实和已有认知；
 - 使用自身代码搜索能力进行 Targeted Source Read；
-- 将探索过程压缩为完整、结构化且大小受限的 `AnalysisReport` 返回 Main Codex；
+- 将本次选择提交的候选数据压缩为结构化且大小受限的 `AnalysisReport` 返回 Main Codex；
 - 不修改业务源码；
 - 不创建或应用正式认知修改。
+
+CodeCortex 能硬性保证 Analyzer MCP 不暴露写工具、Core 拒绝 Analyzer profile 写正式状态。自定义 Agent 默认请求 read-only sandbox，但父 Codex 会话的实时 sandbox/approval 覆盖可能被重新应用给 subagent，因此产品不能宣称独立撤销父会话已经授予的原生文件权限。Analyzer 仍被明确指示不得写仓库；分析开始与 Main 消费报告时必须核对源码摘要，期间源码有变化则报告作废。
 
 **CodeCortex Core**
 
@@ -243,13 +245,15 @@ CodeCortex 分别记录：
 - **Fact Freshness**：AST、符号、关系和 CodeEntity 是否与源码一致；
 - **Cognition Freshness**：认知图是否已经对当前源码完成语义影响判断。
 
-每批差异形成一个 `ChangeSet`，至少包含前后源码摘要、涉及文件和实体、来源、影响范围、创建时间和处理状态。影响范围必须包含 `affected_nodes`、`affected_entities`、`unmapped_changes` 和 `scope_confidence: complete | partial | unknown`。无法可靠确定来源时使用 `unknown`，不得把修改猜测为 Codex 或用户产生。
+每批差异形成一个 `ChangeSet`，至少包含前后源码摘要、涉及文件和实体、来源、影响范围、创建时间和处理状态。影响范围必须包含 `file_diff_completeness`、`entity_diff_completeness: complete | partial`、`affected_nodes`、`affected_entities`、`unmapped_changes` 和 `scope_confidence: complete | partial | unknown`。无法可靠确定来源时使用 `unknown`，不得把修改猜测为 Codex 或用户产生。
 
-- `complete`：每个新增、修改或删除项都能通过当前/历史 Implementation Mapping，或 containment、经 resolver 高置信解析的 import/inheritance 等结构关系路径连接到已有认知节点；没有无法连接的 `unmapped_changes`，并已完成保守依赖闭包；
+- `complete`：全部变化/删除文件已识别并解析成功；每项变化都能通过当前/历史 Implementation Mapping、Evidence 或经 resolver 高置信解析的结构关系连接到已有认知节点，或者被规则化地证明与正式认知无关；没有 unresolved 的相关关系或 `unmapped_changes`，并已完成保守依赖闭包；
 - `partial`：只解析了部分变化，或仍存在无法通过确定关系连接到已有认知节点的新增、删除或未映射内容；
 - `unknown`：无法可靠界定变化可能影响的认知范围。
 
 删除实体可以使用删除前的 CodeEntity tombstone 和历史 Mapping 计算候选范围。无法连接的新文件、新实体或删除项必须保留在 `unmapped_changes` 中，使 scope 至少为 `partial`；Core 不得为了获得 `complete` 状态而推断它们“与认知图无关”。错误的 `complete` 比保守降级更危险。
+
+cache 连续存在时，SQLite 中独立的 baseline entity snapshot 只随 cognition baseline 推进，因此可完整比较新旧实体。cache 被删除或换机器后，正式 source baseline 仍能恢复完整文件级差异，Core 也能恢复当前实体和 `entity_refs.json` 中正式引用过的旧实体；但未被正式引用的全部旧实体无法重建，因此 `entity_diff_completeness` 必须标为 `partial`。这不自动决定 `scope_confidence`，后者仍须逐项满足上述严格证明条件。
 
 认知状态至少区分：
 
@@ -644,11 +648,11 @@ Core 能验证 Proposal、approval record、base graph revision、source precond
 - Proposal 绑定 base graph revision；
 - base revision 变化后旧 Proposal 不可应用；
 - apply 前必须先同步最新确定性事实；
-- 任一 `source_preconditions` 的路径摘要或 CodeEntity fingerprint 变化后，Proposal 进入 `STALE`，必须 rebase 或 revise；
-- 只有 `analyzed_source_digest` 变化、但重新计算能够证明新增差异与 Proposal 作用域无交集时，允许继续 apply；
-- 无法证明源码变化与 Proposal 作用域无交集时，Proposal 进入 `STALE`；
+- 当前 repository source digest 必须与 `analyzed_source_digest` 完全一致；任一 Managed Source Set 变化都使 Proposal 进入 `STALE`，必须重新分析或 revise；
+- `source_preconditions` 的路径摘要和 CodeEntity fingerprint 仍需逐项复核，防止实现或摘要算法错误绕过约束；
+- MVP 不实现“证明后续变化无关后继续 apply”的局部 rebase 优化，以保持审批对象、正式 source baseline 和真实源码严格对应；
 - Core 先在内存中应用 Patch 并完整校验；
-- APPLIED Proposal 的不可变 History Event 与 graph、entity refs 和 Views 一起通过临时文件完成一致性写入；
+- APPLIED Proposal 的不可变 History Event 与 graph、entity refs、source baseline 和 Views 一起通过临时文件完成一致性写入；
 - 任一步失败都保持上一正式 revision 不变。
 
 ## 12. 持久化
@@ -661,6 +665,7 @@ Core 能验证 Proposal、approval record、base graph revision、source precond
 ├── config.toml
 ├── graph.json
 ├── entity_refs.json
+├── source_baseline.json
 ├── PROJECT.md
 ├── history/
 │   └── events/
@@ -683,14 +688,31 @@ Core 能验证 Proposal、approval record、base graph revision、source precond
 - `graph.json` 是语义认知图的规范数据；
 - `manifest.json` 保存 schema、受管理源码规则，以及与当前 graph revision 对应的 cognition baseline 摘要；
 - `entity_refs.json` 保存认知图实际引用的稳定 CodeEntity 身份；
+- `source_baseline.json` 保存与正式 cognition baseline 对应的受管理文件路径和逐文件内容摘要，不保存源码或 AST；
 - `PROJECT.md` 保存用户可手工维护的项目背景和目标；
 - `history/events/` 保存已经影响正式状态的不可变审计事件；
 - `views/` 是从 graph 确定性生成的人类可读投影；
 - `.cache/` 是可删除、可重建的机器状态。
 
-`facts.sqlite3` 保存代码事实和正式认知的本机查询副本，用于按路径、实体、关系、认知节点和 Mapping 高效索引。它不是第二套真相：每次查询必须核对 cache schema、parser version、当前源码摘要和 graph revision；任一不匹配时禁止返回混合数据并重建 cache。正式认知仍只以 Git 中的 graph、entity refs、manifest 和 History 为准。
+`facts.sqlite3` 保存代码事实和正式认知的本机查询副本，用于按路径、实体、关系、认知节点和 Mapping 高效索引。它不是第二套真相：每次查询必须核对 cache schema、parser version、当前源码摘要和 graph revision；任一不匹配时禁止返回混合数据并重建 cache。正式状态以 Git 中的 graph、entity refs、source baseline、manifest 和 History 为准。
 
-`freshness.json`、当前事实摘要和未决 ChangeSet 属于可重建状态。删除缓存后，Core 必须从已提交 cognition baseline 和当前源码重新计算，而不是默认认知图仍然 fresh。
+`freshness.json`、当前事实摘要和未决 ChangeSet 属于可重建状态。删除缓存后，Core 必须从已提交 cognition baseline、`source_baseline.json` 和当前源码重新计算，而不是默认认知图仍然 fresh。source baseline 与 manifest baseline 必须在同一正式事务推进；两者摘要不一致属于正式状态损坏。
+
+`source_baseline.json` 的最小规范为：
+
+```yaml
+schema_version: 1
+digest_profile_version: 1
+managed_source_set_version: 1
+repository_source_digest: "sha256:..."
+files:
+  - relative_path: src/codecortex/application/query.py
+    content_digest: "sha256:..."
+```
+
+文件按规范化相对路径稳定排序且路径唯一。普通 Fact Sync 只更新 cache，不能修改 source baseline；只有初始化 apply、认知 Proposal apply 或 cognition baseline advance 的正式事务才能整体替换它。
+
+M0 revision 0 是唯一空基线：manifest cognition baseline 与 `repository_source_digest` 同时为 null，`files=[]`；首次真实初始化 apply 后不再允许 null。
 
 MVP 只持久化两类 History Event：
 
@@ -715,13 +737,13 @@ unmapped_changes: []
 
 `DRAFT`、`PROPOSED`、`REVISED` 和 `STALE` 等非正式 Proposal 状态只保存在 `.codecortex/.cache/pending_proposals/`，可以在删除缓存或跨机器后丢失。`REJECTED` 不进入正式 History，可以立即删除或仅作为本机临时诊断保留。
 
-Analyzer 不直接写 SQLite，也不创建独立 Analysis Result 生命周期。它通过 Codex subagent 返回一份完整但压缩的 `AnalysisReport`；Main Codex 收到后立即创建或修订 pending Proposal。Proposal 是唯一持久化的临时语义工作状态。
+Analyzer 不直接写 SQLite，也不创建独立 Analysis Result 生命周期。它通过 Codex subagent 返回压缩的 `AnalysisReport`；Main Codex 收到后立即创建或修订 pending Proposal。Proposal 是唯一持久化的临时语义工作状态。“完整报告”只指它包含本次选择提交的全部候选数据，不代表完整覆盖仓库。
 
 History Event ID、Proposal ID 和 ChangeSet ID 使用独立命名空间：`evt_`、`prop_` 和 `chg_`。正式节点中的 `approval.approval_event_id` 指向 `cognitive_proposal_applied` Event，Event 内再保存 `proposal_id`，形成 `Node → History Event → Proposal Snapshot`。Core 校验时必须拒绝悬空 Event 引用或 ID 类型混用。
 
 `cognitive_proposal_applied` 的 `event_id` 由 Core 在 apply 事务中分配，并作为确定性 provenance metadata 写入受影响节点的 `approval_event_id`。用户批准的 Patch 摘要覆盖语义修改；Core 自动附加的 Event ID、批准者和批准时间属于受校验的操作元数据，不改变获批语义。apply 返回新的 Event ID 和 graph revision。
 
-History Event 一经写入不可修改。apply 成功时，最终 Proposal Event、graph revision、entity refs、Views 和 manifest 必须形成同一个可恢复的一致性边界；发生中断时不得暴露只更新一部分的正式状态。
+History Event 一经写入不可修改。apply 成功时，最终 Proposal Event、graph revision、entity refs、source baseline、Views 和 manifest 必须形成同一个可恢复的一致性边界；发生中断时不得暴露只更新一部分的正式状态。
 
 MVP 不支持用户直接编辑 `graph.json` 或生成的 Markdown Views。用户修正统一通过 Main Codex、Proposal 和 Core 完成。
 
@@ -733,6 +755,7 @@ MVP 不支持用户直接编辑 `graph.json` 或生成的 Markdown Views。用�
 - `config.toml`；
 - `graph.json`；
 - `entity_refs.json`；
+- `source_baseline.json`；
 - `PROJECT.md`；
 - `history/`；
 - `views/`。
@@ -752,7 +775,7 @@ git clone
   ↓
 Core 读取 manifest 和 graph
   ↓
-读取 history 并校验 graph 中的 approval 引用
+读取 source baseline、history 并校验 graph 中的 approval 引用
   ↓
 发现本地缓存缺失
   ↓
@@ -760,7 +783,7 @@ Core 读取 manifest 和 graph
   ↓
 按 address / fingerprint 解析 entity_refs
   ↓
-对比 cognition baseline 与当前源码摘要
+用 source baseline 对比当前逐文件源码摘要
   ↓
 一致：validate_graph 后进入正常查询
 不一致：执行 Fact Preflight，Semantic Cognition Sync 按查询范围延迟执行
@@ -773,7 +796,7 @@ Core 读取 manifest 和 graph
 - 不创建认知 Proposal；
 - 不改变 graph revision。
 
-缓存重建完成后若源码摘要与 cognition baseline 不一致，Core 先生成 ChangeSet 和 potentially affected scope，不阻塞当前无关查询。后续 Semantic Cognition Sync 可以按范围调用 Main Codex 或 Analyzer，并遵守标准 Proposal 审批规则。换言之，“恢复缓存”是确定性的，“判断认知是否仍然成立”是独立且按需执行的语义步骤。
+缓存重建完成后若源码摘要与 cognition baseline 不一致，Core 用正式 source baseline 精确恢复 added/modified/deleted 文件；唯一同摘要的删除/新增对才可标为 rename，否则保留为删除加新增。实体历史仅能从正式 entity refs 完整恢复，因此必要时标记 `entity_diff_completeness=partial`。Core 随后计算 potentially affected scope，不阻塞当前无关查询。后续 Semantic Cognition Sync 可以按范围调用 Main Codex 或 Analyzer，并遵守标准 Proposal 审批规则。换言之，“恢复缓存”是确定性的，“判断认知是否仍然成立”是独立且按需执行的语义步骤。
 
 实体无法解析时标记为 stale/unresolved，并向 Main Codex 报告；Core 不根据猜测静默改写已提交认知。
 
@@ -894,7 +917,7 @@ Main Codex 判断问题范围和可能起点
   ├─ Behavior unmaterialized：询问是否展开，或 transient 回答
   └─ 没有任何语义锚点：Native Codex Search
   ↓
-必要时派生只读 Analyzer
+必要时派生 Analyzer（只读 MCP profile）
   ↓
 Main Codex 综合证据并回答
 ```
@@ -946,7 +969,7 @@ L3/L4 动态加载属于 graph-guided retrieval，不视为 fallback。只有找
 - 用户要求全面或全局分析；
 - Main Codex 判断大范围探索会明显占用主讨论上下文。
 
-单节点解释、已有映射清楚、少量源码即可回答的问题由 Main Codex 直接处理。Analyzer 返回一份完整但压缩且有大小上限的结构化 `AnalysisReport`，包括候选认知数据、证据、覆盖范围和不确定项；它不直接写数据库。Main Codex 接收报告后立即创建或修订 Proposal，并负责最终回答。
+单节点解释、已有映射清楚、少量源码即可回答的问题由 Main Codex 直接处理。Analyzer 返回一份压缩且有大小上限的结构化 `AnalysisReport`，包括候选认知数据、证据、覆盖范围和不确定项；它不直接写数据库。默认上限为序列化 512 KiB、节点 300、边 1000、Mapping 2000、Evidence 2000、单条描述 240 Unicode code points，且总字节上限优先。超限时提高语义粒度并明确列出未覆盖区域。Main Codex 接收报告后立即创建或修订 Proposal，并负责最终回答。
 
 ### 16.5 回答证据标准
 
@@ -974,7 +997,7 @@ L3/L4 动态加载属于 graph-guided retrieval，不视为 fallback。只有找
 - AST 单文件解析失败：记录文件级诊断；若影响初始化覆盖范围，在 Proposal 前向用户说明。
 - Proposal 过期：拒绝 apply，要求重新读取当前 graph 和相关 CodeEntity。
 - graph 中的 approval 引用找不到对应 History Event：校验失败，保留文件原状并报告悬空引用，不静默删除审批信息。
-- History Event 写入失败：graph、manifest、entity refs 和 Views 均不得推进正式 revision。
+- History Event 写入失败：graph、manifest、entity refs、source baseline 和 Views 均不得推进正式 revision。
 - entity ref 无法解析：保留认知节点，标记映射 unresolved，不删除用户认知。
 - Markdown View 生成失败：graph 不推进 revision；修复生成问题后整体重试。
 - 跨机器 schema 不兼容：报告所需最低 Core 版本，不隐式降级或丢字段。
@@ -990,6 +1013,7 @@ L3/L4 动态加载属于 graph-guided retrieval，不视为 fallback。只有找
 - Python AST 实体和源码位置；
 - SQLite cache schema、必要索引、外键、批量查询和 graph/source revision 校验；
 - SQLite 增量更新与全量重建结果等价，cache 损坏时原子替换；
+- 目标实体改变或删除后，未变化来源文件的 incoming relations 重新解析，relation identity 不依赖解析目标；
 - contains、import declaration 和 declared base 的确定性提取；
 - imports、inherits、tested_by 和 calls 的证据、置信度与 resolver 版本；
 - CodeEntity address、fingerprint 和 uid 保留规则；
@@ -1013,6 +1037,7 @@ L3/L4 动态加载属于 graph-guided retrieval，不视为 fallback。只有找
 - Markdown Views 的确定性输出；
 - entity refs 的跨目录解析；
 - cache 删除后的无损重建；
+- cache 删除后用 source baseline 恢复精确文件级差异，旧实体不全时明确标记 partial；
 - cache 删除后 applied History Event 仍可读取；
 - 受管理源码摘要的确定性和未提交修改检测；
 - Source Digest Profile 的路径排序、分隔符、LF/CRLF 规范化和版本失配处理；
@@ -1037,17 +1062,18 @@ L3/L4 动态加载属于 graph-guided retrieval，不视为 fallback。只有找
 - 自动推进 baseline 时写入 `reason: no_semantic_change` 的正式 History Event；
 - 用户确认图仍然有效时写入带 approval record 的 `reason: user_accepted` Event；
 - Semantic Cognition Sync 确认语义变化时按 ChangeSet 聚合为一份 Proposal；
-- init 必定派生只读 Analyzer；
+- init 必定派生 Analyzer，且 Analyzer MCP 无写工具；
 - Analyzer 无法访问写 MCP；
-- Analyzer 返回完整、压缩、大小受限的 AnalysisReport，且不写临时分析数据库；
+- Analyzer 返回不超过 512 KiB 的压缩 AnalysisReport，明确未覆盖区域，且不写临时分析数据库；
+- Analyzer 分析期间源码摘要变化时报告被拒绝；
 - Main Codex 能从 AnalysisReport 创建整体 Proposal；
 - 仅从源码归纳出的语义节点不会自动标记为 established；
 - 未收到批准时不调用 apply；
 - 用户修订后 Proposal 内容同步变化；
 - Proposal 作用域源码变化时 apply 进入 STALE；
-- 仅无关源码变化且重新确认无交集时允许 apply；
+- Proposal 生成后即使只改了无关源码，也必须重新分析或 revise 后才能 apply；
 - apply 缺少或携带不匹配的 approval record 时拒绝写入；
-- 批准后 graph、entity refs 和 Views 一致更新；
+- 批准后 graph、entity refs、source baseline 和 Views 一致更新；
 - 批准后不可变 History Event 与 graph revision 一致更新；
 - 另一台机器 clone 后能够解析 graph 中的 approval history 引用；
 - 不同换行风格和路径分隔符不会制造跨机器虚假源码变化；
@@ -1063,7 +1089,7 @@ L3/L4 动态加载属于 graph-guided retrieval，不视为 fallback。只有找
 - MCP 查询失败时恢复原生 Codex 搜索；
 - 图外问题完整恢复 Native Codex Search，不限制原生源码工具和搜索范围。
 
-Codex 集成验收使用两个相同 commit 的临时 Git 副本，分别运行独立 `codex exec --ephemeral --json` 进程测试 Native Codex 与 CodeCortex；两边固定模型、推理设置、sandbox、问题和预算，记录 MCP 调用、最终回答、token 与耗时。审批流程用 `codex exec resume` 测试，VS Code host approval prompt 另保留一次人工 smoke test。
+Codex 集成验收使用两个相同 commit 的临时 Git 副本，普通单轮 Benchmark 分别运行独立 `codex exec --ephemeral --json` 进程测试 Native Codex 与 CodeCortex；两边固定模型、推理设置、sandbox、问题和预算，记录 MCP 调用、最终回答、token 与耗时。需要 resume 的自动化审批流程不能使用 `--ephemeral`：它在隔离的临时 Codex home 中使用独立测试配置，将 apply 的 host approval 设为 `approve`，再用 `codex exec resume` 验证第一轮未批准不写、第二轮用户批准和 `approval_record` 校验，完成后清理测试 home；产品配置始终保留 `prompt`，并另做一次 VS Code 人工 smoke test。
 
 ### 18.3 中型仓库验收
 
@@ -1074,7 +1100,7 @@ Codex 集成验收使用两个相同 commit 的临时 Git 副本，分别运行�
 - 关键 Capability 可以被多个 Behavior 共享引用；
 - Implementation Mapping 能定位到真实源码；
 - L2/L3 可以按需局部 materialize；
-- Main Codex 接收 Analyzer 完整但压缩的 AnalysisReport，不接收大范围源码探索过程；
+- Main Codex 接收 Analyzer 受限且压缩的 AnalysisReport，不接收大范围源码探索过程；
 - 不使用源码向量 RAG；
 - 删除 `.cache` 后能够恢复；
 - 另一台机器 clone 后无需重新语义初始化；
@@ -1104,8 +1130,8 @@ Codex 集成验收使用两个相同 commit 的临时 Git 副本，分别运行�
 ```text
 显式触发 $codecortex
   → Main Codex 调用一个只读 MCP 工具
-  → Main Codex 派生只读 Analyzer
-  → Analyzer 只能访问只读工具
+  → Main Codex 派生 Analyzer（只读 MCP profile）
+  → Analyzer MCP 只暴露只读工具
   → Main Codex 创建最小 Proposal
   → 未收到用户明确批准时 Main Codex 不得调用 apply
   → 用户批准后 Main Codex 提交结构化 approval record
@@ -1125,7 +1151,7 @@ M0 明确不包含 Python AST、Freshness、ChangeSet、增量索引、文件系
 安装 CodeCortex
   → 在 Codex 中显式执行 $codecortex init
   → Core 建立真实 AST 事实
-  → Main Codex 派生只读 Analyzer
+  → Main Codex 派生 Analyzer（只读 MCP profile）
   → Analyzer 返回 L0/L1 建议
   → Main Codex 创建整体 Proposal
   → 用户讨论并批准

@@ -65,6 +65,22 @@ repository_digest = SHA256(
 
 Digest Profile 和 Managed Source Set 算法版本保存在 manifest。规则版本变化必须全量重新扫描，不能继承旧 baseline。
 
+与正式 cognition baseline 同步提交的 `.codecortex/source_baseline.json` 只保存基线文件清单和摘要，不保存源码或 AST：
+
+```yaml
+schema_version: 1
+digest_profile_version: 1
+managed_source_set_version: 1
+repository_source_digest: "sha256:..."
+files:
+  - relative_path: src/codecortex/application/query.py
+    content_digest: "sha256:..."
+```
+
+`files` 按规范化相对路径排序且路径唯一。文件中的仓库摘要必须与 manifest cognition baseline 相同。它只在初始化 apply、带图修改的 apply 或 baseline advance 正式事务中整体替换；普通 Fact Sync 绝不改它。这样 SQLite 被删除或换机器后，Core 仍能从“已接受的逐文件基线”与当前源码精确恢复 added/modified/deleted 文件集合。
+
+唯一例外是 M0 revision 0：manifest cognition baseline 和 `repository_source_digest` 同时为 null，`files=[]`。首次真实初始化 apply 后不再允许 null。
+
 ## 3. AST 解析
 
 ### 3.1 支持范围
@@ -157,6 +173,7 @@ CREATE TABLE cache_metadata (
   managed_source_set_version INTEGER NOT NULL,
   repository_source_digest TEXT NOT NULL,
   graph_revision INTEGER NOT NULL,
+  baseline_entity_snapshot_completeness TEXT NOT NULL,
   index_generation INTEGER NOT NULL,
   built_at TEXT NOT NULL
 );
@@ -186,7 +203,7 @@ CREATE TABLE entities (
   qualname TEXT NOT NULL,
   kind TEXT NOT NULL,
   name TEXT NOT NULL,
-  parent_uid TEXT REFERENCES entities(uid),
+  parent_uid TEXT REFERENCES entities(uid) ON DELETE CASCADE,
   start_line INTEGER NOT NULL,
   end_line INTEGER NOT NULL,
   signature TEXT,
@@ -229,6 +246,19 @@ CREATE TABLE diagnostics (
   start_line INTEGER,
   end_line INTEGER
 );
+
+CREATE TABLE baseline_entity_snapshots (
+  uid TEXT PRIMARY KEY,
+  baseline_source_digest TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  address TEXT NOT NULL,
+  module_name TEXT NOT NULL,
+  qualname TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  signature TEXT,
+  UNIQUE(baseline_source_digest, address, kind)
+);
 ```
 
 必要索引：
@@ -241,9 +271,17 @@ relations(source_uid, relation_type)
 relations(target_uid, relation_type)
 relations(target_module, relation_type)
 diagnostics(file_id, severity)
+baseline_entity_snapshots(relative_path)
+baseline_entity_snapshots(module_name, fingerprint)
 ```
 
-增量同步先在事务外解析变化文件，再获取独占仓库锁并重新验证输入摘要；摘要未变化时，在一个短事务中按 file 批量删除旧派生记录、插入新记录并最后更新 metadata generation。摘要已经变化则放弃本批结果并重试，不把针对旧源码的 AST 写入 cache。读取接口不得逐实体发 SQL。
+`baseline_entity_snapshots` 是可删除的本机辅助数据，不是正式真相。cognition baseline 推进时，因为 MVP 要求当前源码与 Proposal 分析摘要完全一致，cache 可以从当前 `entities` 复制一份 baseline entity 快照，并把 completeness 设为 `complete`。后续 Fact Sync 只更新当前实体，保留这份快照，用于始终按“正式 baseline → current”重算单一 ChangeSet。cache 丢失且当前源码已经偏离 baseline 时，只能用 `entity_refs.json` 恢复被正式引用的旧实体，completeness 必须为 `partial`；不能伪造完整快照。
+
+`relation_key` 只由关系声明本身的稳定信息计算：source relative path、source declaration address、relation type、声明位置和规范化 raw expression；临时 entity UID 与 resolved target 都不进入 key。目标解析变化时更新同一关系，不制造一条“新关系”。
+
+增量同步先在事务外解析变化文件，再获取独占仓库锁并重新验证输入摘要。更新变化/删除文件前，先按旧 `target_uid`、旧/新 module name 收集指向这些目标的 incoming relations，并包含可能被新增 module/entity 解析成功的同名 unresolved relations；替换实体和本文件派生关系后，对这些来源声明重新运行关系 resolver。该步骤只读取来源文件已有 AST 事实/声明，不重新解析未变化文件。它保证 A 文件的实体改名、增加或删除后，B 文件缓存的 imports/inherits/calls 不会继续错误指向旧目标或错过新目标。
+
+摘要未变化时，在一个短事务中按 file 批量替换记录、刷新 incoming relation resolution 并最后更新 metadata generation。摘要已经变化则放弃本批结果并重试，不把针对旧源码的 AST 写入 cache。读取接口不得逐实体发 SQL。
 
 ## 7. SQLite 认知查询副本
 
@@ -535,7 +573,7 @@ apply 根据 graph 中全部 Mapping/Evidence 重新计算集合，不保留无�
 
 ## 10. AnalysisReport
 
-Analyzer 完全只读，通过 Codex subagent 返回一份完整、压缩、结构化报告：
+Analyzer 通过 Codex subagent 返回一份完整、压缩、结构化报告。这里的“完整”只表示报告包含 Analyzer 本次选择提交的全部候选数据，不表示覆盖整个仓库：
 
 ```yaml
 schema_version: 1
@@ -560,7 +598,7 @@ diagnostics: []
 
 报告不保存到独立 analysis database，也没有 analysis lifecycle。Main 收到后立即调用 `create_cognitive_proposal`；Proposal 成为唯一临时工作状态。
 
-默认安全上限：序列化报告 5 MiB、节点 1000、边 5000、Mapping 10000、Evidence 20000、单条证据说明 400 Unicode code points。超限时 Analyzer 降低语义粒度并显式报告未覆盖区域，不分块偷偷提交。
+默认安全上限：序列化报告 512 KiB、节点 300、边 1000、Mapping 2000、Evidence 2000、单条 description/observation 240 Unicode code points。总字节上限优先于各项数量上限。预计超限时 Analyzer 必须提高语义层级、减少低价值候选，并在 `unexamined_partitions` / `unmapped_regions` 中明确列出未覆盖区域，不分块偷偷提交，也不把“报告完整”描述成“仓库完整覆盖”。
 
 ## 11. 初始化流程
 
@@ -580,7 +618,7 @@ $codecortex init
 
 Analyzer 顺序：项目文档/入口 → package/module 分区 → 分区职责行为 → 跨区依赖 → 关键 Capability → 全局汇总。初始化优先生成 L0/L1 和关键 L2，不为每个函数制造 Capability。
 
-创建 Proposal 前 Core 重新同步事实并检查 AnalysisReport 的 source digest。若变化范围可确定，Main 只重新分析受影响分区；无法证明无关时拒绝使用旧报告。
+创建 Proposal 前 Core 重新同步事实并检查 AnalysisReport 的 source digest。Analyzer 开始分析时记录 digest，Main 消费报告时必须再次检查；期间源码有任何变化时，本报告整体作废并重新分析，不使用 affected-scope 规则替旧报告续命。Proposal 创建后，任何 Managed Source Set 摘要变化都使它 stale；MVP 不实现“证明变化无关后继续 apply”的复杂 rebase 优化。
 
 ## 12. Reinitialize
 
@@ -603,7 +641,7 @@ add_mapping / update_mapping / remove_mapping
 
 完整 Proposal 包含：base revision、AnalysisReport source digest、细粒度 source preconditions、operations、结构化 before/after summary、affected nodes、evidence、uncertainties、revision log 和 canonical patch digest。
 
-revision 后 digest 改变，旧批准无效。apply 时检查 graph revision、路径摘要、entity fingerprint；无法证明后续源码变化与作用域无交集时标记 STALE。
+revision 后 digest 改变，旧批准无效。apply 时要求当前 repository source digest 与 `analyzed_source_digest` 完全一致，并再次检查路径摘要和 entity fingerprint；任一源码变化都标记 STALE。后续版本可增加有证据的局部 rebase，MVP 不承担这套复杂度。
 
 ## 14. History 与 baseline
 
@@ -614,7 +652,7 @@ M1a 正式事件：
 
 节点/边/Flow/Mapping 的 approval 指向最新改变它的 applied Event；Event 内保存 Proposal ID，形成 `Object → Event → Proposal Snapshot`。
 
-初始化 apply 把 analyzed source digest 设为 cognition baseline。History Event 不可修改；cache 中的 pending Proposal 可以删除。
+初始化 apply 以及后续认知 Proposal apply，都把已经重新核验的当前 source digest 设为 cognition baseline，并从当前排序后的逐文件摘要在同一正式事务生成对应 `source_baseline.json`。History Event 不可修改；cache 中的 pending Proposal 可以删除。
 
 ## 15. 原子 apply
 
@@ -622,10 +660,10 @@ M1a 正式事件：
 2. Fact Sync；
 3. proposal、approval、graph/source preconditions 校验；
 4. 内存应用全部操作；
-5. 全图、entity refs 和 History 引用校验；
-6. 生成 Event ID、revision、Views；
+5. 全图、entity refs、source baseline 和 History 引用校验；
+6. 生成 Event ID、revision、source baseline、Views；
 7. 写事务 staging/journal；
-8. event、graph、entity refs、views 替换；
+8. event、graph、entity refs、source baseline、views 替换；
 9. manifest 最后提交；
 10. 刷新 SQLite 认知副本。
 
@@ -674,11 +712,14 @@ M0 Proposal 工具扩展为完整 M1a schema。所有列表返回 cursor 和 `tr
 - 嵌套定义、async、decorator、复杂 signature；
 - 单文件语法/编码错误；
 - import/inheritance resolved 与 unresolved；
+- 目标实体修改/删除后，未变化来源文件的 incoming imports/inherits/calls 重新解析；
+- relation key 不随 resolved target 改变，增量更新与全量重建一致；
 - rename、duplicate fingerprint 和 ambiguous identity。
 
 ### 18.2 数据库
 
 - DDL、外键、必要索引存在；
+- baseline entity snapshot 在连续 cache 下保持不变，baseline 推进时才整体刷新；
 - 增量更新等于全量重建结果；
 - 作用域批量查询无 N+1；
 - graph revision 不匹配不返回数据；
@@ -694,6 +735,8 @@ M0 Proposal 工具扩展为完整 M1a schema。所有列表返回 cursor 和 `tr
 - Patch digest、revision、stale source；
 - apply 故障注入和 History 不可变；
 - View 可重复生成。
+- source baseline 与 manifest digest 一致，事务失败不会只推进其中一方；
+- Analyzer 开始后源码变化时 AnalysisReport 被拒绝；
 
 ### 18.4 真实初始化
 
@@ -703,9 +746,9 @@ M0 Proposal 工具扩展为完整 M1a schema。所有列表返回 cursor 和 `tr
 
 - 100～500 个 Python 文件仓库可以建立稳定事实索引；
 - cache 查询按 scope/limit 完成，不整库加载；
-- Analyzer 不写状态，完整报告可以生成 Proposal；
+- Analyzer 不通过 MCP 写状态，受限报告可以生成 Proposal；
 - 初始化后有可理解的 L0/L1 和关键 Capability；
 - 所有正式语义修改有 approval Event；
 - inspect 可从认知节点到当前源码；
-- 删除 cache 或换机器后能恢复相同正式图和实体引用；
+- 删除 cache 或换机器后能恢复相同正式图、实体引用和精确文件级 baseline 差异；
 - reinitialize 不静默覆盖用户确认内容。

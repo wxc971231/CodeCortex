@@ -122,8 +122,8 @@ required = false
 startup_timeout_sec = 10
 tool_timeout_sec = 120
 
-[mcp_servers.codecortex.tool_approvals]
-apply_cognitive_proposal = "prompt"
+[mcp_servers.codecortex.tools.apply_cognitive_proposal]
+approval_mode = "prompt"
 ```
 
 Analyzer profile 写在自定义 Agent 配置中，不作为 Main 默认可见的第二套服务，避免 Main 混淆工具来源。
@@ -160,7 +160,7 @@ M1a/M1b 在不改变上述安全规则的前提下扩充 ask、sync、reinitiali
 自定义 Agent 文件定义：
 
 - 名称和描述明确为 repository-wide project understanding；
-- sandbox 为 read-only；
+- 默认请求 `sandbox_mode = "read-only"`；
 - 指令要求以证据为基础，区分事实、推断和不确定项；
 - 禁止修改源码和 `.codecortex/`；
 - 只注册 `codecortex mcp --profile analyzer`；
@@ -168,6 +168,8 @@ M1a/M1b 在不改变上述安全规则的前提下扩充 ask、sync、reinitiali
 - 不返回大段源码，只返回实体引用、短证据摘要和覆盖信息。
 
 Analyzer 是 Codex subagent。Core 中不得创建名为 Analyzer 的 LLM service，也不得从 Core 发起模型请求。
+
+权限边界必须诚实区分两层：Analyzer MCP 的工具 allowlist 和 Core profile 校验是 CodeCortex 能独立保证的硬边界，任何正式写工具都不会暴露或接受；自定义 Agent 的 read-only sandbox 是标准运行配置，但 Codex 可能把父会话的实时 sandbox/approval 覆盖重新应用给 subagent，因此 CodeCortex 不能声称可以撤销父会话已经授予的原生文件写权限。Analyzer 指令仍禁止修改仓库，并在分析开始及 Main 消费报告时比较源码摘要；摘要不一致则报告作废，不能创建 Proposal。
 
 ## 7. MCP Server 启动
 
@@ -219,9 +221,11 @@ graph.semantic_edges = []
 graph.logical_flows = []
 graph.implementation_mappings = []
 entity_refs = []
+source_baseline.repository_source_digest = null
+source_baseline.files = []
 ```
 
-同时创建默认 `config.toml`、`PROJECT.md` 模板和空 Views。它不声称已经理解项目，也不推进 cognition baseline。重复执行返回现有状态；发现半初始化或非法正式文件时拒绝覆盖。
+同时创建默认 `config.toml`、空 `source_baseline.json`、`PROJECT.md` 模板和空 Views。revision 0 的 source baseline 允许摘要为 null，且 manifest cognition baseline 也必须为 null；它不声称已经理解项目，也不推进 cognition baseline。重复执行返回现有状态；发现半初始化或非法正式文件时拒绝覆盖。
 
 M1a 的 `$codecortex init` 在 revision 0 上完成真实 AST、Analyzer 和初始化 Proposal，批准后产生 revision 1。
 
@@ -333,26 +337,27 @@ Core 不独立验证自然语言消息作者；Skill/Main 是否如实构造 rec
 - apply 各阶段故障注入；
 - 两个进程同时 apply，至多一个成功；
 - Analyzer MCP 尝试写工具得到 tool-not-found/permission error；
+- Analyzer 分析期间源码摘要改变时，报告被拒绝；
 - MCP stderr 日志不污染 stdout protocol。
 
 ### 14.3 真实 Codex E2E
 
-在临时 Git 仓库运行独立 `codex exec --ephemeral --json`：
+在临时 Git 仓库运行独立 Child Codex。单轮场景使用 `codex exec --ephemeral --json`；需要第二轮批准的场景不能使用 `--ephemeral`，而是在测试专用临时 Codex home 中运行 `codex exec --json`、记录 thread ID，完成 resume 后清理整个测试 home。自动化专用隔离配置把 `apply_cognitive_proposal` 的 host `approval_mode` 设为 `approve`，因为非交互执行无法弹出新的 host approval；产品默认配置仍为 `prompt`：
 
 1. `$codecortex status` 能调用 Main MCP；
 2. Main 能派生 Analyzer；
 3. Analyzer 能读 overview，不能写；
 4. 未给用户批准时 graph revision 保持不变；
-5. 用 `codex exec resume` 提供明确批准后 apply 成功；
+5. 第一轮未给 CodeCortex 对话级用户批准时不 apply；用 `codex exec resume` 在第二轮提供明确批准后，Main 生成 `approval_record` 并 apply 成功；
 6. 禁用/破坏 CodeCortex MCP 后普通 Codex 任务仍能完成。
 
-非交互环境无法完全代替 VS Code host approval 弹窗；M0 发布前保留一次人工 VS Code 验收。
+测试配置中的 host `approve` 只消除非交互环境无法展示弹窗这一技术障碍，不跳过 CodeCortex 自己的对话级批准和 Core `approval_record` 校验，也不得复制到产品安装配置。M0 发布前另用默认 `prompt` 配置完成一次人工 VS Code 验收。
 
 ## 15. M0 完成条件
 
 - 全新机器安装流程有文档且 `doctor` 通过；
 - Main 与 Analyzer 使用真实 Codex 配置启动；
-- Analyzer 工具权限在实现层不可写；
+- Analyzer MCP 工具权限在实现层不可写，标准 Agent 配置使用 read-only sandbox；
 - Proposal 未批准不可改变正式状态；
 - apply 生成可追溯 History Event；
 - 并发和崩溃测试没有产生部分正式 revision；

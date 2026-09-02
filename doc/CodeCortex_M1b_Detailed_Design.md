@@ -41,7 +41,7 @@ M1b 不实现后台文件监听、向量检索、完整调用图、数据流引�
 ```text
 重新枚举全部 Managed Source Set
 → 流式计算全部规范化文件摘要
-→ 与 SQLite source_files 比较
+→ 与 SQLite source_files 比较；cache 缺失时与正式 source_baseline 比较
 → 只 AST 解析摘要变化的文件
 → 原子更新事实索引
 → 计算当前 repository source digest
@@ -65,6 +65,8 @@ cognition_baseline:
 ```
 
 baseline 表示“正式认知已经针对这份源码状态完成语义处理”，不是最后一次 Git commit。graph revision 可以不变而 baseline 推进，例如确认代码重构没有改变认知语义。
+
+`.codecortex/source_baseline.json` 与 manifest baseline 属于同一正式状态，保存当时全部 Managed Source Set 的规范化相对路径和逐文件 digest。manifest 提供快速总摘要，source baseline 提供 cache 删除或跨机器恢复时的文件级比较依据；两者不一致属于 `FORMAL_STATE_CORRUPT`。它不保存源码、AST 或每个历史版本，只保存当前正式 baseline。
 
 ## 5. 单一有效 ChangeSet
 
@@ -94,6 +96,8 @@ changed_entities:
   modified: []
   missing: []
   moved: []
+file_diff_completeness: complete
+entity_diff_completeness: complete
 affected_nodes: []
 affected_flows: []
 scope_confidence: complete
@@ -102,6 +106,10 @@ diagnostics: []
 ```
 
 无变化时不保留 ChangeSet，repository cognition status 为 fresh。
+
+文件级差异由正式 source baseline 和当前摘要确定，因此在 cache 丢失后仍可完整恢复 added/modified/deleted。仅当删除与新增文件具有唯一相同 content digest 时标记为 renamed；否则保守保留为 added + deleted。`file_diff_completeness` 正常必须为 `complete`，基线文件缺失/非法时拒绝继续而不是猜测。
+
+`entity_diff_completeness` 为 `complete | partial`。SQLite 连续存在时，`baseline_entity_snapshots` 保留正式 baseline 的实体快照，当前变化不会覆盖它，因此可按 baseline 比较新旧实体；只有 cognition baseline 推进时才整体刷新该表。cache 丢失后，Core 能精确恢复当前实体以及 `entity_refs.json` 中被正式认知引用的旧实体，但无法列举未被正式引用的所有旧实体，因此标记 `partial`。这个字段只描述实体清单完整度，不能被误用为 affected scope 已经完整。
 
 ## 6. Affected Scope 算法
 
@@ -116,7 +124,9 @@ diagnostics: []
 7. 必要时沿 resolved 本地 import/inherits/calls 进行最多一跳传播；
 8. 收集未解析文件、动态关系和无正式映射变化。
 
-不进行无限递归依赖扩散。一跳后仍无法界定时设置 `scope_confidence=partial|unknown`，并保存 `unmapped_changes`。Core 不启动 Agent 猜测范围。
+不进行无限递归依赖扩散。`scope_confidence=complete` 必须同时满足：全部变化/删除文件已识别且解析成功；每项变化都能连接到正式 Mapping/Evidence，或被规则化地证明与任何正式认知无关；相关关系没有 unresolved；传播边界内不存在无法归属的变化。`entity_diff_completeness=partial` 不会自动导致 scope partial，但只有上述条件都由正式引用和当前事实证明时才允许 complete。
+
+任一条件不满足时设置 `scope_confidence=partial|unknown` 并保存具体 `unmapped_changes` / diagnostics。Core 不启动 Agent 猜测范围，也不得因为“暂时没找到映射”乐观标记 complete。
 
 ## 7. Freshness 状态
 
@@ -162,11 +172,11 @@ Fact Preflight 不自动触发 Analyzer。语义同步发生在：
 
 结果三类：
 
-1. **有语义变化：** 创建聚合 Proposal，批准 apply 后 graph 和 baseline 一起推进；
+1. **有语义变化：** 创建聚合 Proposal，批准 apply 后 graph、manifest baseline 和 source baseline 一起推进；
 2. **无语义变化：** 调用 `advance_cognition_baseline(reason=no_semantic_change)`，自动写正式 Event，不需要用户审批；
 3. **用户确认旧认知仍有效：** `reason=user_accepted`，必须携带 approval record。
 
-baseline advance Event 与 manifest 更新使用正式状态事务。它不能引用已经过期的 ChangeSet digest。
+baseline advance Event、manifest 与 source baseline 更新使用同一正式状态事务；新的 source baseline 从已重新核验 digest 的当前 Managed Source Set 生成。它不能引用已经过期的 ChangeSet digest。
 
 ## 9. 问答路由总览
 
@@ -290,16 +300,16 @@ pending Proposal 按 ChangeSet 聚合，不按文件或保存次数创建。每�
 
 cache 缺失或不匹配时：
 
-1. 读取并校验 manifest、graph、entity refs 和 History；
+1. 读取并校验 manifest、graph、entity refs、source baseline 和 History；
 2. 从当前源码全量重建事实 SQLite；
 3. 从 graph/history 重建认知查询副本；
 4. 恢复正式 entity UID；
 5. 计算当前 digest；
-6. 与 baseline 相同则 fresh；不同则生成 ChangeSet；
+6. 与 baseline 相同则 fresh；不同则用 source baseline 生成完整文件差异；
 7. validate_graph；
 8. 不调用 Agent。
 
-恢复 cache 是确定性操作；判断源码变化是否改变认知是之后按需执行的独立语义任务。
+恢复 cache 是确定性操作；此时未被正式引用的历史实体可能无法恢复，因此 ChangeSet 明确标记 `entity_diff_completeness=partial`。判断源码变化是否改变认知是之后按需执行的独立语义任务。
 
 ## 16. M1b MCP 增量
 
@@ -331,7 +341,7 @@ eval-run/
 └── codecortex/
 ```
 
-分别运行新进程：
+普通单轮 Benchmark 分别运行新进程：
 
 ```text
 codex exec --ephemeral --json <fixed prompt>
@@ -341,7 +351,7 @@ Native 运行忽略 CodeCortex 用户配置；CodeCortex 运行使用测试 MCP 
 
 JSONL trace 保存：MCP calls、源码/命令访问、最终回答、turn result、token usage 和耗时。日志清除认证信息和机器绝对路径。
 
-审批测试用 `codex exec resume <thread_id>` 发送第二轮明确批准。真实 VS Code host prompt 仍保留一次人工 smoke test。
+非交互验收专用 MCP 配置把 apply 的 host `approval_mode` 设为 `approve`，避免无法展示新 host prompt 导致命令直接失败；产品安装配置仍为 `prompt`。审批测试单独使用隔离的临时 Codex home，第一轮运行不带 `--ephemeral` 的 `codex exec --json` 并保存 thread ID，验证没有 CodeCortex 对话级明确批准时 graph 不变；再用 `codex exec resume <thread_id>` 发送第二轮批准，检查 Main 生成的 `approval_record` 和 Core 校验，最后清理临时 home。真实 VS Code 则使用产品默认 `prompt` 另做人工 smoke test。测试专用设置不得进入安装资源。
 
 ## 18. Benchmark 问题集
 
@@ -382,7 +392,10 @@ Native 与 CodeCortex 进行盲化人工抽查。产品约束是固定 Benchmark
 
 - 全文件哈希、只解析变化文件；
 - baseline→current 单一 ChangeSet 重算；
+- source baseline 的稳定排序、manifest 一致性和原子推进；
+- cache 删除后精确恢复文件差异，并对不可恢复的旧实体标记 partial；
 - mapped/unmapped affected scope；
+- 只有满足全部严格条件时 scope confidence 才为 complete；
 - 一跳传播边界；
 - repository 与 query freshness 组合；
 - baseline advance 两种 reason 和审批要求；
@@ -402,7 +415,7 @@ Native 与 CodeCortex 进行盲化人工抽查。产品约束是固定 Benchmark
 
 - 对照进程确实独立；
 - Main 小范围处理和大范围 Analyzer 委派；
-- Analyzer 只读；
+- Analyzer MCP 不暴露写工具，标准 Agent 配置请求 read-only sandbox；
 - 问答不自动写图；
 - 用户批准前后 revision 行为；
 - CodeCortex MCP 失败后 Native 问题仍完成。

@@ -28,9 +28,9 @@ MVP 只实现 Codex-first 版本：
 | 产品形态 | Codex Skill + 本地 STDIO MCP + Python Core |
 | 进程模型 | 每个活跃 Codex 客户端可启动一个 MCP 进程，无常驻共享服务 |
 | Main/Analyzer | 都访问同一个 Core；Main 使用完整工具集，Analyzer 使用只读工具集 |
-| 正式真相 | Git 中 `.codecortex/` 的 JSON、History 和 Markdown Views |
+| 正式真相 | Git 中 `.codecortex/` 的认知 JSON、源码基线摘要、History 和 Markdown Views |
 | 高速索引 | `.codecortex/.cache/facts.sqlite3`，可删除、可重建 |
-| Agent 数据流 | Analyzer 返回完整但压缩的 `AnalysisReport` 给 Main，不写临时分析数据库 |
+| Agent 数据流 | Analyzer 返回有界且压缩的 `AnalysisReport` 给 Main，不写临时分析数据库 |
 | 代码解析 | Python 标准库 `ast`；被分析语法范围 Python 3.9～3.14 |
 | 开发环境 | Conda；`pyproject.toml` + Hatchling 打包 |
 | 用户安装 | 首选 pipx；不要求用户使用 Conda |
@@ -171,6 +171,7 @@ Domain 不读取文件、不执行 SQL、不依赖 MCP、Codex 或 Pydantic。Ap
 ├── config.toml
 ├── graph.json
 ├── entity_refs.json
+├── source_baseline.json
 ├── PROJECT.md
 ├── history/events/*.json
 ├── views/
@@ -188,6 +189,7 @@ Domain 不读取文件、不执行 SQL、不依赖 MCP、Codex 或 Pydantic。Ap
 - `manifest.json`：schema、graph revision、Digest Profile、Managed Source Set 规则和 cognition baseline；
 - `graph.json`：唯一规范认知图；
 - `entity_refs.json`：正式图实际引用的稳定 CodeEntity 身份和最后已知地址；
+- `source_baseline.json`：与 cognition baseline 对应的受管理文件路径和逐文件内容摘要，用于 cache 删除或跨机器后的精确文件级差异重建；
 - `history/events/`：不可变正式事件；
 - `PROJECT.md`：用户手工维护的项目背景；
 - `views/`：可重建但提交 Git 的人类可读投影。
@@ -294,7 +296,7 @@ lock_timeout_seconds = 10
 4. 写入 `.cache/transactions/<txn_id>/staged/`；
 5. 校验所有 staged 文件并计算摘要；
 6. 保存事务 journal 和旧文件备份；
-7. 依次替换 event、graph、entity refs 和 views；
+7. 依次替换 event、graph、entity refs、source baseline 和 views；
 8. 最后替换 manifest，manifest 是 commit marker；
 9. 刷新 SQLite 查询副本；
 10. 标记完成并清理暂存。
@@ -370,19 +372,21 @@ MCP DTO 使用显式版本字段。内部领域对象不得直接暴露，避免
 - AST 解析只读取文本；
 - SQL 全部参数化；
 - Analyzer MCP 从工具注册层移除写工具，不只依赖 prompt 禁止；
+- Analyzer 自定义 Agent 默认请求 `sandbox_mode="read-only"`，但父会话的实时 sandbox/approval 覆盖可能被 Codex 重新应用；CodeCortex 能硬性保证的是 Analyzer MCP 没有写工具、Core 拒绝 Analyzer profile 的写请求，不能宣称独立撤销 Codex 原生文件写权限；
+- Analyzer 开始前和 Main 消费报告前都校验 repository source digest；期间源码发生任何变化时报告作废，不允许据此创建或应用 Proposal；
 - Core 可以验证结构化 approval record 与 Patch 一致，但不能证明自然语言批准确实来自用户；这属于 Main Codex 信任边界。
 
 ## 16. 跨机器恢复
 
-Git 提交：manifest、config、graph、entity refs、PROJECT、history 和 views。Git 忽略整个 `.codecortex/.cache/`。
+Git 提交：manifest、config、graph、entity refs、source baseline、PROJECT、history 和 views。Git 忽略整个 `.codecortex/.cache/`。
 
 clone 后：
 
 1. 用户在新机器安装 CodeCortex 并运行 `install-codex`；
-2. Core 校验正式 JSON、History 引用和 View 可重建性；
+2. Core 校验正式 JSON、source baseline、History 引用和 View 可重建性；
 3. 从源码和 entity refs 重建 SQLite；
 4. 用版本化 Source Digest Profile 计算当前摘要；
-5. 与 cognition baseline 相同则 fresh；不同则生成 ChangeSet；
+5. 与 cognition baseline 相同则 fresh；不同则用 `source_baseline.json` 与当前逐文件摘要生成精确的 added/modified/deleted 文件集合和 ChangeSet；
 6. 不因 cache 缺失假设认知仍然 fresh。
 
 CRLF/LF、路径分隔符和文件遍历顺序通过 Source Digest Profile 规范化。原生 Windows 不在 MVP 支持范围，但正式文件不写入 POSIX 机器绝对路径。
@@ -411,9 +415,10 @@ CRLF/LF、路径分隔符和文件遍历顺序通过 Source Digest Profile 规�
 
 - Domain 可以在不启动 MCP、Codex 或网络的情况下测试；
 - CLI 与两个 MCP profile 调用同一组 Application Services；
-- 删除 SQLite 后所有正式认知仍可恢复；
+- 删除 SQLite 后所有正式认知和 baseline 文件级差异仍可恢复；
 - 未经 apply 的操作不能改变 graph revision；
 - 两个 MCP writer 并发时只有满足最新 preconditions 的操作成功；
 - Analyzer 工具列表中不存在任何正式或 cache 写能力；
+- Analyzer 报告跨越源码变化时必须被拒绝；
 - CodeCortex 启动失败不阻塞 Native Codex；
 - 所有跨文件正式写入都可恢复到完整旧 revision 或完整新 revision。
