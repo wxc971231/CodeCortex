@@ -162,7 +162,7 @@ git commit -m "feat: discover and digest Python sources"
 - Produces: `ParsedFile`, `CodeEntityCandidate`, `SyntacticRelation`, `ParseDiagnostic`
 - Produces: `parse_python_file(source: SourceFileDigest, previous: Sequence[EntityIdentityHint]) -> ParsedFile`
 
-- [ ] **Step 1: Write failing nested-entity and parse-error tests**
+- [x] **Step 1: Write failing nested-entity and parse-error tests**
 
 ```python
 def test_parser_emits_nested_qualified_addresses(parsed):
@@ -178,13 +178,13 @@ def test_syntax_error_is_a_file_diagnostic(source_factory):
     assert result.diagnostics[0].code == "PYTHON_SYNTAX_ERROR"
 ```
 
-- [ ] **Step 2: Run parser tests and confirm failure**
+- [x] **Step 2: Run parser tests and confirm failure**
 
 Run: `pytest tests/unit/python/test_parser.py -q`
 
 Expected: collection fails because `parse_python_file` is absent.
 
-- [ ] **Step 3: Implement AST extraction without importing target modules**
+- [x] **Step 3: Implement AST extraction without importing target modules**
 
 Extract module/file, class, function, async function, and method entities; nesting, decorators, normalized signatures, docstring digest, start/end locations, qualname, address, kind, and fingerprint. Emit syntactic `contains`, `import_declaration`, and `declared_base`. Preserve a previous UID only for unique exact address/kind match or unique fingerprint-compatible rename; ambiguous matches get a new `ent_` UID plus diagnostic.
 
@@ -195,13 +195,13 @@ collector.visit(tree)
 return collector.result(parse_status="parsed")
 ```
 
-- [ ] **Step 4: Run all syntax and identity tests**
+- [x] **Step 4: Run all syntax and identity tests**
 
 Run: `pytest tests/unit/python/test_parser.py -q`
 
 Expected: fixtures for every supported syntax version, nested/async/decorated definitions, overload-like duplicates, moves, renames, duplicate fingerprints, encoding errors, and syntax errors pass.
 
-- [ ] **Step 5: Commit the parser**
+- [x] **Step 5: Commit the parser**
 
 ```bash
 git add src/codecortex/infrastructure/python/parser.py tests/unit/python/test_parser.py tests/fixtures/python_syntax
