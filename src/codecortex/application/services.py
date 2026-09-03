@@ -19,6 +19,13 @@ from codecortex.application.ports import (
     RepositoryLockPort,
     ViewRendererPort,
 )
+from codecortex.application.query import (
+    AnalysisScopeResult,
+    EntityContextResult,
+    QueryService,
+    RepositoryFactsPage,
+    SearchPage,
+)
 from codecortex.domain.cognition import (
     CognitiveGraph,
     FormalState,
@@ -38,6 +45,10 @@ from codecortex.domain.proposals import (
     ProposalRevision,
     ProposalStatus,
     json_value_to_mutable,
+)
+from codecortex.infrastructure.persistence.graph_replica import (
+    ContextRequest,
+    DiscussionContext,
 )
 
 
@@ -72,6 +83,8 @@ class ApplicationServices:
     pending_proposals: PendingProposalStorePort | None = None
     view_renderer: ViewRendererPort | None = None
     fact_sync: FactSyncPort | None = None
+    query_service: QueryService | None = None
+    cognitive_graph_max_objects: int = 500
 
     def initialize_repository(self) -> RepositoryOverview:
         """Idempotently establish the revision-zero technical skeleton."""
@@ -116,6 +129,98 @@ class ApplicationServices:
             )
         return self.fact_sync.sync(cast(Literal["auto", "full"], mode))
 
+    def repository_facts(
+        self,
+        scope: str,
+        cursor: str | None = None,
+        limit: int = 50,
+        *,
+        expected_source_digest: str | None = None,
+        expected_graph_revision: int | None = None,
+    ) -> RepositoryFactsPage:
+        """Return one guarded, cursor-paginated page of module entities."""
+        return self._query().repository_facts(
+            scope,
+            cursor,
+            limit,
+            expected_source_digest=expected_source_digest,
+            expected_graph_revision=expected_graph_revision,
+        )
+
+    def analysis_scope(
+        self,
+        scope: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        *,
+        diagnostics_limit: int = 50,
+        expected_source_digest: str | None = None,
+        expected_graph_revision: int | None = None,
+    ) -> AnalysisScopeResult:
+        """Return guarded package/module partitions, totals, and diagnostics."""
+        return self._query().analysis_scope(
+            scope,
+            cursor,
+            limit,
+            diagnostics_limit=diagnostics_limit,
+            expected_source_digest=expected_source_digest,
+            expected_graph_revision=expected_graph_revision,
+        )
+
+    def resolve_entity_context(
+        self,
+        *,
+        entity_uid: str | None = None,
+        path: str | None = None,
+        address: str | None = None,
+        relation_types: tuple[str, ...] = (),
+        cursor: str | None = None,
+        limit: int = 50,
+        expected_source_digest: str | None = None,
+        expected_graph_revision: int | None = None,
+    ) -> EntityContextResult:
+        """Resolve exactly one anchor to entities, mappings, and relations."""
+        return self._query().resolve_entity_context(
+            entity_uid=entity_uid,
+            path=path,
+            address=address,
+            relation_types=relation_types,
+            cursor=cursor,
+            limit=limit,
+            expected_source_digest=expected_source_digest,
+            expected_graph_revision=expected_graph_revision,
+        )
+
+    def get_discussion_context(self, request: ContextRequest) -> DiscussionContext:
+        """Return one guarded, bounded discussion-context neighborhood."""
+        return self._query().get_discussion_context(request)
+
+    def search_cognitive_graph(
+        self,
+        query: str,
+        kinds: tuple[str, ...] = (),
+        limit: int = 20,
+        *,
+        expected_source_digest: str | None = None,
+        expected_graph_revision: int | None = None,
+    ) -> SearchPage:
+        """Return guarded, deterministic, bounded cognitive search hits."""
+        return self._query().search_cognitive_graph(
+            query,
+            kinds,
+            limit,
+            expected_source_digest=expected_source_digest,
+            expected_graph_revision=expected_graph_revision,
+        )
+
+    def _query(self) -> QueryService:
+        if self.query_service is None:
+            raise CodeCortexError(
+                ErrorCode.NOT_INITIALIZED,
+                "Bounded query services are not configured",
+            )
+        return self.query_service
+
     def repository_overview(self) -> RepositoryOverview:
         """Return the current formal-state summary under a shared lock."""
         with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
@@ -123,9 +228,34 @@ class ApplicationServices:
             return self._overview(state)
 
     def cognitive_graph(self) -> CognitiveGraph:
-        """Load the complete formal graph under a shared repository lock."""
+        """Load the complete formal graph under a shared repository lock.
+
+        M1a keeps this M0 entry for compatibility diagnostics only: responses
+        are capped at ``cognitive_graph_max_objects`` and larger graphs must
+        be read through the bounded query APIs instead (detailed design
+        section 17).
+        """
         with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
-            return self.formal_store.load().graph
+            graph = self.formal_store.load().graph
+        total = (
+            len(graph.nodes)
+            + len(graph.semantic_edges)
+            + len(graph.logical_flows)
+            + len(graph.implementation_mappings)
+        )
+        if total > self.cognitive_graph_max_objects:
+            raise CodeCortexError(
+                ErrorCode.CONTEXT_LIMIT_EXCEEDED,
+                "cognitive_graph() is compatibility-only and capped at "
+                f"{self.cognitive_graph_max_objects} objects; this graph has "
+                f"{total}. Use search_cognitive_graph, get_discussion_context, "
+                "or the cursor-based repository_facts interface instead",
+                suggested_action=(
+                    "Use search_cognitive_graph, get_discussion_context, or "
+                    "cursor-based repository_facts"
+                ),
+            )
+        return graph
 
     def history_event(self, event_id: str) -> dict[str, object]:
         """Load one immutable History event under a shared repository lock."""

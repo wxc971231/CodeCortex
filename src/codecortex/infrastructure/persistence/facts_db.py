@@ -39,6 +39,9 @@ _ALLOWED_RELATION_TYPES = frozenset(
     }
 )
 
+ALLOWED_RELATION_TYPES = frozenset(_ALLOWED_RELATION_TYPES)
+"""Public read-only alias used by the application query layer (Task 8)."""
+
 
 @dataclass(frozen=True)
 class FactScope:
@@ -130,6 +133,38 @@ class CacheMetadata:
     baseline_entity_snapshot_completeness: str
     index_generation: int
     built_at: str
+
+
+@dataclass(frozen=True)
+class ModulePartition:
+    """One package/module partition of the current managed-source facts."""
+
+    module_name: str
+    file_count: int
+    entity_count: int
+    diagnostic_count: int
+
+
+@dataclass(frozen=True)
+class FactTotals:
+    """Whole-cache aggregate counts for the analysis-scope overview."""
+
+    file_count: int
+    entity_count: int
+    diagnostic_count: int
+
+
+@dataclass(frozen=True)
+class FactDiagnostic:
+    """One recorded source diagnostic with its optional file location."""
+
+    diagnostic_id: int
+    relative_path: str | None
+    code: str
+    severity: str
+    message: str
+    start_line: int | None
+    end_line: int | None
 
 
 class FactsDatabase:
@@ -330,6 +365,177 @@ class FactsDatabase:
         with self.open_read() as connection:
             rows = connection.execute(statement, parameters).fetchall()
         return _relation_page(rows, limit)
+
+    def entity_by_uid(self, uid: str) -> CodeEntity | None:
+        """Return the current entity for *uid*, or None when it is gone."""
+        if not isinstance(uid, str) or not uid:
+            raise ValueError("Entity UID must be a non-empty string")
+        with self.open_read() as connection:
+            row = connection.execute(
+                f"{_ENTITY_SELECT} WHERE e.uid = ?", (uid,)
+            ).fetchone()
+        return None if row is None else _code_entity_from_row(row)
+
+    def entities_at_path(
+        self, relative_path: str, cursor: str | None, limit: int
+    ) -> Page[CodeEntity]:
+        """Return a bounded page of current entities declared in one file."""
+        self._validate_limit(limit)
+        if not isinstance(relative_path, str) or not relative_path:
+            raise ValueError("Entity path scope must be a non-empty relative path")
+        after_uid = _decode_cursor(cursor, "entity")
+        with self.open_read() as connection:
+            rows = connection.execute(
+                f"{_ENTITY_SELECT} WHERE sf.relative_path = ? "
+                "AND (? IS NULL OR e.uid > ?) "
+                "ORDER BY e.uid ASC LIMIT ?",
+                (relative_path, after_uid, after_uid, limit + 1),
+            ).fetchall()
+        return _entity_page(rows, limit)
+
+    def entities_by_address(
+        self, address: str, cursor: str | None, limit: int
+    ) -> Page[CodeEntity]:
+        """Return a bounded page of current entities with one exact address."""
+        self._validate_limit(limit)
+        if not isinstance(address, str) or not address:
+            raise ValueError("Entity address scope must be a non-empty string")
+        after_uid = _decode_cursor(cursor, "entity")
+        with self.open_read() as connection:
+            rows = connection.execute(
+                f"{_ENTITY_SELECT} WHERE e.address = ? "
+                "AND (? IS NULL OR e.uid > ?) "
+                "ORDER BY e.uid ASC LIMIT ?",
+                (address, after_uid, after_uid, limit + 1),
+            ).fetchall()
+        return _entity_page(rows, limit)
+
+    def analysis_totals(self) -> FactTotals:
+        """Return whole-cache aggregate counts with three constant aggregates."""
+        with self.open_read() as connection:
+            row = connection.execute(
+                "SELECT (SELECT COUNT(*) FROM source_files) AS file_count, "
+                "(SELECT COUNT(*) FROM entities) AS entity_count, "
+                "(SELECT COUNT(*) FROM diagnostics) AS diagnostic_count"
+            ).fetchone()
+        return FactTotals(
+            file_count=row["file_count"],
+            entity_count=row["entity_count"],
+            diagnostic_count=row["diagnostic_count"],
+        )
+
+    def analysis_partitions(
+        self, module: str | None, cursor: str | None, limit: int
+    ) -> Page[ModulePartition]:
+        """Return a bounded, keyset-paginated partition per package/module.
+
+        *module* selects the exact module and its submodules.  Files without a
+        module name are grouped under the empty-string partition.  Diagnostics
+        without a file (global diagnostics) are not attributed to partitions.
+        """
+        self._validate_limit(limit)
+        if module is not None and (not isinstance(module, str) or not module):
+            raise ValueError("Analysis scope must be a non-empty module name")
+        after_module = _decode_cursor(cursor, "partition")
+        like_prefix = None if module is None else _escape_like_prefix(module)
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT m.module_name AS module_name, m.file_count AS file_count, "
+                "COALESCE(e.entity_count, 0) AS entity_count, "
+                "COALESCE(d.diagnostic_count, 0) AS diagnostic_count "
+                "FROM (SELECT COALESCE(module_name, '') AS module_name, "
+                "COUNT(*) AS file_count FROM source_files "
+                "GROUP BY COALESCE(module_name, '')) AS m "
+                "LEFT JOIN (SELECT module_name, COUNT(*) AS entity_count "
+                "FROM entities GROUP BY module_name) AS e "
+                "ON e.module_name = m.module_name "
+                "LEFT JOIN (SELECT COALESCE(sf.module_name, '') AS module_name, "
+                "COUNT(*) AS diagnostic_count FROM diagnostics AS d "
+                "JOIN source_files AS sf ON sf.file_id = d.file_id "
+                "GROUP BY COALESCE(sf.module_name, '')) AS d "
+                "ON d.module_name = m.module_name "
+                "WHERE (? IS NULL OR m.module_name = ? "
+                "OR m.module_name LIKE (? || '.%') ESCAPE '\\') "
+                "AND (? IS NULL OR m.module_name > ?) "
+                "ORDER BY m.module_name ASC LIMIT ?",
+                (module, module, like_prefix, after_module, after_module, limit + 1),
+            ).fetchall()
+        selected = rows[:limit]
+        items = tuple(
+            ModulePartition(
+                module_name=row["module_name"],
+                file_count=row["file_count"],
+                entity_count=row["entity_count"],
+                diagnostic_count=row["diagnostic_count"],
+            )
+            for row in selected
+        )
+        truncated = len(rows) > limit
+        return Page(
+            items=items,
+            next_cursor=(
+                _encode_cursor("partition", items[-1].module_name)
+                if truncated
+                else None
+            ),
+            truncated=truncated,
+        )
+
+    def query_diagnostics(
+        self, module: str | None, cursor: str | None, limit: int
+    ) -> Page[FactDiagnostic]:
+        """Return a bounded page of recorded diagnostics, newest cursor last.
+
+        A *module* scope restricts the listing to that module and its
+        submodules; global diagnostics (no owning file) are only listed when
+        no module scope is given.
+        """
+        self._validate_limit(limit)
+        if module is not None and (not isinstance(module, str) or not module):
+            raise ValueError("Diagnostics scope must be a non-empty module name")
+        after_id = _decode_cursor(cursor, "diagnostic")
+        statement = (
+            "SELECT d.diagnostic_id, sf.relative_path, d.code, d.severity, "
+            "d.message, d.start_line, d.end_line "
+            "FROM diagnostics AS d "
+            "LEFT JOIN source_files AS sf ON sf.file_id = d.file_id "
+            "WHERE (? IS NULL OR d.diagnostic_id > ?)"
+        )
+        parameters: tuple[object, ...] = (after_id, after_id)
+        if module is not None:
+            statement += (
+                " AND (sf.module_name = ? "
+                "OR sf.module_name LIKE (? || '.%') ESCAPE '\\')"
+            )
+            parameters = (*parameters, module, _escape_like_prefix(module))
+        statement += " ORDER BY d.diagnostic_id ASC LIMIT ?"
+        with self.open_read() as connection:
+            rows = connection.execute(
+                statement, (*parameters, limit + 1)
+            ).fetchall()
+        selected = rows[:limit]
+        items = tuple(
+            FactDiagnostic(
+                diagnostic_id=row["diagnostic_id"],
+                relative_path=row["relative_path"],
+                code=row["code"],
+                severity=row["severity"],
+                message=row["message"],
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+            )
+            for row in selected
+        )
+        truncated = len(rows) > limit
+        return Page(
+            items=items,
+            next_cursor=(
+                _encode_cursor("diagnostic", items[-1].diagnostic_id)
+                if truncated
+                else None
+            ),
+            truncated=truncated,
+        )
 
     def replace_parsed_files(
         self,
@@ -856,9 +1062,45 @@ def _decode_cursor(cursor: str | None, expected_kind: str) -> str | int | None:
     value = parsed["value"]
     if expected_kind == "entity" and isinstance(value, str) and value:
         return value
-    if expected_kind == "relation" and isinstance(value, int) and value >= 0:
+    if expected_kind == "partition" and isinstance(value, str):
+        return value
+    if expected_kind in ("relation", "diagnostic") and isinstance(value, int) and value >= 0:
         return value
     raise ValueError("Query cursor is invalid")
+
+
+_ENTITY_SELECT = (
+    "SELECT e.uid, sf.relative_path, e.address, e.module_name, e.qualname, "
+    "e.kind, e.name, e.parent_uid, e.start_line, e.end_line, e.signature, "
+    "e.docstring_digest, e.fingerprint, e.resolution_status "
+    "FROM entities AS e JOIN source_files AS sf ON sf.file_id = e.file_id "
+)
+
+
+def _code_entity_from_row(row: sqlite3.Row) -> CodeEntity:
+    return CodeEntity(
+        uid=row["uid"],
+        relative_path=row["relative_path"],
+        address=row["address"],
+        module_name=row["module_name"],
+        qualname=row["qualname"],
+        kind=row["kind"],
+        name=row["name"],
+        parent_uid=row["parent_uid"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        signature=row["signature"],
+        docstring_digest=row["docstring_digest"],
+        fingerprint=row["fingerprint"],
+        resolution_status=row["resolution_status"],
+    )
+
+
+def _escape_like_prefix(value: str) -> str:
+    """Escape one module prefix for a LIKE pattern with the backslash escape."""
+    return (
+        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
 
 
 def _entity_page(rows: Sequence[sqlite3.Row], limit: int) -> Page[CodeEntity]:

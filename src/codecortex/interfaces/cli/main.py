@@ -17,12 +17,16 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from codecortex import __version__
+from codecortex.application.fact_sync import FactSyncService
 from codecortex.application.ports import RepositoryContextPort
+from codecortex.application.query import QueryService
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
+from codecortex.infrastructure.persistence.facts_db import FactsDatabase
+from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.repository import find_repository
 from codecortex.infrastructure.views import render_views
 
@@ -118,12 +122,26 @@ def _default_services() -> ApplicationServices:
     # Repository.root is a frozen (read-only) dataclass attribute while the port
     # declares a settable one; the composition only ever reads it.
     context = cast(RepositoryContextPort, repository)
+    formal_store = FormalStore(repository)
+    repository_lock = RepositoryLock(repository.root)
+    cache_directory = repository.root / ".codecortex" / ".cache"
     return ApplicationServices(
         repository=context,
-        formal_store=FormalStore(repository),
-        repository_lock=RepositoryLock(repository.root),
+        formal_store=formal_store,
+        repository_lock=repository_lock,
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
+        fact_sync=FactSyncService(
+            repository,
+            repository_lock=repository_lock,
+            formal_store=formal_store,
+        ),
+        query_service=QueryService(
+            formal_store=formal_store,
+            facts=FactsDatabase(cache_directory / "facts.sqlite3"),
+            replica=GraphReplica(cache_directory / "cognitive.sqlite3"),
+            repository_lock=repository_lock,
+        ),
     )
 
 

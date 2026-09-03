@@ -16,9 +16,15 @@ ANALYZER_TOOLS = {
     "inspect_node",
     "history_event",
     "validate_graph",
+    "repository_facts",
+    "analysis_scope",
+    "resolve_entity_context",
+    "get_discussion_context",
+    "search_cognitive_graph",
 }
 MAIN_TOOLS = ANALYZER_TOOLS | {
     "initialize_repository",
+    "sync_repository_facts",
     "create_cognitive_proposal",
     "revise_cognitive_proposal",
     "cognitive_proposal",

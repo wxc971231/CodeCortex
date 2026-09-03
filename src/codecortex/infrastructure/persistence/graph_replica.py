@@ -53,6 +53,9 @@ _CJK_RUN = re.compile(
 
 _NODE_KINDS = frozenset({"responsibility", "behavior", "capability"})
 
+NODE_KINDS = frozenset(_NODE_KINDS)
+"""Public read-only alias used by the application query layer (Task 8)."""
+
 _FIELD_WEIGHTS = {
     "title": 50,
     "exact_alias": 40,
@@ -1033,6 +1036,87 @@ class GraphReplica:
             )
             for row in rows
         )
+
+    def node_kind_counts(self, expected_revision: int) -> dict[str, int]:
+        """Count indexed nodes per kind at exactly *expected_revision*."""
+        with self.open_read() as connection:
+            self._require_revision(connection, expected_revision)
+            rows = connection.execute(
+                "SELECT kind, COUNT(*) AS node_count FROM cognitive_nodes "
+                "GROUP BY kind"
+            ).fetchall()
+        return {row["kind"]: row["node_count"] for row in rows}
+
+    def entity_refs_for(
+        self, entity_uids: Sequence[str], expected_revision: int
+    ) -> tuple[ContextEntity, ...]:
+        """Return formal entity-reference rows for *entity_uids* in one query."""
+        uids = _validated_anchors(entity_uids, "Entity UID")
+        if not uids:
+            return ()
+        if len(uids) > self.max_anchors:
+            raise ValueError("Entity UID list exceeds the anchor maximum")
+        with self.open_read() as connection:
+            self._require_revision(connection, expected_revision)
+            placeholders, values = _in_clause(uids)
+            rows = connection.execute(
+                "SELECT entity_uid, last_known_address, kind, relative_path, "
+                "signature, fingerprint, resolution_status "
+                "FROM entity_reference_index "
+                f"WHERE entity_uid IN ({placeholders}) "
+                "ORDER BY entity_uid ASC",
+                values,
+            ).fetchall()
+        return tuple(
+            ContextEntity(
+                entity_uid=row["entity_uid"],
+                last_known_address=row["last_known_address"],
+                kind=row["kind"],
+                relative_path=row["relative_path"],
+                signature=row["signature"],
+                fingerprint=row["fingerprint"],
+                resolution_status=row["resolution_status"],
+            )
+            for row in rows
+        )
+
+    def mappings_for_entities(
+        self, entity_uids: Sequence[str], limit: int, expected_revision: int
+    ) -> tuple[tuple[ContextMapping, ...], bool]:
+        """Return bounded implementation mappings for *entity_uids*.
+
+        The boolean reports whether more mappings exist beyond *limit*.
+        """
+        uids = _validated_anchors(entity_uids, "Entity UID")
+        checked_limit = _bounded_int(limit, 1, self.max_context_entities, "limit")
+        if not uids:
+            return (), False
+        if len(uids) > self.max_anchors:
+            raise ValueError("Entity UID list exceeds the anchor maximum")
+        with self.open_read() as connection:
+            self._require_revision(connection, expected_revision)
+            placeholders, values = _in_clause(uids)
+            rows = connection.execute(
+                "SELECT mapping_id, subject_kind, subject_id, entity_uid, role, "
+                "resolution_status, evidence_note "
+                "FROM implementation_mappings "
+                f"WHERE entity_uid IN ({placeholders}) "
+                "ORDER BY mapping_id ASC LIMIT ?",
+                (*values, checked_limit + 1),
+            ).fetchall()
+        selected = rows[:checked_limit]
+        return tuple(
+            ContextMapping(
+                mapping_id=row["mapping_id"],
+                subject_kind=row["subject_kind"],
+                subject_id=row["subject_id"],
+                entity_uid=row["entity_uid"],
+                role=row["role"],
+                resolution_status=row["resolution_status"],
+                evidence_note=row["evidence_note"],
+            )
+            for row in selected
+        ), len(rows) > checked_limit
 
     def context(self, request: ContextRequest) -> DiscussionContext:
         """Traverse a bounded neighborhood and materialize it as DTOs.

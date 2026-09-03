@@ -189,17 +189,19 @@ def _nearest_existing(path: Path) -> Path:
 
 def _profile_allowlist_check() -> DoctorCheck:
     expected_read = {
-        "repository_overview", "cognitive_graph", "inspect_node", "history_event", "validate_graph"
+        "repository_overview", "cognitive_graph", "inspect_node", "history_event", "validate_graph",
+        "repository_facts", "analysis_scope", "resolve_entity_context",
+        "get_discussion_context", "search_cognitive_graph",
     }
     expected_main = {
         "initialize_repository", "create_cognitive_proposal", "revise_cognitive_proposal",
-        "cognitive_proposal", "apply_cognitive_proposal",
+        "cognitive_proposal", "apply_cognitive_proposal", "sync_repository_facts",
     }
     if READ_TOOL_NAMES == expected_read and MAIN_ONLY_TOOL_NAMES == expected_main:
-        return _ok("MCP_PROFILE_ALLOWLIST", "Main and Analyzer MCP tool allowlists match the M0 contract.")
+        return _ok("MCP_PROFILE_ALLOWLIST", "Main and Analyzer MCP tool allowlists match the M1a contract.")
     return _error(
         "MCP_PROFILE_ALLOWLIST",
-        "Main and Analyzer MCP tool allowlists do not match the M0 contract.",
+        "Main and Analyzer MCP tool allowlists do not match the M1a contract.",
         "Reinstall a compatible CodeCortex version.",
     )
 

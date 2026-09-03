@@ -1,7 +1,8 @@
 """Versioned DTO adapters for the static CodeCortex MCP tool sets."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from typing import Any, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -17,6 +18,7 @@ from codecortex.domain.proposals import (
     Proposal,
     json_value_to_mutable,
 )
+from codecortex.infrastructure.persistence.graph_replica import ContextRequest
 
 SCHEMA_VERSION = 1
 
@@ -264,6 +266,262 @@ def apply_cognitive_proposal(
     )
 
 
+class RepositoryFactsOutput(_Dto):
+    """One guarded, cursor-paginated page of module entities."""
+
+    repository_source_digest: str
+    graph_revision: int
+    entities: list[dict[str, Any]]
+    cursor: str | None
+    truncated: bool
+
+
+class AnalysisScopeOutput(_Dto):
+    """Guarded package/module partitions with totals and diagnostics."""
+
+    repository_source_digest: str
+    graph_revision: int
+    scope: str | None
+    totals: dict[str, int]
+    node_kind_counts: dict[str, int]
+    partitions: list[dict[str, Any]]
+    cursor: str | None
+    truncated: bool
+    diagnostics: list[dict[str, Any]]
+    diagnostics_truncated: bool
+
+
+class EntityContextOutput(_Dto):
+    """Guarded factual and cognitive context around one entity anchor."""
+
+    repository_source_digest: str
+    graph_revision: int
+    anchor_kind: str
+    anchor_value: str
+    entities: list[dict[str, Any]]
+    cursor: str | None
+    truncated: bool
+    entity_refs: list[dict[str, Any]]
+    mappings: list[dict[str, Any]]
+    mappings_truncated: bool
+    relations: list[dict[str, Any]]
+    relations_truncated: bool
+
+
+class DiscussionContextOutput(_Dto):
+    """One guarded, bounded discussion-context neighborhood."""
+
+    graph_revision: int
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    flows: list[dict[str, Any]]
+    mappings: list[dict[str, Any]]
+    entities: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    truncated: bool
+    cursor: str | None
+
+
+class SearchGraphOutput(_Dto):
+    """One guarded page of weighted cognitive search hits."""
+
+    repository_source_digest: str
+    graph_revision: int
+    hits: list[dict[str, Any]]
+    cursor: str | None
+    truncated: bool
+
+
+class SyncFactsOutput(_Dto):
+    """The committed cache-generation outcome of one Fact Sync run."""
+
+    repository_source_digest: str
+    graph_revision: int
+    index_generation: int
+    parsed_files: int
+    added_files: int
+    changed_files: int
+    deleted_files: int
+    retry_count: int
+    rebuilt: bool
+    diagnostics: list[dict[str, Any]]
+
+
+def repository_facts(
+    services: ApplicationServices,
+    scope: str,
+    cursor: str | None = None,
+    limit: int = 50,
+    expected_graph_revision: int | None = None,
+    expected_source_digest: str | None = None,
+) -> RepositoryFactsOutput:
+    """Return one guarded page of module entities with cursor metadata."""
+    page = services.repository_facts(
+        scope,
+        cursor,
+        limit,
+        expected_source_digest=expected_source_digest,
+        expected_graph_revision=expected_graph_revision,
+    )
+    return RepositoryFactsOutput(
+        repository_source_digest=page.coordinate.repository_source_digest,
+        graph_revision=page.coordinate.graph_revision,
+        entities=[asdict(entity) for entity in page.entities],
+        cursor=page.cursor,
+        truncated=page.truncated,
+    )
+
+
+def analysis_scope(
+    services: ApplicationServices,
+    scope: str | None = None,
+    cursor: str | None = None,
+    limit: int = 50,
+    expected_graph_revision: int | None = None,
+    expected_source_digest: str | None = None,
+) -> AnalysisScopeOutput:
+    """Return guarded partitions, totals, and diagnostics for delegation."""
+    result = services.analysis_scope(
+        scope,
+        cursor,
+        limit,
+        expected_source_digest=expected_source_digest,
+        expected_graph_revision=expected_graph_revision,
+    )
+    return AnalysisScopeOutput(
+        repository_source_digest=result.coordinate.repository_source_digest,
+        graph_revision=result.coordinate.graph_revision,
+        scope=result.scope,
+        totals=asdict(result.totals),
+        node_kind_counts=dict(result.node_kind_counts),
+        partitions=[asdict(partition) for partition in result.partitions],
+        cursor=result.cursor,
+        truncated=result.truncated,
+        diagnostics=[asdict(diagnostic) for diagnostic in result.diagnostics],
+        diagnostics_truncated=result.diagnostics_truncated,
+    )
+
+
+def resolve_entity_context(
+    services: ApplicationServices,
+    entity_uid: str | None = None,
+    path: str | None = None,
+    address: str | None = None,
+    relation_types: Sequence[str] = (),
+    cursor: str | None = None,
+    limit: int = 50,
+    expected_graph_revision: int | None = None,
+    expected_source_digest: str | None = None,
+) -> EntityContextOutput:
+    """Resolve exactly one anchor to entities, mappings, and relations."""
+    result = services.resolve_entity_context(
+        entity_uid=entity_uid,
+        path=path,
+        address=address,
+        relation_types=tuple(relation_types),
+        cursor=cursor,
+        limit=limit,
+        expected_source_digest=expected_source_digest,
+        expected_graph_revision=expected_graph_revision,
+    )
+    return EntityContextOutput(
+        repository_source_digest=result.coordinate.repository_source_digest,
+        graph_revision=result.coordinate.graph_revision,
+        anchor_kind=result.anchor_kind,
+        anchor_value=result.anchor_value,
+        entities=[asdict(entity) for entity in result.entities],
+        cursor=result.cursor,
+        truncated=result.truncated,
+        entity_refs=[asdict(ref) for ref in result.entity_refs],
+        mappings=[asdict(mapping) for mapping in result.mappings],
+        mappings_truncated=result.mappings_truncated,
+        relations=[asdict(relation) for relation in result.relations],
+        relations_truncated=result.relations_truncated,
+    )
+
+
+def get_discussion_context(
+    services: ApplicationServices,
+    node_ids: Sequence[str] = (),
+    entity_ids: Sequence[str] = (),
+    depth: int = 2,
+    max_nodes: int = 40,
+    max_entities: int = 80,
+    max_evidence: int = 80,
+    expected_graph_revision: int | None = None,
+    expected_source_digest: str | None = None,
+) -> DiscussionContextOutput:
+    """Return one guarded, bounded discussion-context neighborhood."""
+    result = services.get_discussion_context(
+        ContextRequest(
+            node_ids=tuple(node_ids),
+            entity_uids=tuple(entity_ids),
+            depth=depth,
+            max_nodes=max_nodes,
+            max_entities=max_entities,
+            max_evidence=max_evidence,
+            expected_graph_revision=expected_graph_revision,
+            expected_source_digest=expected_source_digest,
+        )
+    )
+    return DiscussionContextOutput(
+        graph_revision=result.graph_revision,
+        nodes=[asdict(node) for node in result.nodes],
+        edges=[asdict(edge) for edge in result.edges],
+        flows=[asdict(flow) for flow in result.flows],
+        mappings=[asdict(mapping) for mapping in result.mappings],
+        entities=[asdict(entity) for entity in result.entities],
+        evidence=[asdict(evidence) for evidence in result.evidence],
+        truncated=result.truncated,
+        cursor=result.continuation,
+    )
+
+
+def search_cognitive_graph(
+    services: ApplicationServices,
+    query: str,
+    kinds: Sequence[str] = (),
+    limit: int = 20,
+    expected_graph_revision: int | None = None,
+    expected_source_digest: str | None = None,
+) -> SearchGraphOutput:
+    """Return guarded, deterministic, bounded cognitive search hits."""
+    page = services.search_cognitive_graph(
+        query,
+        tuple(kinds),
+        limit,
+        expected_source_digest=expected_source_digest,
+        expected_graph_revision=expected_graph_revision,
+    )
+    return SearchGraphOutput(
+        repository_source_digest=page.coordinate.repository_source_digest,
+        graph_revision=page.coordinate.graph_revision,
+        hits=[asdict(hit) for hit in page.hits],
+        cursor=None,
+        truncated=page.truncated,
+    )
+
+
+def sync_repository_facts(
+    services: ApplicationServices,
+    mode: Literal["auto", "full"] = "auto",
+) -> SyncFactsOutput:
+    """Refresh only disposable code facts; formal state stays untouched."""
+    result = services.synchronize_facts(mode)
+    return SyncFactsOutput(
+        repository_source_digest=result.repository_source_digest,
+        graph_revision=result.graph_revision,
+        index_generation=result.index_generation,
+        parsed_files=result.parsed_files,
+        added_files=result.added_files,
+        changed_files=result.changed_files,
+        deleted_files=result.deleted_files,
+        retry_count=result.retry_count,
+        rebuilt=result.rebuilt,
+        diagnostics=[asdict(diagnostic) for diagnostic in result.diagnostics],
+    )
+
+
 def as_tool_error(error: CodeCortexError) -> ToolError:
     """Preserve the stable Core error contract inside an anticipated MCP error."""
     return ToolError(
@@ -272,6 +530,15 @@ def as_tool_error(error: CodeCortexError) -> ToolError:
             ensure_ascii=False,
             sort_keys=True,
         )
+    )
+
+
+def invalid_argument(error: ValueError) -> CodeCortexError:
+    """Translate request-validation failures into the stable error contract."""
+    return CodeCortexError(
+        ErrorCode.INVALID_ARGUMENT,
+        str(error),
+        suggested_action="Fix the request arguments and retry",
     )
 
 
