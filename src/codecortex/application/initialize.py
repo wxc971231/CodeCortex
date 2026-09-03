@@ -10,6 +10,7 @@ not rebase an old report onto a changed snapshot.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from codecortex.application.ports import (
     FactSyncPort,
@@ -22,6 +23,16 @@ from codecortex.domain.analysis import (
     AnalysisReport,
     validate_analysis_report,
 )
+from codecortex.domain.proposals import Proposal
+
+
+class AnalysisProposalPort(Protocol):
+    """The narrow write boundary used after a report has been validated."""
+
+    def create_proposal_from_analysis(
+        self, report: AnalysisReport, reason: str
+    ) -> Proposal:
+        """Persist exactly one aggregate pending Proposal from ``report``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,12 +52,14 @@ class InitializationService:
         formal_store: FormalStorePort,
         fact_sync: FactSyncPort,
         repository_lock: RepositoryLockPort,
+        proposal_service: AnalysisProposalPort | None = None,
         lock_timeout_seconds: float = 10,
         limits: AnalysisLimits = DEFAULT_ANALYSIS_LIMITS,
     ) -> None:
         self._formal_store = formal_store
         self._fact_sync = fact_sync
         self._repository_lock = repository_lock
+        self._proposal_service = proposal_service
         self._lock_timeout_seconds = lock_timeout_seconds
         self._limits = limits
 
@@ -62,6 +75,25 @@ class InitializationService:
             coordinate.graph_revision,
             coordinate.source_digest,
             limits=self._limits,
+        )
+
+    def create_aggregate_proposal(self, payload: bytes, reason: str) -> Proposal:
+        """Validate one Analyzer payload then persist one aggregate Proposal.
+
+        Codex owns Analyzer dispatch and the user discussion.  Core owns this
+        narrow hand-off so an Analyzer payload cannot bypass freshness or the
+        strict report schema on its way to formal state.  The proposal service
+        performs one final Fact Sync/source probe before it writes the pending
+        proposal, so source changes between validation and persistence fail
+        closed.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Proposal reason must be non-empty")
+        if self._proposal_service is None:
+            raise RuntimeError("Analysis-backed proposal service is not configured")
+        report = self.consume_report(payload)
+        return self._proposal_service.create_proposal_from_analysis(
+            report, reason.strip()
         )
 
     def _current_coordinate(self) -> AnalysisCoordinate:

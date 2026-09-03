@@ -198,3 +198,58 @@ def test_consume_rejects_oversized_payload(
     with pytest.raises(CodeCortexError) as exc:
         initialization.consume_report(oversized)
     assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_validated_report_creates_exactly_one_aggregate_proposal(
+    app: ApplicationServices, repository: Repository
+) -> None:
+    class RecordingProposalService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[AnalysisReport, str]] = []
+
+        def create_proposal_from_analysis(
+            self, report: AnalysisReport, reason: str
+        ) -> object:
+            self.calls.append((report, reason))
+            return object()
+
+    app.initialize_repository()
+    recorder = RecordingProposalService()
+    service = InitializationService(
+        formal_store=FormalStore(repository),
+        fact_sync=FactSyncService(repository),
+        repository_lock=RepositoryLock(repository.root),
+        proposal_service=recorder,
+    )
+    coordinate = service.begin_analysis()
+
+    proposal = service.create_aggregate_proposal(
+        _fresh_report(coordinate), "Initialize repository understanding"
+    )
+
+    assert proposal is not None
+    assert len(recorder.calls) == 1
+    report, reason = recorder.calls[0]
+    assert report.analyzed_source_digest == coordinate.source_digest
+    assert reason == "Initialize repository understanding"
+
+
+def test_invalid_report_never_reaches_proposal_creation(
+    app: ApplicationServices, repository: Repository
+) -> None:
+    class ForbiddenProposalService:
+        def create_proposal_from_analysis(
+            self, report: AnalysisReport, reason: str
+        ) -> object:
+            raise AssertionError("invalid report must not create a Proposal")
+
+    app.initialize_repository()
+    service = InitializationService(
+        formal_store=FormalStore(repository),
+        fact_sync=FactSyncService(repository),
+        repository_lock=RepositoryLock(repository.root),
+        proposal_service=ForbiddenProposalService(),
+    )
+    with pytest.raises(CodeCortexError) as exc:
+        service.create_aggregate_proposal(b"{}", "Initialize")
+    assert exc.value.code is ErrorCode.ANALYSIS_REPORT_INVALID

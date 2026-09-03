@@ -31,6 +31,7 @@ MAIN_ONLY_TOOL_NAMES = frozenset(
         "initialize_repository",
         "sync_repository_facts",
         "create_cognitive_proposal",
+        "create_cognitive_proposal_from_analysis",
         "revise_cognitive_proposal",
         "cognitive_proposal",
         "apply_cognitive_proposal",
@@ -277,6 +278,17 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
     ) -> tools.ProposalOutput:
         try:
             return tools.create_cognitive_proposal(services, proposal)
+        except CodeCortexError as error:
+            raise tools.as_tool_error(error) from error
+        except ValueError as error:
+            raise tools.as_tool_error(tools.invalid_argument(error)) from error
+
+    @server.tool(name="create_cognitive_proposal_from_analysis")
+    def create_cognitive_proposal_from_analysis(
+        proposal: tools.AnalysisProposalInput,
+    ) -> tools.ProposalOutput:
+        try:
+            return tools.create_cognitive_proposal_from_analysis(services, proposal)
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:

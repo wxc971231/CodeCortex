@@ -196,6 +196,7 @@ def _profile_allowlist_check() -> DoctorCheck:
     expected_main = {
         "initialize_repository", "create_cognitive_proposal", "revise_cognitive_proposal",
         "cognitive_proposal", "apply_cognitive_proposal", "sync_repository_facts",
+        "create_cognitive_proposal_from_analysis",
     }
     if READ_TOOL_NAMES == expected_read and MAIN_ONLY_TOOL_NAMES == expected_main:
         return _ok("MCP_PROFILE_ALLOWLIST", "Main and Analyzer MCP tool allowlists match the M1a contract.")

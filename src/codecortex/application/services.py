@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from codecortex.application.fact_sync import FactSyncResult
 from codecortex.application.ports import (
@@ -53,6 +53,10 @@ from codecortex.infrastructure.persistence.graph_replica import (
     DiscussionContext,
 )
 
+if TYPE_CHECKING:
+    from codecortex.application.initialize import InitializationService
+    from codecortex.application.proposals import ProposalService
+
 
 @dataclass(frozen=True)
 class RepositoryOverview:
@@ -86,6 +90,8 @@ class ApplicationServices:
     view_renderer: ViewRendererPort | None = None
     fact_sync: FactSyncPort | None = None
     query_service: QueryService | None = None
+    initialization_service: InitializationService | None = None
+    m1a_proposal_service: ProposalService | None = None
     cognitive_graph_max_objects: int = 500
 
     def initialize_repository(self) -> RepositoryOverview:
@@ -312,6 +318,22 @@ class ApplicationServices:
             store.create(proposal)
             return proposal
 
+    def create_cognitive_proposal_from_analysis(
+        self, payload: bytes, reason: str
+    ) -> Proposal:
+        """Create the one aggregate Proposal produced by an Analyzer report.
+
+        This is deliberately separate from the generic M0 Proposal endpoint:
+        only this path accepts Analyzer output, and it always validates report
+        bounds/freshness before the M1a proposal service rechecks source state.
+        """
+        if self.initialization_service is None:
+            raise CodeCortexError(
+                ErrorCode.NOT_INITIALIZED,
+                "Analysis-backed initialization is not configured",
+            )
+        return self.initialization_service.create_aggregate_proposal(payload, reason)
+
     def revise_cognitive_proposal(
         self,
         proposal_id: str,
@@ -366,6 +388,15 @@ class ApplicationServices:
         successful commit consumes the pending proposal; the formal event
         already carries its complete snapshot.
         """
+        if self.m1a_proposal_service is not None:
+            m1a_result = self.m1a_proposal_service.apply_cognitive_proposal(
+                proposal_id, approval
+            )
+            return ApplyResult(
+                event_id=m1a_result.event_id,
+                graph_revision=m1a_result.graph_revision,
+                applied_proposal_id=m1a_result.applied_proposal_id,
+            )
         store = self._pending_store()
         with self.repository_lock.acquire("exclusive", self.lock_timeout_seconds):
             self.formal_store.recover()

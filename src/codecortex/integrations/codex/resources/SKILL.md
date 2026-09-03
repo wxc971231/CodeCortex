@@ -23,6 +23,53 @@ Codex coding depend on CodeCortex.
    normal Codex source search and explain the limitation. Do not block ordinary
    work while waiting for CodeCortex.
 
-M0 supports status, technical initialization, graph inspection, validation and
-the safe Proposal lifecycle. It does not yet implement AST analysis, freshness
-sync, semantic benchmark evaluation or general project Q&A.
+## M1a initialization and reinitialization
+
+For `$codecortex init`, first call `initialize_repository` only when formal
+state is absent.  Then use this exact sequence; never replace it with an
+unbounded `cognitive_graph` read:
+
+```text
+sync_repository_facts(mode="full")
+→ analysis_scope(expected source digest/revision)
+→ delegate codecortex-analyzer
+→ receive one JSON AnalysisReport only
+→ create_cognitive_proposal_from_analysis
+→ show Big Picture + operation diff + affected scope + uncertainties
+→ discuss/revise if requested
+→ apply only after explicit approval of the current patch_digest
+```
+
+The Analyzer must use its read-only profile, read only bounded fact/context
+pages plus selected source, and return one report with the exact
+`AnalysisReport` schema. It must not create a Proposal or modify any state.
+Pass the current graph revision and source digest to it. If Core rejects the
+report as stale or invalid, discard it and run a new Analyzer pass; do not
+repair, split, or reuse its patch.
+
+`create_cognitive_proposal_from_analysis` is the only normal route from an
+Analyzer report to a pending Proposal. It validates the complete report and
+creates one aggregate Proposal. Show the user its high-level responsibilities,
+behaviors, capabilities and flows, every operation/diff category, affected
+scope, evidence limits, unmapped regions and uncertainties. A request to
+change the candidate means revise the current pending Proposal and show its
+new digest again.
+
+For `$codecortex reinitialize`, always delegate the Analyzer. Before doing so,
+give it bounded existing graph context, relevant user-confirmed `intent`, and
+applicable approval History in addition to the current fact scope. Require a
+global diff that explicitly labels additions, deletions, moves, merges,
+splits, and conflicts. Never clear the graph and never silently replace a
+user-confirmed intent: conflicts remain explicit Proposal operations for the
+user to discuss and approve. "No deletion proposed" is an explicit outcome,
+not permission to erase unmentioned nodes.
+
+The user approving analysis or an Analyzer dispatch is not Proposal approval.
+Apply only if the user explicitly approves the exact, currently displayed
+`proposal_id` and `patch_digest`; a changed/revised/stale patch needs fresh
+approval.
+
+M1a supports deterministic Python facts, bounded Analyzer reports,
+analysis-backed aggregate Proposals, source baselines, rendering/inspection,
+and the safe Proposal lifecycle. General freshness-routed project Q&A remains
+an M1b capability.

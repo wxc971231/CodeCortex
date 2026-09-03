@@ -26,6 +26,7 @@ MAIN_TOOLS = ANALYZER_TOOLS | {
     "initialize_repository",
     "sync_repository_facts",
     "create_cognitive_proposal",
+    "create_cognitive_proposal_from_analysis",
     "revise_cognitive_proposal",
     "cognitive_proposal",
     "apply_cognitive_proposal",
@@ -60,6 +61,11 @@ async def test_analyzer_write_tool_is_not_registered(services: MagicMock) -> Non
         await server.call_tool(
             "apply_cognitive_proposal",
             {"proposal_id": "prop_01ARZ3NDEKTSV4RRFFQ69G5FAV", "approval_record": {}},
+        )
+    with pytest.raises(ToolError, match="Unknown tool"):
+        await server.call_tool(
+            "create_cognitive_proposal_from_analysis",
+            {"proposal": {"analysis_report": {}, "reason": "forbidden"}},
         )
 
 

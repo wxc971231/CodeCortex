@@ -18,16 +18,23 @@ from typing import Protocol, cast
 
 from codecortex import __version__
 from codecortex.application.fact_sync import FactSyncService
+from codecortex.application.initialize import InitializationService
 from codecortex.application.ports import RepositoryContextPort
+from codecortex.application.proposals import ManagedSourceSnapshot, ProposalService
 from codecortex.application.query import QueryService
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.facts import DigestProfile, SourceConfig
 from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
-from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
-from codecortex.infrastructure.repository import find_repository
+from codecortex.infrastructure.python.digest import (
+    digest_source_file,
+    repository_digest,
+)
+from codecortex.infrastructure.python.discovery import discover_python_source_set
+from codecortex.infrastructure.repository import Repository, find_repository
 from codecortex.infrastructure.views import render_views
 
 ERROR_EXIT = {
@@ -125,23 +132,55 @@ def _default_services() -> ApplicationServices:
     formal_store = FormalStore(repository)
     repository_lock = RepositoryLock(repository.root)
     cache_directory = repository.root / ".codecortex" / ".cache"
+    fact_sync = FactSyncService(
+        repository,
+        repository_lock=repository_lock,
+        formal_store=formal_store,
+    )
+    facts = fact_sync.database
+    replica = GraphReplica(cache_directory / "cognitive.sqlite3")
+    proposal_service = ProposalService(
+        formal_store=formal_store,
+        repository_lock=repository_lock,
+        pending_proposals=PendingProposalStore(repository),
+        view_renderer=render_views,
+        fact_sync=fact_sync,
+        source_probe=lambda: _probe_sources(repository),
+        facts=facts,
+        replica=replica,
+    )
     return ApplicationServices(
         repository=context,
         formal_store=formal_store,
         repository_lock=repository_lock,
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
-        fact_sync=FactSyncService(
-            repository,
-            repository_lock=repository_lock,
-            formal_store=formal_store,
-        ),
+        fact_sync=fact_sync,
         query_service=QueryService(
             formal_store=formal_store,
-            facts=FactsDatabase(cache_directory / "facts.sqlite3"),
-            replica=GraphReplica(cache_directory / "cognitive.sqlite3"),
+            facts=facts,
+            replica=replica,
             repository_lock=repository_lock,
         ),
+        initialization_service=InitializationService(
+            formal_store=formal_store,
+            fact_sync=fact_sync,
+            repository_lock=repository_lock,
+            proposal_service=proposal_service,
+        ),
+        m1a_proposal_service=proposal_service,
+    )
+
+
+def _probe_sources(repository: Repository) -> ManagedSourceSnapshot:
+    """Return a fresh managed-source snapshot for M1a proposal preconditions."""
+    discovered = discover_python_source_set(repository, SourceConfig())
+    files = [digest_source_file(source) for source in discovered.sources]
+    return ManagedSourceSnapshot(
+        repository_source_digest=repository_digest(files, DigestProfile()),
+        file_digests={
+            item.source.relative_path: item.content_digest for item in files
+        },
     )
 
 

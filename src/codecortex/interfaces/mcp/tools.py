@@ -53,6 +53,13 @@ class ProposalInput(_Dto):
     uncertainties: list[Any] = Field(default_factory=list, max_length=100)
 
 
+class AnalysisProposalInput(_Dto):
+    """One complete Analyzer report handed to Core without a loose patch path."""
+
+    analysis_report: dict[str, Any]
+    reason: str = Field(min_length=1, max_length=4_000)
+
+
 class ProposalRevisionInput(_Dto):
     """Replacement current candidate for a previously discussed proposal."""
 
@@ -253,6 +260,22 @@ def create_cognitive_proposal(
         source_preconditions=tuple(dict(item) for item in proposal.source_preconditions),
         evidence=tuple(dict(item) for item in proposal.evidence),
         uncertainties=tuple(proposal.uncertainties),
+    )
+    return ProposalOutput(proposal=_proposal_payload(created))
+
+
+def create_cognitive_proposal_from_analysis(
+    services: ApplicationServices, proposal: AnalysisProposalInput
+) -> ProposalOutput:
+    """Strictly validate one Analyzer report and create one aggregate Proposal."""
+    payload = json.dumps(
+        proposal.analysis_report,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    created = services.create_cognitive_proposal_from_analysis(
+        payload, proposal.reason
     )
     return ProposalOutput(proposal=_proposal_payload(created))
 
