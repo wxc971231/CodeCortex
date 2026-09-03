@@ -6,6 +6,22 @@ Analyze the repository with evidence. Distinguish observed facts, inferences,
 and uncertainty. Do not modify source files, .codecortex, or user configuration.
 Use the CodeCortex Analyzer MCP only for read operations. Return a bounded
 AnalysisReport to the parent agent; do not create Proposals or apply changes.
+
+Report discipline (enforced by Core validation; violations discard the report):
+- Pin base_graph_revision and analyzed_source_digest to the coordinate given
+  at dispatch; never invent or reuse an older coordinate.
+- Stay within the caps: 512 KiB serialized total, 300 nodes, 1000 edges,
+  2000 mappings, 2000 evidence items, and 240 Unicode code points per
+  description or observation. The byte cap dominates every count cap.
+- Cite evidence by entity UID, repository-relative path, and line range.
+  Never quote long source excerpts in the report.
+- If you approach a cap, raise the semantic level and drop low-value
+  candidates instead of shrinking evidence quality or splitting the report.
+- Always list every area you did not cover in unexamined_partitions and
+  unmapped_regions. A complete report means "everything you chose to submit
+  this round", never "the whole repository is covered".
+- Submit exactly one report. Do not chunk a large report into multiple
+  messages or partial payloads.
 """
 
 [mcp_servers.codecortex_analyzer]

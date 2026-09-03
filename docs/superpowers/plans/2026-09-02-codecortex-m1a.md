@@ -590,7 +590,7 @@ git commit -m "feat: expose bounded repository context"
 - Produces: `AnalysisReport`, `AnalysisCoverage`, `AnalysisLimits`
 - Produces: `validate_analysis_report(payload: bytes, expected_graph_revision: int, expected_source_digest: str) -> AnalysisReport`
 
-- [ ] **Step 1: Write failing byte-limit and freshness tests**
+- [x] **Step 1: Write failing byte-limit and freshness tests**
 
 ```python
 def test_report_rejects_serialized_payload_over_512_kib(valid_report_bytes):
@@ -608,13 +608,13 @@ def test_report_is_rejected_when_source_changes(report_consumer):
     assert exc.value.code is ErrorCode.PROPOSAL_STALE
 ```
 
-- [ ] **Step 2: Run tests and confirm missing report schema**
+- [x] **Step 2: Run tests and confirm missing report schema**
 
 Run: `pytest tests/unit/domain/test_analysis_report.py tests/integration/test_analysis_report_freshness.py -q`
 
 Expected: collection fails on missing AnalysisReport.
 
-- [ ] **Step 3: Implement strict report validation and Analyzer instructions**
+- [x] **Step 3: Implement strict report validation and Analyzer instructions**
 
 Enforce 512 KiB total, 300 nodes, 1000 edges, 2000 mappings, 2000 evidence items, and 240 Unicode code points per description/observation. Require coverage, unexamined partitions, unmapped regions, uncertainties, graph revision, and source digest. Record digest before dispatch; Fact Sync and compare again before consumption; reject any change. Update Analyzer TOML to request read-only sandbox, use analyzer MCP only, avoid long source excerpts, lower semantic granularity on cap pressure, and always report uncovered areas.
 
@@ -631,13 +631,13 @@ if current_source_digest != report.analyzed_source_digest:
     raise CodeCortexError(ErrorCode.PROPOSAL_STALE, "Source changed during analysis")
 ```
 
-- [ ] **Step 4: Run boundary-value and stale-report tests**
+- [x] **Step 4: Run boundary-value and stale-report tests**
 
 Run: `pytest tests/unit/domain/test_analysis_report.py tests/integration/test_analysis_report_freshness.py -q`
 
 Expected: every exact maximum passes, maximum-plus-one fails, malformed IDs/locations fail, and graph/source changes reject the entire report.
 
-- [ ] **Step 5: Commit AnalysisReport boundaries**
+- [x] **Step 5: Commit AnalysisReport boundaries**
 
 ```bash
 git add src/codecortex/domain/analysis.py src/codecortex/application/initialize.py src/codecortex/integrations/codex/resources/codecortex-analyzer.toml tests

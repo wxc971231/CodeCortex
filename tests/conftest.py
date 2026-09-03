@@ -270,3 +270,53 @@ def replica_history_events():
             relative_path=f"history/events/{REPLICA_EVENT_ID}.json",
         ),
     )
+
+
+def analysis_ulid(prefix: str, index: int) -> str:
+    """Build a unique valid ULID-shaped ID from a non-negative index."""
+    suffix = format(index, "X")
+    payload = "01J" + "0" * (23 - len(suffix)) + suffix
+    return f"{prefix}_{payload}"
+
+
+def analysis_report_dict(
+    *,
+    base_graph_revision: int = 0,
+    analyzed_source_digest: str = "sha256:" + "0" * 64,
+    candidate_nodes=(),
+    candidate_edges=(),
+    candidate_flows=(),
+    candidate_mappings=(),
+    evidence=(),
+    uncertainties=(),
+    unmapped_regions=(),
+    diagnostics=(),
+    analyzed_partitions=("src/codecortex",),
+    unexamined_partitions=(),
+) -> dict:
+    """Return a minimally valid M1a AnalysisReport payload as a dict."""
+    return {
+        "schema_version": 1,
+        "base_graph_revision": base_graph_revision,
+        "analyzed_source_digest": analyzed_source_digest,
+        "analysis_scope": {"mode": "repository", "files": 2, "modules": 1},
+        "coverage": {
+            "analyzed_partitions": list(analyzed_partitions),
+            "unexamined_partitions": list(unexamined_partitions),
+        },
+        "candidate_nodes": list(candidate_nodes),
+        "candidate_edges": list(candidate_edges),
+        "candidate_flows": list(candidate_flows),
+        "candidate_mappings": list(candidate_mappings),
+        "evidence": list(evidence),
+        "uncertainties": list(uncertainties),
+        "unmapped_regions": list(unmapped_regions),
+        "diagnostics": list(diagnostics),
+    }
+
+
+def analysis_report_bytes(report: dict) -> bytes:
+    """Serialize one report dict exactly as the Analyzer would return it."""
+    import json
+
+    return json.dumps(report, ensure_ascii=False).encode("utf-8")
