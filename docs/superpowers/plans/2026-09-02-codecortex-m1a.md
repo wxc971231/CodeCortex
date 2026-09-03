@@ -91,11 +91,13 @@ tests/conftest.py                              shared real repository/Core fixtu
 
 **Interfaces:**
 - Produces: `SourceFileInput(relative_path: str, absolute_path: Path)`
+- Produces: `SourceDiagnostic(relative_path: str, code: str, message: str)`
+- Produces: `discover_python_source_set(repository: Repository, config: SourceConfig) -> SourceDiscoveryResult`
 - Produces: `discover_python_sources(repository: Repository, config: SourceConfig) -> tuple[SourceFileInput, ...]`
 - Produces: `digest_source_file(source: SourceFileInput) -> SourceFileDigest`
 - Produces: `repository_digest(files: Sequence[SourceFileDigest], profile: DigestProfile) -> str`
 
-- [ ] **Step 1: Write failing discovery and normalization tests**
+- [x] **Step 1: Write failing discovery and normalization tests**
 
 ```python
 def test_discovery_includes_untracked_and_excludes_ignored(git_repo):
@@ -111,15 +113,15 @@ def test_crlf_and_lf_have_same_digest(source_factory):
         digest_source_file(source_factory("a.py", b"x = 1\n")).content_digest
 ```
 
-- [ ] **Step 2: Run tests and confirm missing Fact Engine modules**
+- [x] **Step 2: Run tests and confirm missing Fact Engine modules**
 
 Run: `pytest tests/unit/python/test_discovery.py tests/unit/python/test_digest.py -q`
 
 Expected: collection fails on missing discovery/digest imports.
 
-- [ ] **Step 3: Implement versioned source rules and digest profile**
+- [x] **Step 3: Implement versioned source rules and digest profile**
 
-Invoke Git with a list of arguments and NUL-delimited output. Normalize repository-relative paths to `/`, sort by UTF-8 bytes, reject external symlinks, detect Python encoding with `tokenize.detect_encoding`, convert CRLF/CR to LF, and hash normalized UTF-8. Compute repository digest as profile version, NUL, then sorted `path + NUL + digest + LF`. Return a diagnostic for unreadable/undecodable files rather than silently omitting them.
+Invoke Git with a list of arguments and NUL-delimited output. Normalize repository-relative paths to `/`, sort by UTF-8 bytes, exclude external symlinks with a structured diagnostic, detect Python encoding with `tokenize.detect_encoding`, convert CRLF/CR to LF, and hash normalized UTF-8. Compute repository digest as profile version, NUL, then sorted `path + NUL + digest + LF`. Return a diagnostic for unreadable/undecodable files rather than silently omitting them.
 
 ```python
 completed = subprocess.run(
@@ -131,13 +133,13 @@ completed = subprocess.run(
 paths = tuple(sorted(filter(None, completed.stdout.decode().split("\0")), key=lambda value: value.encode("utf-8")))
 ```
 
-- [ ] **Step 4: Run cross-platform-style digest fixtures**
+- [x] **Step 4: Run cross-platform-style digest fixtures**
 
 Run: `pytest tests/unit/python/test_discovery.py tests/unit/python/test_digest.py -q`
 
 Expected: tracked/untracked/ignored, include/exclude, stable ordering, external symlink, CRLF, CR, non-UTF-8 Python encoding, trailing whitespace, and Unicode-preservation cases pass.
 
-- [ ] **Step 5: Commit discovery and digesting**
+- [x] **Step 5: Commit discovery and digesting**
 
 ```bash
 git add src/codecortex/domain/facts.py src/codecortex/infrastructure/python tests/unit/python
