@@ -1,0 +1,4 @@
+[agents]
+# Keep implementation serialized until CodeCortex's task workflow has proved
+# stable. This limit is per Codex session, not a cross-machine/global lock.
+max_concurrent_threads_per_session = 1
