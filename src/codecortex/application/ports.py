@@ -1,13 +1,18 @@
 """Application-layer contracts for infrastructure adapters."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from codecortex.domain.cognition import CognitiveGraph, FormalState
 from codecortex.domain.proposals import Proposal
+
+if TYPE_CHECKING:
+    from codecortex.application.fact_sync import FactSyncResult
 
 LockMode = Literal["shared", "exclusive"]
 
@@ -25,6 +30,13 @@ class RepositoryContextPort(Protocol):
     """Expose the stable root needed by repository-scoped application results."""
 
     root: Path
+
+
+class FactSyncPort(Protocol):
+    """The deterministic Main-process operation that refreshes fact cache state."""
+
+    def sync(self, mode: Literal["auto", "full"] = "auto") -> FactSyncResult:
+        """Return the committed cache-generation result for one source snapshot."""
 
 
 ViewRendererPort = Callable[[CognitiveGraph], Mapping[str, bytes]]

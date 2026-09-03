@@ -349,7 +349,7 @@ git commit -m "feat: resolve and invalidate code relations"
 - Produces: `FactSyncService.sync(mode: Literal["auto", "full"]) -> FactSyncResult`
 - Produces: `CacheMetadata` with source digest, graph revision, generation, and baseline snapshot completeness
 
-- [ ] **Step 1: Write failing idempotency and race tests**
+- [x] **Step 1: Write failing idempotency and race tests**
 
 ```python
 def test_unchanged_sync_does_not_advance_generation(fact_sync):
@@ -372,7 +372,7 @@ Run: `pytest tests/integration/test_fact_sync.py tests/integration/test_cache_re
 
 Expected: collection fails on `FactSyncService`.
 
-- [ ] **Step 3: Implement parse-outside-lock and short transactional commit**
+- [x] **Step 3: Implement parse-outside-lock and short transactional commit**
 
 Enumerate/hash all files; parse changed files outside the exclusive lock; acquire lock; re-enumerate/re-hash; retry on digest drift; replace affected rows, reverse-resolve incoming relations, update metadata last, and commit once. Full rebuild writes a sibling database, runs `quick_check`, `foreign_key_check`, metadata/count checks, acquires exclusive repository lock, closes/checkpoints old connections, and atomically replaces database plus WAL sidecars. Cache mismatch returns rebuild-required rather than mixed data.
 
@@ -387,13 +387,13 @@ discover_and_hash
   -> commit
 ```
 
-- [ ] **Step 4: Run incremental/full equivalence and replacement tests**
+- [x] **Step 4: Run incremental/full equivalence and replacement tests**
 
 Run: `pytest tests/integration/test_fact_sync.py tests/integration/test_cache_replacement.py -q`
 
 Expected: no-op idempotency, add/modify/delete/rename, parse error, source race retry, corrupt cache, graph-revision mismatch, and full-vs-incremental equivalence pass.
 
-- [ ] **Step 5: Commit Fact Sync**
+- [x] **Step 5: Commit Fact Sync**
 
 ```bash
 git add src/codecortex/application src/codecortex/infrastructure/persistence tests/integration

@@ -7,8 +7,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal, cast
 
+from codecortex.application.fact_sync import FactSyncResult
 from codecortex.application.ports import (
+    FactSyncPort,
     FormalStorePort,
     PendingProposalStorePort,
     RecoveryResult,
@@ -68,6 +71,7 @@ class ApplicationServices:
     lock_timeout_seconds: float = 10
     pending_proposals: PendingProposalStorePort | None = None
     view_renderer: ViewRendererPort | None = None
+    fact_sync: FactSyncPort | None = None
 
     def initialize_repository(self) -> RepositoryOverview:
         """Idempotently establish the revision-zero technical skeleton."""
@@ -100,6 +104,17 @@ class ApplicationServices:
         with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
             self.formal_store.load()
         return ValidationResult(valid=True, issues=())
+
+    def synchronize_facts(self, mode: str = "auto") -> FactSyncResult:
+        """Refresh only disposable code facts; formal baseline and graph stay untouched."""
+        if mode not in ("auto", "full"):
+            raise ValueError("Fact Sync mode must be 'auto' or 'full'")
+        if self.fact_sync is None:
+            raise CodeCortexError(
+                ErrorCode.NOT_INITIALIZED,
+                "Fact synchronization is not configured",
+            )
+        return self.fact_sync.sync(cast(Literal["auto", "full"], mode))
 
     def repository_overview(self) -> RepositoryOverview:
         """Return the current formal-state summary under a shared lock."""

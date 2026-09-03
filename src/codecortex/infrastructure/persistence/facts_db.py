@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from codecortex.infrastructure.python.parser import ParsedFile, SyntacticRelation
+from codecortex.infrastructure.python.parser import (
+    EntityIdentityHint,
+    ParsedFile,
+    SyntacticRelation,
+)
 
 if TYPE_CHECKING:
     from codecortex.infrastructure.python.resolver import ResolvedRelation, SymbolIndex
@@ -113,11 +117,27 @@ class RelationUpdateScope:
     incoming: tuple[RelationDeclarationRef, ...]
 
 
+@dataclass(frozen=True)
+class CacheMetadata:
+    """The one cache-generation record used to reject mixed fact snapshots."""
+
+    cache_schema_version: int
+    parser_version: str
+    digest_profile_version: int
+    managed_source_set_version: int
+    repository_source_digest: str
+    graph_revision: int
+    baseline_entity_snapshot_completeness: str
+    index_generation: int
+    built_at: str
+
+
 class FactsDatabase:
     """A local SQLite fact cache with strict connection and query policies."""
 
     max_page_size = 100
     max_relation_entity_uids = 200
+    schema_version = _CACHE_SCHEMA_VERSION
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -187,6 +207,77 @@ class FactsDatabase:
                     return True
         return False
 
+    def cache_metadata(self) -> CacheMetadata:
+        """Load the sole cache metadata row without exposing SQL to callers."""
+        with self.open_read() as connection:
+            row = connection.execute(
+                "SELECT cache_schema_version, parser_version, digest_profile_version, "
+                "managed_source_set_version, repository_source_digest, graph_revision, "
+                "baseline_entity_snapshot_completeness, index_generation, built_at "
+                "FROM cache_metadata WHERE singleton_id = 1"
+            ).fetchone()
+        if row is None:
+            raise ValueError("Fact cache metadata is missing")
+        return CacheMetadata(
+            cache_schema_version=row["cache_schema_version"],
+            parser_version=row["parser_version"],
+            digest_profile_version=row["digest_profile_version"],
+            managed_source_set_version=row["managed_source_set_version"],
+            repository_source_digest=row["repository_source_digest"],
+            graph_revision=row["graph_revision"],
+            baseline_entity_snapshot_completeness=row[
+                "baseline_entity_snapshot_completeness"
+            ],
+            index_generation=row["index_generation"],
+            built_at=row["built_at"],
+        )
+
+    def source_file_digests(self) -> dict[str, str]:
+        """Return the current path-to-content-digest map in one local query."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relative_path, content_digest FROM source_files "
+                "ORDER BY relative_path"
+            ).fetchall()
+        return {row["relative_path"]: row["content_digest"] for row in rows}
+
+    def identity_hints(
+        self, relative_paths: Sequence[str]
+    ) -> tuple[EntityIdentityHint, ...]:
+        """Load parser identity seeds for changed paths in one bounded query."""
+        paths = tuple(sorted(set(relative_paths)))
+        if not paths:
+            return ()
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT e.uid, e.address, e.kind, sf.relative_path, e.signature, "
+                "e.fingerprint FROM entities AS e JOIN source_files AS sf "
+                "ON sf.file_id = e.file_id WHERE sf.relative_path IN "
+                f"({_placeholders(paths)}) ORDER BY sf.relative_path, e.uid",
+                paths,
+            ).fetchall()
+        return tuple(
+            EntityIdentityHint(
+                uid=row["uid"],
+                address=row["address"],
+                kind=row["kind"],
+                relative_path=row["relative_path"],
+                signature=row["signature"],
+                fingerprint=row["fingerprint"],
+            )
+            for row in rows
+        )
+
+    def integrity_ok(self) -> bool:
+        """Check that SQLite can safely serve as a replacement cache input."""
+        try:
+            with self.open_read() as connection:
+                quick = connection.execute("PRAGMA quick_check").fetchone()[0]
+                foreign = connection.execute("PRAGMA foreign_key_check").fetchall()
+        except sqlite3.DatabaseError:
+            return False
+        return quick == "ok" and not foreign
+
     def query_entities(
         self, scope: FactScope, cursor: str | None, limit: int
     ) -> Page[CodeEntity]:
@@ -253,50 +344,112 @@ class FactsDatabase:
         entities disappear, then returns them after the replacement.  Nothing
         here rereads or reparses an unchanged importer.
         """
+        with self.open_write() as connection:
+            return self._replace_parsed_files(
+                connection, parsed, deleted_paths=deleted_paths
+            )
+
+    def synchronize(
+        self,
+        parsed: Sequence[ParsedFile],
+        *,
+        deleted_paths: Sequence[str],
+        metadata: CacheMetadata,
+        global_diagnostics: Sequence[tuple[str, str, str]] = (),
+    ) -> None:
+        """Commit one complete current-facts generation in a short transaction.
+
+        Parsing is deliberately performed by the caller before it takes the
+        repository lock.  Once called, this method replaces affected file rows,
+        re-resolves both changed and incoming declarations from stored facts,
+        writes diagnostics, and updates metadata *last* in one SQLite commit.
+        """
+        from codecortex.infrastructure.python.resolver import resolve_relations
+
+        with self.open_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                scope = self._replace_parsed_files(
+                    connection, parsed, deleted_paths=deleted_paths
+                )
+                declarations = self._current_declarations(
+                    connection,
+                    (*scope.changed_relation_keys, *(item.relation_key for item in scope.incoming)),
+                )
+                resolved = resolve_relations(
+                    declarations, self._symbol_index(connection)
+                )
+                for relation in resolved:
+                    self._upsert_resolved_relation(connection, relation)
+                connection.execute("DELETE FROM diagnostics WHERE file_id IS NULL")
+                connection.executemany(
+                    "INSERT INTO diagnostics "
+                    "(file_id, code, severity, message, start_line, end_line) "
+                    "VALUES (NULL, ?, ?, ?, NULL, NULL)",
+                    ((code, severity, message) for code, severity, message in global_diagnostics),
+                )
+                self._update_metadata(connection, metadata)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _replace_parsed_files(
+        self,
+        connection: sqlite3.Connection,
+        parsed: Sequence[ParsedFile],
+        *,
+        deleted_paths: Sequence[str] = (),
+    ) -> RelationUpdateScope:
+        """Connection-scoped implementation shared by incremental sync helpers."""
         paths = tuple(item.source.source.relative_path for item in parsed)
         if len(set(paths)) != len(paths):
             raise ValueError("Parsed file paths must be unique")
         replaced_paths = tuple(sorted({*paths, *deleted_paths}))
-        with self.open_write() as connection:
-            old_rows = _source_rows(connection, replaced_paths)
-            old_uids = tuple(
+        old_rows = _source_rows(connection, replaced_paths)
+        old_file_ids = tuple(row[0] for row in old_rows)
+        old_uids = (
+            tuple(
                 row[0]
                 for row in connection.execute(
                     "SELECT uid FROM entities WHERE file_id IN "
-                    f"({_placeholders(tuple(row[0] for row in old_rows))})",
-                    tuple(row[0] for row in old_rows),
+                    f"({_placeholders(old_file_ids)})",
+                    old_file_ids,
                 ).fetchall()
-            ) if old_rows else ()
-            old_modules = tuple(row[1] for row in old_rows if row[1] is not None)
-            old_names = (
-                tuple(
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM entities WHERE file_id IN "
-                        f"({_placeholders(tuple(row[0] for row in old_rows))})",
-                        tuple(row[0] for row in old_rows),
-                    ).fetchall()
-                )
-                if old_rows
-                else ()
             )
-            new_modules = tuple(item.module_name for item in parsed)
-            new_names = tuple(entity.name for item in parsed for entity in item.entities)
-            incoming = self._incoming_relation_sources(
-                connection,
-                old_uids,
-                (*old_modules, *new_modules),
-                (*old_names, *new_names),
+            if old_file_ids
+            else ()
+        )
+        old_modules = tuple(row[1] for row in old_rows if row[1] is not None)
+        old_names = (
+            tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM entities WHERE file_id IN "
+                    f"({_placeholders(old_file_ids)})",
+                    old_file_ids,
+                ).fetchall()
             )
-            if replaced_paths:
-                connection.execute(
-                    "DELETE FROM source_files WHERE relative_path IN "
-                    f"({_placeholders(replaced_paths)})",
-                    replaced_paths,
-                )
-            changed_keys: list[str] = []
-            for item in parsed:
-                changed_keys.extend(self._insert_parsed_file(connection, item))
+            if old_file_ids
+            else ()
+        )
+        new_modules = tuple(item.module_name for item in parsed)
+        new_names = tuple(entity.name for item in parsed for entity in item.entities)
+        incoming = self._incoming_relation_sources(
+            connection,
+            old_uids,
+            (*old_modules, *new_modules),
+            (*old_names, *new_names),
+        )
+        if replaced_paths:
+            connection.execute(
+                "DELETE FROM source_files WHERE relative_path IN "
+                f"({_placeholders(replaced_paths)})",
+                replaced_paths,
+            )
+        changed_keys: list[str] = []
+        for item in parsed:
+            changed_keys.extend(self._insert_parsed_file(connection, item))
         return RelationUpdateScope(
             changed_relation_keys=tuple(sorted(set(changed_keys))), incoming=incoming
         )
@@ -318,42 +471,13 @@ class FactsDatabase:
         self, relation_keys: Sequence[str]
     ) -> tuple[SyntacticRelation, ...]:
         """Load original declarations by stable key, without accessing source files."""
-        keys = tuple(sorted({key.removesuffix(":tested_by") for key in relation_keys}))
-        if not keys:
-            return ()
         with self.open_read() as connection:
-            rows = connection.execute(
-                "SELECT relation_key, declaration_type, source_address, relative_path, "
-                "declaration_line, declaration_column, raw_expression "
-                "FROM relations WHERE relation_key IN "
-                f"({_placeholders(keys)}) ORDER BY relation_key",
-                keys,
-            ).fetchall()
-        return tuple(_declaration_from_row(row) for row in rows)
+            return self._current_declarations(connection, relation_keys)
 
     def symbol_index(self) -> SymbolIndex:
         """Build the resolver's in-memory projection in one bounded local query."""
-        from codecortex.infrastructure.python.resolver import Symbol, SymbolIndex
-
         with self.open_read() as connection:
-            rows = connection.execute(
-                "SELECT e.uid, e.address, e.module_name, e.qualname, sf.relative_path, "
-                "e.kind, e.name FROM entities AS e "
-                "JOIN source_files AS sf ON sf.file_id = e.file_id "
-                "ORDER BY e.address, e.uid"
-            ).fetchall()
-        return SymbolIndex.from_symbols(
-            Symbol(
-                uid=row["uid"],
-                address=row["address"],
-                module_name=row["module_name"],
-                qualname=row["qualname"],
-                relative_path=row["relative_path"],
-                kind=row["kind"],
-                name=row["name"],
-            )
-            for row in rows
-        )
+            return self._symbol_index(connection)
 
     def replace_resolved_relations(self, relations: Sequence[ResolvedRelation]) -> None:
         """Atomically replace resolution/evidence fields for declaration-stable keys."""
@@ -419,6 +543,68 @@ class FactsDatabase:
             )
         return tuple(output)
 
+    def _current_declarations(
+        self, connection: sqlite3.Connection, relation_keys: Sequence[str]
+    ) -> tuple[SyntacticRelation, ...]:
+        """Read only declaration rows whose source files still exist."""
+        keys = tuple(sorted({key.removesuffix(":tested_by") for key in relation_keys}))
+        if not keys:
+            return ()
+        rows = connection.execute(
+            "SELECT relation_key, declaration_type, source_address, relative_path, "
+            "declaration_line, declaration_column, raw_expression "
+            "FROM relations WHERE relation_key IN "
+            f"({_placeholders(keys)}) ORDER BY relation_key",
+            keys,
+        ).fetchall()
+        return tuple(_declaration_from_row(row) for row in rows)
+
+    def _symbol_index(self, connection: sqlite3.Connection) -> SymbolIndex:
+        """Build a resolver index from the connection's consistent transaction view."""
+        from codecortex.infrastructure.python.resolver import Symbol, SymbolIndex
+
+        rows = connection.execute(
+            "SELECT e.uid, e.address, e.module_name, e.qualname, sf.relative_path, "
+            "e.kind, e.name FROM entities AS e "
+            "JOIN source_files AS sf ON sf.file_id = e.file_id "
+            "ORDER BY e.address, e.uid"
+        ).fetchall()
+        return SymbolIndex.from_symbols(
+            Symbol(
+                uid=row["uid"],
+                address=row["address"],
+                module_name=row["module_name"],
+                qualname=row["qualname"],
+                relative_path=row["relative_path"],
+                kind=row["kind"],
+                name=row["name"],
+            )
+            for row in rows
+        )
+
+    def _update_metadata(
+        self, connection: sqlite3.Connection, metadata: CacheMetadata
+    ) -> None:
+        """Write cache visibility metadata last, after every fact table mutation."""
+        connection.execute(
+            "UPDATE cache_metadata SET cache_schema_version = ?, parser_version = ?, "
+            "digest_profile_version = ?, managed_source_set_version = ?, "
+            "repository_source_digest = ?, graph_revision = ?, "
+            "baseline_entity_snapshot_completeness = ?, index_generation = ?, "
+            "built_at = ? WHERE singleton_id = 1",
+            (
+                metadata.cache_schema_version,
+                metadata.parser_version,
+                metadata.digest_profile_version,
+                metadata.managed_source_set_version,
+                metadata.repository_source_digest,
+                metadata.graph_revision,
+                metadata.baseline_entity_snapshot_completeness,
+                metadata.index_generation,
+                metadata.built_at,
+            ),
+        )
+
     def _insert_parsed_file(
         self, connection: sqlite3.Connection, parsed: ParsedFile
     ) -> tuple[str, ...]:
@@ -441,6 +627,22 @@ class FactsDatabase:
         file_id = connection.execute(
             "SELECT file_id FROM source_files WHERE relative_path = ?", (relative_path,)
         ).fetchone()[0]
+        connection.executemany(
+            "INSERT INTO diagnostics "
+            "(file_id, code, severity, message, start_line, end_line) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    file_id,
+                    diagnostic.code,
+                    diagnostic.severity,
+                    diagnostic.message,
+                    diagnostic.line,
+                    diagnostic.line,
+                )
+                for diagnostic in parsed.diagnostics
+            ),
+        )
         addresses_to_uids = {entity.address: entity.uid for entity in parsed.entities}
         for entity in parsed.entities:
             connection.execute(
