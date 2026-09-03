@@ -281,7 +281,7 @@ git commit -m "feat: index code facts in SQLite"
 - Produces: `relation_key(declaration: SyntacticRelation) -> str`
 - Produces: `FactsDatabase.incoming_relation_sources(old_target_uids, module_names) -> tuple[RelationDeclarationRef, ...]`
 
-- [ ] **Step 1: Write failing stable-key and reverse-invalidation tests**
+- [x] **Step 1: Write failing stable-key and reverse-invalidation tests**
 
 ```python
 def test_relation_key_does_not_depend_on_resolved_target(import_declaration):
@@ -300,13 +300,13 @@ def test_adding_target_re_resolves_unchanged_importer(sync_fixture):
     assert sync_fixture.parse_count("consumer.py") == 1
 ```
 
-- [ ] **Step 2: Run resolver tests and confirm failure**
+- [x] **Step 2: Run resolver tests and confirm failure**
 
 Run: `pytest tests/unit/python/test_resolver.py tests/integration/test_reverse_relation_invalidation.py -q`
 
 Expected: missing resolver symbols or unchanged importer remains unresolved.
 
-- [ ] **Step 3: Implement evidence-bearing best-effort relations**
+- [x] **Step 3: Implement evidence-bearing best-effort relations**
 
 Create deterministic declaration-based keys from source path, source address, relation type, source location, and normalized raw expression—never UID or resolved target. Resolve local imports/inherits first; mark calls/tested_by best effort with evidence, confidence, and resolver version. Before replacing a changed/deleted target, capture incoming sources by old target UID and old/new module names plus same-name unresolved relations; after replacement, rerun only those declarations from stored facts, without reparsing unchanged Python files.
 
@@ -323,13 +323,13 @@ def relation_key(declaration: SyntacticRelation) -> str:
     return "sha256:" + hashlib.sha256(canonical_json_bytes(stable)).hexdigest()
 ```
 
-- [ ] **Step 4: Run target add/delete/rename/move matrix**
+- [x] **Step 4: Run target add/delete/rename/move matrix**
 
 Run: `pytest tests/unit/python/test_resolver.py tests/integration/test_reverse_relation_invalidation.py -q`
 
 Expected: unchanged sources resolve or unresolve correctly, relation keys remain stable, and incremental results equal a clean full rebuild.
 
-- [ ] **Step 5: Commit relation resolution**
+- [x] **Step 5: Commit relation resolution**
 
 ```bash
 git add src/codecortex/infrastructure/python/resolver.py src/codecortex/infrastructure/persistence/facts_db.py tests

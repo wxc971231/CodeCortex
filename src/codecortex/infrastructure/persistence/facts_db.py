@@ -5,14 +5,23 @@ callers to compose arbitrary SQL.  The cache is an implementation detail, so
 all reads are paginated and all analyzer-facing connections are read-only.
 """
 
+from __future__ import annotations
+
+import ast
 import base64
 import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-_CACHE_SCHEMA_VERSION = 1
+from codecortex.infrastructure.python.parser import ParsedFile, SyntacticRelation
+
+if TYPE_CHECKING:
+    from codecortex.infrastructure.python.resolver import ResolvedRelation, SymbolIndex
+
+_CACHE_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 10_000
 _ALLOWED_RELATION_TYPES = frozenset(
     {
@@ -80,11 +89,28 @@ class CodeRelation:
     source_file_id: int
     target_uid: str | None
     target_module: str | None
+    target_address: str | None
     raw_expression: str | None
     resolution_status: str
     confidence: str
     resolver_version: str
     relation_key: str
+
+
+@dataclass(frozen=True)
+class RelationDeclarationRef:
+    """A stored declaration that can be re-resolved without parsing its source."""
+
+    relation_key: str
+    declaration: SyntacticRelation
+
+
+@dataclass(frozen=True)
+class RelationUpdateScope:
+    """Changed and incoming declarations needing one narrowly scoped resolution pass."""
+
+    changed_relation_keys: tuple[str, ...]
+    incoming: tuple[RelationDeclarationRef, ...]
 
 
 class FactsDatabase:
@@ -103,6 +129,7 @@ class FactsDatabase:
         database.path.parent.mkdir(parents=True, exist_ok=True)
         with database.open_write() as connection:
             connection.executescript(_DDL)
+            _ensure_task4_relation_columns(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO cache_metadata "
                 "(singleton_id, cache_schema_version, parser_version, "
@@ -110,6 +137,10 @@ class FactsDatabase:
                 "repository_source_digest, graph_revision, "
                 "baseline_entity_snapshot_completeness, index_generation, built_at) "
                 "VALUES (1, ?, '', 1, 1, 'sha256:', 0, 'unknown', 0, '')",
+                (_CACHE_SCHEMA_VERSION,),
+            )
+            connection.execute(
+                "UPDATE cache_metadata SET cache_schema_version = ? WHERE singleton_id = 1",
                 (_CACHE_SCHEMA_VERSION,),
             )
         return database
@@ -197,7 +228,7 @@ class FactsDatabase:
         type_placeholders = ", ".join("?" for _ in types)
         statement = (
             "SELECT relation_id, relation_type, source_uid, source_file_id, target_uid, "
-            "target_module, raw_expression, resolution_status, confidence, "
+            "target_module, target_address, raw_expression, resolution_status, confidence, "
             "resolver_version, relation_key FROM relations "
             f"WHERE source_uid IN ({uid_placeholders}) "
             f"AND relation_type IN ({type_placeholders}) "
@@ -208,6 +239,325 @@ class FactsDatabase:
         with self.open_read() as connection:
             rows = connection.execute(statement, parameters).fetchall()
         return _relation_page(rows, limit)
+
+    def replace_parsed_files(
+        self,
+        parsed: Sequence[ParsedFile],
+        *,
+        deleted_paths: Sequence[str] = (),
+    ) -> RelationUpdateScope:
+        """Replace changed file facts and return only declarations needing resolution.
+
+        The caller parses files outside the SQLite transaction.  This method
+        intentionally captures incoming declaration references before target
+        entities disappear, then returns them after the replacement.  Nothing
+        here rereads or reparses an unchanged importer.
+        """
+        paths = tuple(item.source.source.relative_path for item in parsed)
+        if len(set(paths)) != len(paths):
+            raise ValueError("Parsed file paths must be unique")
+        replaced_paths = tuple(sorted({*paths, *deleted_paths}))
+        with self.open_write() as connection:
+            old_rows = _source_rows(connection, replaced_paths)
+            old_uids = tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT uid FROM entities WHERE file_id IN "
+                    f"({_placeholders(tuple(row[0] for row in old_rows))})",
+                    tuple(row[0] for row in old_rows),
+                ).fetchall()
+            ) if old_rows else ()
+            old_modules = tuple(row[1] for row in old_rows if row[1] is not None)
+            old_names = (
+                tuple(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM entities WHERE file_id IN "
+                        f"({_placeholders(tuple(row[0] for row in old_rows))})",
+                        tuple(row[0] for row in old_rows),
+                    ).fetchall()
+                )
+                if old_rows
+                else ()
+            )
+            new_modules = tuple(item.module_name for item in parsed)
+            new_names = tuple(entity.name for item in parsed for entity in item.entities)
+            incoming = self._incoming_relation_sources(
+                connection,
+                old_uids,
+                (*old_modules, *new_modules),
+                (*old_names, *new_names),
+            )
+            if replaced_paths:
+                connection.execute(
+                    "DELETE FROM source_files WHERE relative_path IN "
+                    f"({_placeholders(replaced_paths)})",
+                    replaced_paths,
+                )
+            changed_keys: list[str] = []
+            for item in parsed:
+                changed_keys.extend(self._insert_parsed_file(connection, item))
+        return RelationUpdateScope(
+            changed_relation_keys=tuple(sorted(set(changed_keys))), incoming=incoming
+        )
+
+    def incoming_relation_sources(
+        self,
+        old_target_uids: Sequence[str],
+        module_names: Sequence[str],
+        *,
+        symbol_names: Sequence[str] = (),
+    ) -> tuple[RelationDeclarationRef, ...]:
+        """Return declarations that might change when targets/modules change."""
+        with self.open_read() as connection:
+            return self._incoming_relation_sources(
+                connection, old_target_uids, module_names, symbol_names
+            )
+
+    def relation_declarations(
+        self, relation_keys: Sequence[str]
+    ) -> tuple[SyntacticRelation, ...]:
+        """Load original declarations by stable key, without accessing source files."""
+        keys = tuple(sorted({key.removesuffix(":tested_by") for key in relation_keys}))
+        if not keys:
+            return ()
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relation_key, declaration_type, source_address, relative_path, "
+                "declaration_line, declaration_column, raw_expression "
+                "FROM relations WHERE relation_key IN "
+                f"({_placeholders(keys)}) ORDER BY relation_key",
+                keys,
+            ).fetchall()
+        return tuple(_declaration_from_row(row) for row in rows)
+
+    def symbol_index(self) -> SymbolIndex:
+        """Build the resolver's in-memory projection in one bounded local query."""
+        from codecortex.infrastructure.python.resolver import Symbol, SymbolIndex
+
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT e.uid, e.address, e.module_name, e.qualname, sf.relative_path, "
+                "e.kind, e.name FROM entities AS e "
+                "JOIN source_files AS sf ON sf.file_id = e.file_id "
+                "ORDER BY e.address, e.uid"
+            ).fetchall()
+        return SymbolIndex.from_symbols(
+            Symbol(
+                uid=row["uid"],
+                address=row["address"],
+                module_name=row["module_name"],
+                qualname=row["qualname"],
+                relative_path=row["relative_path"],
+                kind=row["kind"],
+                name=row["name"],
+            )
+            for row in rows
+        )
+
+    def replace_resolved_relations(self, relations: Sequence[ResolvedRelation]) -> None:
+        """Atomically replace resolution/evidence fields for declaration-stable keys."""
+        with self.open_write() as connection:
+            for relation in relations:
+                self._upsert_resolved_relation(connection, relation)
+
+    def relations_for_path(self, relative_path: str) -> tuple[CodeRelation, ...]:
+        """A small internal test/incremental-sync projection for one known file."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relation_id, relation_type, source_uid, source_file_id, target_uid, "
+                "target_module, target_address, raw_expression, resolution_status, confidence, "
+                "resolver_version, relation_key FROM relations AS r "
+                "JOIN source_files AS sf ON sf.file_id = r.source_file_id "
+                "WHERE sf.relative_path = ? AND r.relation_type IN "
+                "('imports', 'inherits', 'calls', 'tested_by') ORDER BY r.relation_id",
+                (relative_path,),
+            ).fetchall()
+        return tuple(_code_relation_from_row(row) for row in rows)
+
+    def _incoming_relation_sources(
+        self,
+        connection: sqlite3.Connection,
+        old_target_uids: Sequence[str],
+        module_names: Sequence[str],
+        symbol_names: Sequence[str] = (),
+    ) -> tuple[RelationDeclarationRef, ...]:
+        uids = tuple(sorted(set(old_target_uids)))
+        modules = tuple(sorted({item for item in module_names if item}))
+        names = tuple(sorted({item for item in symbol_names if item}))
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if uids:
+            clauses.append(f"target_uid IN ({_placeholders(uids)})")
+            parameters.extend(uids)
+        if modules:
+            clauses.append(f"target_module IN ({_placeholders(modules)})")
+            parameters.extend(modules)
+        if names:
+            clauses.append(
+                "(resolution_status = 'unresolved' AND target_symbol IN "
+                f"({_placeholders(names)}))"
+            )
+            parameters.extend(names)
+        if not clauses:
+            return ()
+        rows = connection.execute(
+            "SELECT relation_key, declaration_type, source_address, relative_path, "
+            "declaration_line, declaration_column, raw_expression FROM relations "
+            f"WHERE {' OR '.join(clauses)} ORDER BY relation_key",
+            parameters,
+        ).fetchall()
+        seen: set[str] = set()
+        output: list[RelationDeclarationRef] = []
+        for row in rows:
+            key = row["relation_key"].removesuffix(":tested_by")
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(
+                RelationDeclarationRef(key, _declaration_from_row(row))
+            )
+        return tuple(output)
+
+    def _insert_parsed_file(
+        self, connection: sqlite3.Connection, parsed: ParsedFile
+    ) -> tuple[str, ...]:
+        source = parsed.source
+        relative_path = source.source.relative_path
+        connection.execute(
+            "INSERT INTO source_files "
+            "(relative_path, module_name, content_digest, size_bytes, parse_status, is_test, "
+            "diagnostic_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                relative_path,
+                parsed.module_name,
+                source.content_digest,
+                source.size_bytes,
+                parsed.parse_status,
+                int(_is_test_path(relative_path)),
+                len(parsed.diagnostics),
+            ),
+        )
+        file_id = connection.execute(
+            "SELECT file_id FROM source_files WHERE relative_path = ?", (relative_path,)
+        ).fetchone()[0]
+        addresses_to_uids = {entity.address: entity.uid for entity in parsed.entities}
+        for entity in parsed.entities:
+            connection.execute(
+                "INSERT INTO entities "
+                "(uid, file_id, address, module_name, qualname, kind, name, parent_uid, "
+                "start_line, end_line, signature, docstring_digest, fingerprint, resolution_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'resolved')",
+                (
+                    entity.uid,
+                    file_id,
+                    entity.address,
+                    entity.module_name,
+                    entity.qualname,
+                    entity.kind,
+                    entity.name,
+                    None if entity.parent_address is None else addresses_to_uids[entity.parent_address],
+                    entity.start_line,
+                    entity.end_line,
+                    entity.signature,
+                    entity.docstring_digest,
+                    entity.fingerprint,
+                ),
+            )
+        from codecortex.infrastructure.python.resolver import relation_key
+
+        keys: list[str] = []
+        resolver_declarations = tuple(
+            relation
+            for relation in parsed.relations
+            if relation.relation_type
+            in {"import_declaration", "declared_base", "call_declaration"}
+        )
+        for declaration in resolver_declarations:
+            key = relation_key(declaration)
+            keys.append(key)
+            connection.execute(
+                "INSERT INTO relations "
+                "(relation_type, declaration_type, source_uid, source_file_id, source_address, "
+                "relative_path, declaration_line, declaration_column, raw_expression, "
+                "target_symbol, resolution_status, confidence, resolver_version, relation_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unresolved', 'low', '', ?)",
+                (
+                    declaration.relation_type,
+                    declaration.relation_type,
+                    addresses_to_uids.get(declaration.source_address),
+                    file_id,
+                    declaration.source_address,
+                    declaration.relative_path,
+                    declaration.start_line,
+                    declaration.start_column,
+                    declaration.normalized_expression,
+                    _target_symbol(declaration),
+                    key,
+                ),
+            )
+        return tuple(keys)
+
+    def _upsert_resolved_relation(
+        self, connection: sqlite3.Connection, relation: ResolvedRelation
+    ) -> None:
+        file_row = connection.execute(
+            "SELECT file_id FROM source_files WHERE relative_path = ?",
+            (relation.declaration.relative_path,),
+        ).fetchone()
+        if file_row is None:
+            raise ValueError("Relation declaration source file does not exist")
+        connection.execute(
+            "INSERT INTO relations "
+            "(relation_type, declaration_type, source_uid, source_file_id, source_address, "
+            "relative_path, declaration_line, declaration_column, target_uid, target_module, "
+            "target_address, raw_expression, target_symbol, resolution_status, confidence, resolver_version, relation_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(relation_key) DO UPDATE SET "
+            "relation_type=excluded.relation_type, source_uid=excluded.source_uid, "
+            "target_uid=excluded.target_uid, target_module=excluded.target_module, "
+            "target_address=excluded.target_address, resolution_status=excluded.resolution_status, "
+            "confidence=excluded.confidence, resolver_version=excluded.resolver_version",
+            (
+                relation.relation_type,
+                relation.declaration.relation_type,
+                relation.source_uid,
+                file_row[0],
+                relation.declaration.source_address,
+                relation.declaration.relative_path,
+                relation.declaration.start_line,
+                relation.declaration.start_column,
+                relation.target_uid,
+                relation.target_module,
+                relation.target_address,
+                relation.declaration.normalized_expression,
+                _target_symbol(relation.declaration),
+                relation.resolution_status,
+                relation.confidence,
+                relation.resolver_version,
+                relation.relation_key,
+            ),
+        )
+        relation_id = connection.execute(
+            "SELECT relation_id FROM relations WHERE relation_key = ?", (relation.relation_key,)
+        ).fetchone()[0]
+        connection.execute("DELETE FROM relation_evidence WHERE relation_id = ?", (relation_id,))
+        connection.executemany(
+            "INSERT INTO relation_evidence "
+            "(relation_id, relative_path, start_line, end_line, evidence_kind, snippet_digest) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    relation_id,
+                    evidence.relative_path,
+                    evidence.start_line,
+                    evidence.end_line,
+                    evidence.evidence_kind,
+                    evidence.snippet_digest,
+                )
+                for evidence in relation.evidence
+            ),
+        )
 
     def insert_test_entities(self, *, module_name: str, count: int) -> None:
         """Populate deterministic fixtures; this is intentionally test-only API."""
@@ -341,19 +691,7 @@ def _entity_page(rows: Sequence[sqlite3.Row], limit: int) -> Page[CodeEntity]:
 def _relation_page(rows: Sequence[sqlite3.Row], limit: int) -> Page[CodeRelation]:
     selected = rows[:limit]
     items = tuple(
-        CodeRelation(
-            relation_id=row["relation_id"],
-            relation_type=row["relation_type"],
-            source_uid=row["source_uid"],
-            source_file_id=row["source_file_id"],
-            target_uid=row["target_uid"],
-            target_module=row["target_module"],
-            raw_expression=row["raw_expression"],
-            resolution_status=row["resolution_status"],
-            confidence=row["confidence"],
-            resolver_version=row["resolver_version"],
-            relation_key=row["relation_key"],
-        )
+        _code_relation_from_row(row)
         for row in selected
     )
     truncated = len(rows) > limit
@@ -362,6 +700,98 @@ def _relation_page(rows: Sequence[sqlite3.Row], limit: int) -> Page[CodeRelation
         next_cursor=_encode_cursor("relation", items[-1].relation_id) if truncated else None,
         truncated=truncated,
     )
+
+
+def _code_relation_from_row(row: sqlite3.Row) -> CodeRelation:
+    return CodeRelation(
+        relation_id=row["relation_id"],
+        relation_type=row["relation_type"],
+        source_uid=row["source_uid"],
+        source_file_id=row["source_file_id"],
+        target_uid=row["target_uid"],
+        target_module=row["target_module"],
+        target_address=row["target_address"],
+        raw_expression=row["raw_expression"],
+        resolution_status=row["resolution_status"],
+        confidence=row["confidence"],
+        resolver_version=row["resolver_version"],
+        relation_key=row["relation_key"],
+    )
+
+
+def _declaration_from_row(row: sqlite3.Row) -> SyntacticRelation:
+    return SyntacticRelation(
+        relation_type=row["declaration_type"],
+        source_address=row["source_address"],
+        target_address=None,
+        relative_path=row["relative_path"],
+        start_line=row["declaration_line"],
+        start_column=row["declaration_column"],
+        normalized_expression=row["raw_expression"],
+    )
+
+
+def _source_rows(
+    connection: sqlite3.Connection, relative_paths: Sequence[str]
+) -> tuple[sqlite3.Row, ...]:
+    if not relative_paths:
+        return ()
+    return tuple(
+        connection.execute(
+            "SELECT file_id, module_name FROM source_files WHERE relative_path IN "
+            f"({_placeholders(relative_paths)})",
+            tuple(relative_paths),
+        ).fetchall()
+    )
+
+
+def _placeholders(values: Sequence[object]) -> str:
+    if not values:
+        raise ValueError("SQL placeholder list must not be empty")
+    return ", ".join("?" for _ in values)
+
+
+def _is_test_path(relative_path: str) -> bool:
+    filename = relative_path.rsplit("/", 1)[-1]
+    return filename.startswith("test_") or "/tests/" in f"/{relative_path}"
+
+
+def _target_symbol(declaration: SyntacticRelation) -> str | None:
+    """Extract an identifier hint used only to revisit unresolved declarations."""
+    try:
+        statement = ast.parse(declaration.normalized_expression).body[0]
+    except SyntaxError:
+        return None
+    if isinstance(statement, ast.ImportFrom) and len(statement.names) == 1:
+        return statement.names[0].name
+    if isinstance(statement, ast.Import) and len(statement.names) == 1:
+        return statement.names[0].name.rsplit(".", 1)[-1]
+    try:
+        expression = ast.parse(declaration.normalized_expression, mode="eval").body
+    except SyntaxError:
+        return None
+    while isinstance(expression, ast.Attribute):
+        expression = expression.value
+    return expression.id if isinstance(expression, ast.Name) else None
+
+
+def _ensure_task4_relation_columns(connection: sqlite3.Connection) -> None:
+    """Upgrade the disposable Task 3 cache schema without touching formal state."""
+    actual = {
+        row[1] for row in connection.execute("PRAGMA table_info(relations)").fetchall()
+    }
+    additions = (
+        ("declaration_type", "TEXT NOT NULL DEFAULT 'import_declaration'"),
+        ("source_address", "TEXT NOT NULL DEFAULT ''"),
+        ("relative_path", "TEXT NOT NULL DEFAULT ''"),
+        ("declaration_line", "INTEGER NOT NULL DEFAULT 0"),
+        ("declaration_column", "INTEGER NOT NULL DEFAULT 0"),
+        ("target_address", "TEXT"),
+        ("target_symbol", "TEXT"),
+    )
+    for name, definition in additions:
+        if name not in actual:
+            connection.execute(f"ALTER TABLE relations ADD COLUMN {name} {definition}")
 
 
 _SCHEMA_TABLES = frozenset(
@@ -422,11 +852,18 @@ CREATE TABLE IF NOT EXISTS entities (
 CREATE TABLE IF NOT EXISTS relations (
   relation_id INTEGER PRIMARY KEY,
   relation_type TEXT NOT NULL,
+  declaration_type TEXT NOT NULL DEFAULT 'import_declaration',
   source_uid TEXT REFERENCES entities(uid) ON DELETE CASCADE,
   source_file_id INTEGER NOT NULL REFERENCES source_files(file_id) ON DELETE CASCADE,
+  source_address TEXT NOT NULL DEFAULT '',
+  relative_path TEXT NOT NULL DEFAULT '',
+  declaration_line INTEGER NOT NULL DEFAULT 0,
+  declaration_column INTEGER NOT NULL DEFAULT 0,
   target_uid TEXT REFERENCES entities(uid) ON DELETE SET NULL,
   target_module TEXT,
+  target_address TEXT,
   raw_expression TEXT,
+  target_symbol TEXT,
   resolution_status TEXT NOT NULL,
   confidence TEXT NOT NULL,
   resolver_version TEXT NOT NULL,

@@ -43,6 +43,7 @@ def test_parser_extracts_nested_async_decorated_entities_and_syntactic_relations
         "(self, item: str, /, *, retry: int=3) -> None"
     )
     assert {relation.relation_type for relation in result.relations} == {
+        "call_declaration",
         "contains",
         "declared_base",
         "import_declaration",

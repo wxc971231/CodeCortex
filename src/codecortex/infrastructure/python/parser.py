@@ -56,7 +56,9 @@ class CodeEntityCandidate:
 
 @dataclass(frozen=True)
 class SyntacticRelation:
-    relation_type: Literal["contains", "import_declaration", "declared_base"]
+    relation_type: Literal[
+        "contains", "import_declaration", "declared_base", "call_declaration"
+    ]
     source_address: str
     target_address: str | None
     relative_path: str
@@ -182,6 +184,22 @@ class _EntityCollector(ast.NodeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self._add_import(node)
 
+    def visit_Call(self, node: ast.Call) -> None:
+        """Record a static call-site declaration while preserving normal AST walk."""
+        current = self._contexts[-1]
+        self.relations.append(
+            SyntacticRelation(
+                relation_type="call_declaration",
+                source_address=current.address,
+                target_address=None,
+                relative_path=self._source.source.relative_path,
+                start_line=node.lineno,
+                start_column=node.col_offset,
+                normalized_expression=ast.unparse(node.func),
+            )
+        )
+        self.generic_visit(node)
+
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef, *, is_async: bool) -> None:
         parent = self._contexts[-1]
         direct_class_child = parent.kind == "class"
@@ -205,17 +223,26 @@ class _EntityCollector(ast.NodeVisitor):
 
     def _add_import(self, node: ast.Import | ast.ImportFrom) -> None:
         current = self._contexts[-1]
-        self.relations.append(
-            SyntacticRelation(
-                relation_type="import_declaration",
-                source_address=current.address,
-                target_address=None,
-                relative_path=self._source.source.relative_path,
-                start_line=node.lineno,
-                start_column=node.col_offset,
-                normalized_expression=ast.unparse(node),
+        # Each imported binding gets a declaration of its own.  Besides making
+        # resolution precise, this keeps relation keys unique for
+        # ``from module import A, B`` without involving the resolved target.
+        for alias in node.names:
+            single: ast.Import | ast.ImportFrom
+            if isinstance(node, ast.Import):
+                single = ast.Import(names=[alias])
+            else:
+                single = ast.ImportFrom(module=node.module, names=[alias], level=node.level)
+            self.relations.append(
+                SyntacticRelation(
+                    relation_type="import_declaration",
+                    source_address=current.address,
+                    target_address=None,
+                    relative_path=self._source.source.relative_path,
+                    start_line=node.lineno,
+                    start_column=node.col_offset,
+                    normalized_expression=ast.unparse(single),
+                )
             )
-        )
 
     def _push(self, entity: CodeEntityCandidate, body: list[ast.stmt]) -> None:
         self.entities.append(entity)
