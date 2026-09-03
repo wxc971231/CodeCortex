@@ -133,6 +133,16 @@ class ValidationIssueCode(StrEnum):
     DANGLING_APPROVAL_EVENT = "DANGLING_APPROVAL_EVENT"
     DANGLING_REFERENCE = "DANGLING_REFERENCE"
     INVALID_RELATION = "INVALID_RELATION"
+    BEHAVIOR_PARENT_COUNT = "BEHAVIOR_PARENT_COUNT"
+    CONTAINS_CYCLE = "CONTAINS_CYCLE"
+    INVALID_FLOW_STATUS = "INVALID_FLOW_STATUS"
+    UNMATERIALIZED_FLOW_HAS_STEPS = "UNMATERIALIZED_FLOW_HAS_STEPS"
+    NOT_APPLICABLE_FLOW_HAS_STEPS = "NOT_APPLICABLE_FLOW_HAS_STEPS"
+    MATERIALIZED_FLOW_EMPTY = "MATERIALIZED_FLOW_EMPTY"
+    FLOW_ORDER_NOT_CONTIGUOUS = "FLOW_ORDER_NOT_CONTIGUOUS"
+    INVALID_MAPPING_ROLE = "INVALID_MAPPING_ROLE"
+    INVALID_MAPPING_RESOLUTION_STATUS = "INVALID_MAPPING_RESOLUTION_STATUS"
+    RELATION_EVIDENCE_REQUIRED = "RELATION_EVIDENCE_REQUIRED"
 
 
 @dataclass(frozen=True)
@@ -156,7 +166,13 @@ def validate_formal_state(state: FormalState) -> ValidationResult:
     _validate_baseline(state, issues)
     applied_event_ids = _validate_history(state.history_events, issues)
     entity_ids = _validate_entity_refs(state.entity_refs, issues)
-    _validate_graph(state.graph, applied_event_ids, entity_ids, issues)
+    _validate_graph(
+        state.graph,
+        applied_event_ids,
+        entity_ids,
+        issues,
+        strict_m1a=state.manifest.cognition_initialized,
+    )
     return ValidationResult(valid=not issues, issues=tuple(issues))
 
 
@@ -169,9 +185,7 @@ def _issue(
     issues.append(ValidationIssue(code, location, message))
 
 
-def _validate_versions(
-    state: FormalState, issues: list[ValidationIssue]
-) -> None:
+def _validate_versions(state: FormalState, issues: list[ValidationIssue]) -> None:
     for location, version in (
         ("manifest.schema_version", state.manifest.schema_version),
         ("graph.schema_version", state.graph.schema_version),
@@ -192,7 +206,10 @@ def _validate_versions(
             "manifest.digest_profile_version",
             "digest profile version is unsupported",
         )
-    if state.source_baseline.digest_profile_version != state.manifest.digest_profile_version:
+    if (
+        state.source_baseline.digest_profile_version
+        != state.manifest.digest_profile_version
+    ):
         _issue(
             issues,
             ValidationIssueCode.UNSUPPORTED_SCHEMA,
@@ -225,9 +242,7 @@ def _validate_versions(
         )
 
 
-def _validate_revisions(
-    state: FormalState, issues: list[ValidationIssue]
-) -> None:
+def _validate_revisions(state: FormalState, issues: list[ValidationIssue]) -> None:
     revisions = (
         state.manifest.graph_revision,
         state.graph.graph_revision,
@@ -265,9 +280,7 @@ def _validate_revisions(
         )
 
 
-def _validate_baseline(
-    state: FormalState, issues: list[ValidationIssue]
-) -> None:
+def _validate_baseline(state: FormalState, issues: list[ValidationIssue]) -> None:
     manifest_digest = state.manifest.cognition_baseline
     baseline_digest = state.source_baseline.repository_source_digest
     files = state.source_baseline.files
@@ -366,6 +379,8 @@ def _validate_graph(
     applied_event_ids: set[str],
     entity_ids: set[str],
     issues: list[ValidationIssue],
+    *,
+    strict_m1a: bool,
 ) -> None:
     identifiers: set[str] = set()
     evidence_ids: set[str] = set()
@@ -475,9 +490,7 @@ def _validate_graph(
             else:
                 flow_step_ids.add(step_id)
             if isinstance(step, dict):
-                _validate_provenance(
-                    step, step_location, applied_event_ids, issues
-                )
+                _validate_provenance(step, step_location, applied_event_ids, issues)
                 _validate_evidence(step, step_location, evidence_ids, issues)
                 _validate_capability_references(
                     step,
@@ -531,6 +544,151 @@ def _validate_graph(
             entity_ids,
             issues,
         )
+    if strict_m1a:
+        _validate_m1a_graph_invariants(graph, node_ids, node_kinds, issues)
+
+
+def _validate_m1a_graph_invariants(
+    graph: CognitiveGraph,
+    node_ids: set[str],
+    node_kinds: dict[str, str],
+    issues: list[ValidationIssue],
+) -> None:
+    """Apply M1a-only semantics without breaking legacy M0 technical state.
+
+    M0 deliberately permits small user-created graph fragments before a source
+    cognition baseline exists.  Once cognition is initialized, the persisted
+    JSON graph must also honour the typed M1a model in ``domain.graph``.
+    """
+    parents: dict[str, int] = {identifier: 0 for identifier in node_ids}
+    contains: dict[str, list[str]] = {}
+    for index, edge in enumerate(graph.semantic_edges):
+        location = f"graph.semantic_edges[{index}]"
+        relation = edge.get("type")
+        source = edge.get("source_id")
+        target = edge.get("target_id")
+        if (
+            relation in {"uses", "depends_on"}
+            and edge.get("epistemic_status")
+            in {
+                "inferred",
+                "uncertain",
+            }
+            and not edge.get("evidence")
+        ):
+            _issue(
+                issues,
+                ValidationIssueCode.RELATION_EVIDENCE_REQUIRED,
+                f"{location}.evidence",
+                "inferred or uncertain semantic edges require evidence",
+            )
+        if (
+            relation == "contains"
+            and isinstance(source, str)
+            and isinstance(target, str)
+        ):
+            contains.setdefault(source, []).append(target)
+            if node_kinds.get(target) == "behavior":
+                parents[target] = parents.get(target, 0) + 1
+    for identifier, kind in node_kinds.items():
+        if kind == "behavior" and parents.get(identifier, 0) != 1:
+            _issue(
+                issues,
+                ValidationIssueCode.BEHAVIOR_PARENT_COUNT,
+                identifier,
+                "each behavior requires exactly one responsibility parent",
+            )
+    if _has_cycle(contains):
+        _issue(
+            issues,
+            ValidationIssueCode.CONTAINS_CYCLE,
+            "graph.semantic_edges",
+            "contains hierarchy must be acyclic",
+        )
+
+    for index, flow in enumerate(graph.logical_flows):
+        location = f"graph.logical_flows[{index}]"
+        status = flow.get("materialization_status")
+        steps = flow.get("steps")
+        if status not in {"unmaterialized", "materialized", "not_applicable"}:
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_FLOW_STATUS,
+                f"{location}.materialization_status",
+                "logical flow materialization status is invalid",
+            )
+            continue
+        if not isinstance(steps, list):
+            continue
+        if status == "unmaterialized" and steps:
+            _issue(
+                issues,
+                ValidationIssueCode.UNMATERIALIZED_FLOW_HAS_STEPS,
+                f"{location}.steps",
+                "unmaterialized flow cannot contain steps",
+            )
+        elif status == "not_applicable" and steps:
+            _issue(
+                issues,
+                ValidationIssueCode.NOT_APPLICABLE_FLOW_HAS_STEPS,
+                f"{location}.steps",
+                "not-applicable flow cannot contain steps",
+            )
+        elif status == "materialized" and not steps:
+            _issue(
+                issues,
+                ValidationIssueCode.MATERIALIZED_FLOW_EMPTY,
+                f"{location}.steps",
+                "materialized flow requires steps",
+            )
+        orders = [step.get("order") for step in steps if isinstance(step, dict)]
+        if len(orders) == len(steps) and orders != list(range(1, len(steps) + 1)):
+            _issue(
+                issues,
+                ValidationIssueCode.FLOW_ORDER_NOT_CONTIGUOUS,
+                f"{location}.steps",
+                "flow step orders must start at one and be contiguous",
+            )
+
+    for index, mapping in enumerate(graph.implementation_mappings):
+        location = f"graph.implementation_mappings[{index}]"
+        if mapping.get("role") not in {"primary", "supporting"}:
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_MAPPING_ROLE,
+                f"{location}.role",
+                "mapping role must be primary or supporting",
+            )
+        if mapping.get("resolution_status") not in {
+            "resolved",
+            "missing",
+            "ambiguous",
+        }:
+            _issue(
+                issues,
+                ValidationIssueCode.INVALID_MAPPING_RESOLUTION_STATUS,
+                f"{location}.resolution_status",
+                "mapping resolution status is invalid",
+            )
+
+
+def _has_cycle(adjacency: dict[str, list[str]]) -> bool:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(identifier: str) -> bool:
+        if identifier in visiting:
+            return True
+        if identifier in visited:
+            return False
+        visiting.add(identifier)
+        if any(visit(target) for target in adjacency.get(identifier, ())):
+            return True
+        visiting.remove(identifier)
+        visited.add(identifier)
+        return False
+
+    return any(visit(identifier) for identifier in adjacency)
 
 
 def _validate_edge_references(
@@ -746,11 +904,7 @@ def _validate_record_revision(
     issues: list[ValidationIssue],
 ) -> None:
     revision = record.get(revision_key)
-    if (
-        type(revision) is not int
-        or revision < 1
-        or revision > graph_revision
-    ):
+    if type(revision) is not int or revision < 1 or revision > graph_revision:
         _issue(
             issues,
             ValidationIssueCode.INVALID_REVISION,
@@ -804,14 +958,10 @@ def _validate_repository_relative_fields(
                 _validate_repository_relative_fields(child, child_location, issues)
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            _validate_repository_relative_fields(
-                child, f"{location}[{index}]", issues
-            )
+            _validate_repository_relative_fields(child, f"{location}[{index}]", issues)
 
 
-def _validate_entity_refs(
-    refs: EntityRefs, issues: list[ValidationIssue]
-) -> set[str]:
+def _validate_entity_refs(refs: EntityRefs, issues: list[ValidationIssue]) -> set[str]:
     identifiers: set[str] = set()
     ordered_ids: list[str] = []
     for index, entity in enumerate(refs.entities):
