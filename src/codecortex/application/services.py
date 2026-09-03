@@ -46,6 +46,7 @@ from codecortex.domain.proposals import (
     ProposalStatus,
     json_value_to_mutable,
 )
+from codecortex.infrastructure.formal import view_manifest_for
 from codecortex.infrastructure.persistence.graph_replica import (
     ContextRequest,
     DiscussionContext,
@@ -377,6 +378,11 @@ class ApplicationServices:
                     suggested_action="Revise or recreate the proposal",
                 )
             views = self._view_renderer()(applied.graph)
+            if state.view_manifest is not None:
+                applied = replace(
+                    applied,
+                    view_manifest=view_manifest_for(new_revision, views),
+                )
             event = _history_event(proposal, approval, event_id, new_revision)
             self.formal_store.commit(applied, event, views)
             store.delete(proposal_id)

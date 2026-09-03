@@ -85,6 +85,15 @@ class SourceBaseline:
 
 
 @dataclass(frozen=True)
+class ViewManifest:
+    """Git-portable byte digests for Core-managed rendered views."""
+
+    schema_version: int
+    graph_revision: int
+    files: tuple[JsonObject, ...]
+
+
+@dataclass(frozen=True)
 class HistoryEventRef:
     """The identity and type needed to validate formal provenance references."""
 
@@ -101,6 +110,7 @@ class FormalState:
     entity_refs: EntityRefs
     source_baseline: SourceBaseline
     history_events: tuple[HistoryEventRef, ...] = ()
+    view_manifest: ViewManifest | None = None
 
     @classmethod
     def empty(

@@ -42,6 +42,7 @@ from codecortex.infrastructure.persistence.facts_db import (
     CacheMetadata,
     CodeEntity,
     CodeRelation,
+    EntityReferenceResolution,
     FactDiagnostic,
     FactScope,
     FactTotals,
@@ -101,6 +102,16 @@ class FactQueryPort(Protocol):
 
     def entity_by_uid(self, uid: str) -> CodeEntity | None:
         """Return the current entity for *uid*, or None when it is gone."""
+
+    def resolve_entity_reference(
+        self,
+        *,
+        last_known_address: str,
+        kind: str,
+        signature: str | None,
+        fingerprint: str,
+    ) -> EntityReferenceResolution:
+        """Resolve one strict address/fingerprint fallback without scanning."""
 
     def query_relations(
         self,
@@ -208,6 +219,40 @@ class SearchPage:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class CurrentSourceLocation:
+    """A current source position dynamically projected from the fact cache."""
+
+    relative_path: str
+    address: str
+    start_line: int | None
+    end_line: int | None
+    signature: str | None
+
+
+@dataclass(frozen=True)
+class ResolvedMapping:
+    """One formal mapping plus a non-mutating current-source resolution."""
+
+    mapping: Mapping[str, object]
+    resolution_status: str
+    current_location: CurrentSourceLocation | None
+    last_known_location: CurrentSourceLocation
+
+
+@dataclass(frozen=True)
+class NodeInspection:
+    """Bounded formal node context with dynamically resolved source anchors."""
+
+    coordinate: CacheCoordinate
+    node: Mapping[str, object]
+    relations: tuple[Mapping[str, object], ...]
+    flow: Mapping[str, object] | None
+    mappings: tuple[ResolvedMapping, ...]
+    evidence: tuple[Mapping[str, object], ...]
+    truncated: bool = False
+
+
 def _rebuild_required(message: str) -> CodeCortexError:
     return CodeCortexError(
         ErrorCode.CACHE_REBUILD_REQUIRED,
@@ -312,6 +357,7 @@ class QueryService:
         self.cache_guard = CacheGuard(
             formal_store=formal_store, facts=facts, replica=replica
         )
+        self._formal_store = formal_store
         self._facts = facts
         self._replica = replica
         self._repository_lock = repository_lock
@@ -504,6 +550,119 @@ class QueryService:
             truncated=len(hits) >= checked_limit,
         )
 
+    def inspect_node(
+        self,
+        node_id: str,
+        *,
+        expected_source_digest: str | None = None,
+        expected_graph_revision: int | None = None,
+    ) -> NodeInspection:
+        """Inspect one formal node and project mappings onto current source.
+
+        Formal mapping semantics are never rewritten by this read.  A stable
+        entity UID wins; only when that UID disappeared do we try the strict,
+        indexed address/fingerprint reference fallback.  Missing and ambiguous
+        outcomes preserve the entity-ref's last known location for the UI.
+        """
+        checked_node_id = _required_text(node_id, "inspect_node node ID")
+        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
+            state = self._formal_store.load()
+            coordinate = self.cache_guard.require_current(
+                expected_source_digest, expected_graph_revision
+            )
+            node = next(
+                (item for item in state.graph.nodes if item.get("id") == checked_node_id),
+                None,
+            )
+            if node is None:
+                raise CodeCortexError(
+                    ErrorCode.ANALYSIS_REPORT_INVALID,
+                    f"Cognitive graph node does not exist: {checked_node_id}",
+                    suggested_action="Use a node ID returned by search_cognitive_graph",
+                )
+            relations = tuple(
+                dict(edge)
+                for edge in state.graph.semantic_edges
+                if edge.get("source_id") == checked_node_id
+                or edge.get("target_id") == checked_node_id
+            )
+            flow = next(
+                (
+                    dict(item)
+                    for item in state.graph.logical_flows
+                    if item.get("behavior_id") == checked_node_id
+                ),
+                None,
+            )
+            flow_step_ids = {
+                str(step.get("id"))
+                for step in _object_sequence(None if flow is None else flow.get("steps"))
+            }
+            mappings = tuple(
+                dict(item)
+                for item in state.graph.implementation_mappings
+                if item.get("subject_id") == checked_node_id
+                or item.get("subject_id") in flow_step_ids
+            )
+            refs = {
+                str(item.get("uid")): item
+                for item in state.entity_refs.entities
+                if isinstance(item.get("uid"), str)
+            }
+            resolved = tuple(
+                self._resolve_mapping(mapping, refs) for mapping in mappings
+            )
+            evidence = _inspection_evidence(
+                node=dict(node), relations=relations, flow=flow, mappings=mappings
+            )
+        return NodeInspection(
+            coordinate=coordinate,
+            node=dict(node),
+            relations=relations,
+            flow=flow,
+            mappings=resolved,
+            evidence=evidence,
+        )
+
+    def _resolve_mapping(
+        self, mapping: Mapping[str, object], refs: Mapping[str, Mapping[str, object]]
+    ) -> ResolvedMapping:
+        uid = mapping.get("entity_uid")
+        if not isinstance(uid, str) or not uid:
+            raise CodeCortexError(
+                ErrorCode.ANALYSIS_REPORT_INVALID,
+                "Formal mapping has no entity UID",
+            )
+        reference = refs.get(uid)
+        if reference is None:
+            raise CodeCortexError(
+                ErrorCode.ANALYSIS_REPORT_INVALID,
+                f"Formal mapping entity reference is missing: {uid}",
+            )
+        last_known = _last_known_location(reference)
+        current = self._facts.entity_by_uid(uid)
+        if current is not None:
+            return ResolvedMapping(
+                mapping=dict(mapping),
+                resolution_status="resolved",
+                current_location=_current_location(current),
+                last_known_location=last_known,
+            )
+        fallback = self._facts.resolve_entity_reference(
+            last_known_address=_reference_text(reference, "last_known_address"),
+            kind=_reference_text(reference, "kind"),
+            signature=_optional_reference_text(reference, "signature"),
+            fingerprint=_reference_text(reference, "fingerprint"),
+        )
+        return ResolvedMapping(
+            mapping=dict(mapping),
+            resolution_status=fallback.status,
+            current_location=(
+                None if fallback.entity is None else _current_location(fallback.entity)
+            ),
+            last_known_location=last_known,
+        )
+
     def _bounded_limit(self, limit: int) -> int:
         if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
             raise ValueError("Query limit must be a positive integer")
@@ -560,3 +719,70 @@ def _relation_types(relation_types: Sequence[str]) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"Relation types must be allowlisted; unknown: {unknown}")
     return materialized
+
+
+def _current_location(entity: CodeEntity) -> CurrentSourceLocation:
+    return CurrentSourceLocation(
+        relative_path=entity.relative_path,
+        address=entity.address,
+        start_line=entity.start_line,
+        end_line=entity.end_line,
+        signature=entity.signature,
+    )
+
+
+def _last_known_location(reference: Mapping[str, object]) -> CurrentSourceLocation:
+    return CurrentSourceLocation(
+        relative_path=_reference_text(reference, "relative_path"),
+        address=_reference_text(reference, "last_known_address"),
+        start_line=None,
+        end_line=None,
+        signature=_optional_reference_text(reference, "signature"),
+    )
+
+
+def _reference_text(reference: Mapping[str, object], field: str) -> str:
+    value = reference.get(field)
+    if not isinstance(value, str) or not value:
+        raise CodeCortexError(
+            ErrorCode.ANALYSIS_REPORT_INVALID,
+            f"Formal entity reference has no valid {field}",
+        )
+    return value
+
+
+def _optional_reference_text(reference: Mapping[str, object], field: str) -> str | None:
+    value = reference.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CodeCortexError(
+            ErrorCode.ANALYSIS_REPORT_INVALID,
+            f"Formal entity reference has invalid {field}",
+        )
+    return value
+
+
+def _object_sequence(value: object) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, Mapping))
+
+
+def _inspection_evidence(
+    *,
+    node: Mapping[str, object],
+    relations: Sequence[Mapping[str, object]],
+    flow: Mapping[str, object] | None,
+    mappings: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    items: list[Mapping[str, object]] = list(_object_sequence(node.get("evidence")))
+    for relation in relations:
+        items.extend(_object_sequence(relation.get("evidence")))
+    if flow is not None:
+        items.extend(_object_sequence(flow.get("evidence")))
+        for step in _object_sequence(flow.get("steps")):
+            items.extend(_object_sequence(step.get("evidence")))
+    for mapping in mappings:
+        items.extend(_object_sequence(mapping.get("evidence")))
+    return tuple(sorted((dict(item) for item in items), key=lambda item: str(item.get("id", ""))))

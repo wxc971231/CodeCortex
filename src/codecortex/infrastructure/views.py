@@ -1,79 +1,71 @@
-"""Deterministic Markdown projections of the canonical cognitive graph."""
+"""Compatibility imports for deterministic cognitive Markdown views."""
 
 from collections.abc import Mapping
 
 from codecortex.domain.cognition import CognitiveGraph, JsonObject
 from codecortex.infrastructure.formal import EMPTY_TREE_VIEW
+from codecortex.infrastructure.rendering.markdown import render_views
 
-_KIND_DIRECTORIES = {
-    "responsibility": "responsibilities",
-    "behavior": "behaviors",
-    "capability": "capabilities",
-}
-_KIND_ORDER = ("responsibility", "behavior", "capability")
+__all__ = ["render_legacy_views", "render_views"]
 
 
-def render_views(graph: CognitiveGraph) -> Mapping[str, bytes]:
-    """Render the complete human-readable view set for one graph revision.
+def render_legacy_views(graph: CognitiveGraph) -> Mapping[str, bytes]:
+    """Reproduce the M0 renderer solely for safe legacy-state admission.
 
-    The returned mapping is the authoritative desired content of ``views/``:
-    commit replaces these files and removes any managed view file not listed.
-    The same graph always renders the same bytes on any machine.
+    M1a's richer projection must never silently overwrite a hand-edited M0
+    view.  This compact implementation remains isolated from the M1a renderer
+    so the first migration compares against exactly the M0 byte shape.
     """
     if not graph.nodes:
         return {"views/TREE.md": EMPTY_TREE_VIEW}
-    views: dict[str, bytes] = {"views/TREE.md": _render_tree(graph)}
-    for node in _sorted_nodes(graph.nodes):
-        node_id = str(node.get("id"))
+    directories = {
+        "responsibility": "responsibilities",
+        "behavior": "behaviors",
+        "capability": "capabilities",
+    }
+    nodes = sorted(graph.nodes, key=lambda node: str(node.get("id")))
+    views: dict[str, bytes] = {"views/TREE.md": _legacy_tree(nodes, directories)}
+    for node in nodes:
         kind = str(node.get("kind"))
+        node_id = str(node.get("id"))
         slug = node_id.removeprefix(f"{kind}.")
-        views[f"views/{_KIND_DIRECTORIES[kind]}/{slug}.md"] = _render_node(node)
+        views[f"views/{directories[kind]}/{slug}.md"] = _legacy_node(node)
     return views
 
 
-def _sorted_nodes(nodes: tuple[JsonObject, ...]) -> list[JsonObject]:
-    return sorted(nodes, key=lambda node: str(node.get("id")))
-
-
-def _node_title(node: JsonObject) -> str:
-    title = node.get("title")
-    if isinstance(title, str) and title.strip():
-        return title
-    return str(node.get("id"))
-
-
-def _render_tree(graph: CognitiveGraph) -> bytes:
+def _legacy_tree(nodes: list[JsonObject], directories: Mapping[str, str]) -> bytes:
     lines = ["# CodeCortex Cognitive Tree", ""]
-    for kind in _KIND_ORDER:
-        nodes = [
-            node for node in _sorted_nodes(graph.nodes) if node.get("kind") == kind
-        ]
-        if not nodes:
+    for kind in ("responsibility", "behavior", "capability"):
+        selected = [node for node in nodes if node.get("kind") == kind]
+        if not selected:
             continue
-        lines.append(f"## {_KIND_DIRECTORIES[kind].capitalize()}")
-        lines.append("")
-        for node in nodes:
-            lines.append(f"- `{node.get('id')}` — {_node_title(node)}")
+        lines.extend([f"## {directories[kind].capitalize()}", ""])
+        for node in selected:
+            lines.append(f"- `{node.get('id')}` — {_legacy_title(node)}")
         lines.append("")
     return ("\n".join(lines).rstrip("\n") + "\n").encode("utf-8")
 
 
-def _render_node(node: JsonObject) -> bytes:
+def _legacy_node(node: JsonObject) -> bytes:
     lines = [
-        f"# {_node_title(node)}",
+        f"# {_legacy_title(node)}",
         "",
         f"- ID: `{node.get('id')}`",
         f"- Kind: {node.get('kind')}",
     ]
-    node_revision = node.get("node_revision")
-    if type(node_revision) is int:
-        lines.append(f"- Node revision: {node_revision}")
+    if type(node.get("node_revision")) is int:
+        lines.append(f"- Node revision: {node['node_revision']}")
     approval = node.get("approval")
-    if isinstance(approval, dict):
-        event_id = approval.get("approval_event_id")
-        if isinstance(event_id, str):
-            lines.append(f"- Approval event: `{event_id}`")
+    if isinstance(approval, dict) and isinstance(
+        approval.get("approval_event_id"), str
+    ):
+        lines.append(f"- Approval event: `{approval['approval_event_id']}`")
     summary = node.get("summary")
     if isinstance(summary, str) and summary.strip():
         lines.extend(["", summary])
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _legacy_title(node: JsonObject) -> str:
+    title = node.get("title")
+    return title if isinstance(title, str) and title.strip() else str(node.get("id"))

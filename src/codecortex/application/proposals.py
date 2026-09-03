@@ -65,9 +65,11 @@ from codecortex.domain.proposals import (
     ProposalStatus,
     json_value_to_mutable,
 )
+from codecortex.infrastructure.formal import view_manifest_for
 from codecortex.infrastructure.persistence.entity_refs import recompute_entity_refs
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
+from codecortex.infrastructure.views import render_legacy_views
 
 SourceProbe = Callable[[], "ManagedSourceSnapshot"]
 
@@ -322,6 +324,14 @@ class ProposalService:
         with self._repository_lock.acquire("exclusive", self._lock_timeout_seconds):
             self._formal_store.recover()
             state = self._formal_store.load()
+            if state.view_manifest is None:
+                self._formal_store.verify_legacy_views(
+                    render_legacy_views(state.graph),
+                    # An M0 edit made by this in-development Core already uses
+                    # the M1a renderer.  It is still accepted only when bytes
+                    # exactly match the graph; arbitrary hand edits are not.
+                    self._view_renderer(state.graph),
+                )
             proposal = self._pending.load(proposal_id)
             proposal.verify_approval(approval)
             proposal.verify_base_graph_revision(state.graph.graph_revision)
@@ -389,6 +399,10 @@ class ProposalService:
                     suggested_action="Revise or recreate the proposal",
                 )
             views = self._view_renderer(applied.graph)
+            applied = replace(
+                applied,
+                view_manifest=view_manifest_for(new_revision, views),
+            )
             event = _applied_event(
                 proposal, approval, event_id, state, new_revision, snapshot, verified
             )

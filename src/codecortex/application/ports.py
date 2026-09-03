@@ -68,6 +68,13 @@ class FormalStorePort(Protocol):
     def formal_file_presence(self) -> dict[str, bool]:
         """Return required formal-file existence by repository-relative path."""
 
+    def verify_legacy_views(
+        self,
+        expected_views: Mapping[str, bytes],
+        alternate_views: Mapping[str, bytes] | None = None,
+    ) -> None:
+        """Reject hand-modified M0 views before their first M1a migration."""
+
     def commit(
         self,
         state: FormalState,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -366,6 +367,62 @@ def test_approved_initialization_advances_all_formal_state(
     assert harness.replica.search(
         "answer", ("behavior",), 10, result.graph_revision
     )
+    view_manifest = json.loads(
+        (repo_root / ".codecortex/view_manifest.json").read_text(encoding="utf-8")
+    )
+    assert view_manifest["graph_revision"] == result.graph_revision
+    assert [entry["relative_path"] for entry in view_manifest["files"]] == sorted(
+        entry["relative_path"] for entry in view_manifest["files"]
+    )
+
+
+def test_m1a_view_manifest_rejects_hand_edited_managed_view(
+    harness: M1aHarness, repo_root: Path
+) -> None:
+    proposal = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+    harness.service.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+
+    tree = repo_root / ".codecortex/views/TREE.md"
+    tree.write_text("# hand edit\n", encoding="utf-8")
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        harness.formal_store.load()
+    assert excinfo.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+def test_later_manual_apply_advances_existing_view_manifest(
+    harness: M1aHarness, repo_root: Path
+) -> None:
+    proposal = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+    harness.service.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+    m0 = harness.m0_services()
+    manual = m0.create_cognitive_proposal(
+        operations=(
+            PatchOperation(
+                "add_node",
+                "capability.manual-followup",
+                {
+                    "id": "capability.manual-followup",
+                    "kind": "capability",
+                    "title": "Manual follow-up",
+                },
+            ),
+        ),
+        affected_nodes=("capability.manual-followup",),
+        reason="manual follow-up",
+    )
+    result = m0.apply_cognitive_proposal(manual.proposal_id, approval_for(manual))
+
+    state = harness.formal_store.load()
+    manifest = json.loads(
+        (repo_root / ".codecortex/view_manifest.json").read_text(encoding="utf-8")
+    )
+    assert state.graph.graph_revision == result.graph_revision == 2
+    assert manifest["graph_revision"] == 2
 
 
 def test_any_source_change_makes_the_proposal_stale(

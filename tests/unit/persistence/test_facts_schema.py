@@ -75,3 +75,53 @@ def test_deleting_a_file_cascades_its_entities_and_relations(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM relations").fetchone()[0] == 0
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_entity_reference_fallback_requires_unique_kind_signature_match(tmp_path):
+    database = FactsDatabase.create_new(tmp_path / "facts.sqlite3")
+    with database.open_write() as connection:
+        connection.execute(
+            "INSERT INTO source_files "
+            "(relative_path, content_digest, size_bytes, parse_status, is_test) "
+            "VALUES ('pkg/new.py', ?, 1, 'parsed', 0)",
+            ("sha256:" + "a" * 64,),
+        )
+        file_id = connection.execute("SELECT file_id FROM source_files").fetchone()[0]
+        for uid, address in (("ent_new", "pkg.new:work"), ("ent_other", "pkg.other:work")):
+            connection.execute(
+                "INSERT INTO entities "
+                "(uid, file_id, address, module_name, qualname, kind, name, "
+                "start_line, end_line, signature, fingerprint, resolution_status) "
+                "VALUES (?, ?, ?, 'pkg.new', 'work', 'function', 'work', 1, 2, "
+                "'(value: int) -> int', ?, 'resolved')",
+                (uid, file_id, address, "sha256:" + "b" * 64),
+            )
+
+    ambiguous = database.resolve_entity_reference(
+        last_known_address="pkg.old:work",
+        kind="function",
+        signature="(value: int) -> int",
+        fingerprint="sha256:" + "b" * 64,
+    )
+    assert ambiguous.status == "ambiguous"
+    assert ambiguous.entity is None
+
+    with database.open_write() as connection:
+        connection.execute("DELETE FROM entities WHERE uid = 'ent_other'")
+    resolved = database.resolve_entity_reference(
+        last_known_address="pkg.old:work",
+        kind="function",
+        signature="(value: int) -> int",
+        fingerprint="sha256:" + "b" * 64,
+    )
+    assert resolved.status == "resolved"
+    assert resolved.entity is not None
+    assert resolved.entity.relative_path == "pkg/new.py"
+
+    missing = database.resolve_entity_reference(
+        last_known_address="pkg.old:work",
+        kind="function",
+        signature="(other: str) -> int",
+        fingerprint="sha256:" + "b" * 64,
+    )
+    assert missing.status == "missing"

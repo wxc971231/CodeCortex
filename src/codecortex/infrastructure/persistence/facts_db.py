@@ -87,6 +87,19 @@ class CodeEntity:
 
 
 @dataclass(frozen=True)
+class EntityReferenceResolution:
+    """Strict bounded lookup result for one persisted entity reference.
+
+    A fallback must match the reference's address *or* fingerprint while also
+    matching kind and signature.  Returning an explicit ambiguous result keeps
+    callers from silently choosing one of several same-fingerprint entities.
+    """
+
+    status: str
+    entity: CodeEntity | None
+
+
+@dataclass(frozen=True)
 class CodeRelation:
     """The query projection for one current source declaration relation."""
 
@@ -430,6 +443,42 @@ class FactsDatabase:
                 f"{_ENTITY_SELECT} WHERE e.uid = ?", (uid,)
             ).fetchone()
         return None if row is None else _code_entity_from_row(row)
+
+    def resolve_entity_reference(
+        self,
+        *,
+        last_known_address: str,
+        kind: str,
+        signature: str | None,
+        fingerprint: str,
+    ) -> EntityReferenceResolution:
+        """Resolve one formal entity reference without an unbounded scan.
+
+        The UID is always the caller's first choice.  This method is only the
+        conservative fallback for a cache rebuilt without that UID: the
+        candidate must retain its kind and normalized signature, and match the
+        old address or semantic fingerprint.  Two matches are deliberately
+        reported as ``ambiguous`` rather than selected by ordering.
+        """
+        if not all(
+            isinstance(value, str) and value
+            for value in (last_known_address, kind, fingerprint)
+        ):
+            raise ValueError("Entity reference address, kind, and fingerprint are required")
+        if signature is not None and not isinstance(signature, str):
+            raise ValueError("Entity reference signature must be text or null")
+        with self.open_read() as connection:
+            rows = connection.execute(
+                f"{_ENTITY_SELECT} WHERE e.kind = ? AND e.signature IS ? "
+                "AND (e.address = ? OR e.fingerprint = ?) "
+                "ORDER BY e.uid ASC LIMIT 2",
+                (kind, signature, last_known_address, fingerprint),
+            ).fetchall()
+        if not rows:
+            return EntityReferenceResolution("missing", None)
+        if len(rows) > 1:
+            return EntityReferenceResolution("ambiguous", None)
+        return EntityReferenceResolution("resolved", _code_entity_from_row(rows[0]))
 
     def entities_at_path(
         self, relative_path: str, cursor: str | None, limit: int

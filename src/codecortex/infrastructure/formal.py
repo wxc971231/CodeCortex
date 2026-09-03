@@ -8,6 +8,7 @@ import tempfile
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import NoReturn
 
@@ -18,10 +19,12 @@ from codecortex.domain.cognition import (
     EntityRefs,
     FormalState,
     HistoryEventRef,
+    JsonObject,
     Manifest,
     SourceBaseline,
     ValidationIssueCode,
     ValidationResult,
+    ViewManifest,
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
@@ -60,6 +63,8 @@ _FORMAL_FILES = (
     "source_baseline.json",
     "PROJECT.md",
 )
+_VIEW_MANIFEST_FIELDS = {"schema_version", "graph_revision", "files"}
+_VIEW_MANIFEST_FILE_FIELDS = {"relative_path", "content_digest"}
 _FORMAL_DIRECTORIES = (
     "history",
     "history/events",
@@ -247,6 +252,7 @@ class FormalStore:
         self._check_fields(
             baseline_data, _SOURCE_BASELINE_FIELDS, "source_baseline.json"
         )
+        view_manifest = self._load_view_manifest()
 
         try:
             state = FormalState(
@@ -255,6 +261,7 @@ class FormalStore:
                 entity_refs=_entity_refs_from_json(refs_data),
                 source_baseline=_source_baseline_from_json(baseline_data),
                 history_events=self._load_history_events(),
+                view_manifest=view_manifest,
             )
         except (KeyError, TypeError, ValueError) as error:
             self._raise_corrupt("Formal state has an invalid data shape", cause=error)
@@ -263,6 +270,7 @@ class FormalStore:
         if not result.valid:
             self._raise_validation(result.issues)
         self._validate_empty_views(state)
+        self._validate_view_manifest(state)
         return state
 
     def formal_file_presence(self) -> dict[str, bool]:
@@ -334,6 +342,11 @@ class FormalStore:
             ),
             "manifest.json": canonical_json_bytes(_manifest_to_json(state.manifest)),
         }
+        if state.view_manifest is not None:
+            self._validate_rendered_view_manifest(state.view_manifest, views)
+            payloads["view_manifest.json"] = canonical_json_bytes(
+                _view_manifest_to_json(state.view_manifest)
+            )
         for relative, payload in views.items():
             if not relative.startswith("views/"):
                 self._raise_corrupt("Rendered view paths must stay under views/")
@@ -384,7 +397,12 @@ class FormalStore:
             "graph": ["graph.json"],
             "entity_refs": ["entity_refs.json"],
             "source_baseline": ["source_baseline.json"],
-            "views": sorted(views),
+            "views": sorted(
+                [
+                    *views,
+                    *(["view_manifest.json"] if state.view_manifest is not None else []),
+                ]
+            ),
         }
         for stage in _COMMIT_STAGE_ORDER:
             for relative in stage_targets[stage]:
@@ -553,6 +571,109 @@ class FormalStore:
                     for path in view_directory.glob("*.md")
                 )
         return sorted(managed - rendered)
+
+    def verify_legacy_views(
+        self,
+        expected_views: Mapping[str, bytes],
+        alternate_views: Mapping[str, bytes] | None = None,
+    ) -> None:
+        """Ensure an M0 state was not hand-edited before M1a takes ownership."""
+        if (self._root / "view_manifest.json").exists():
+            return
+        try:
+            self._verify_view_bytes(expected_views, "Legacy M0 views differ from graph")
+        except CodeCortexError:
+            if alternate_views is None:
+                raise
+            self._verify_view_bytes(alternate_views, "Legacy M0 views differ from graph")
+
+    def _load_view_manifest(self) -> ViewManifest | None:
+        path = self._root / "view_manifest.json"
+        if not path.exists():
+            return None
+        if path.is_symlink() or not path.is_file():
+            self._raise_corrupt("View manifest must be a regular file")
+        data = self._read_object(path)
+        self._check_schema(data, "view_manifest.json")
+        self._check_fields(data, _VIEW_MANIFEST_FIELDS, "view_manifest.json")
+        try:
+            return _view_manifest_from_json(data)
+        except (KeyError, TypeError, ValueError) as error:
+            self._raise_corrupt("View manifest has an invalid data shape", cause=error)
+
+    def _validate_view_manifest(self, state: FormalState) -> None:
+        manifest = state.view_manifest
+        if manifest is None:
+            return
+        if manifest.graph_revision != state.graph.graph_revision:
+            self._raise_corrupt("View manifest revision does not match graph revision")
+        expected = {entry["relative_path"] for entry in manifest.files}
+        if len(expected) != len(manifest.files):
+            self._raise_corrupt("View manifest has duplicate paths")
+        self._verify_view_bytes(
+            {
+                str(entry["relative_path"]): b""
+                for entry in manifest.files
+            },
+            "Managed view bytes do not match view manifest",
+            expected_digests={
+                str(entry["relative_path"]): str(entry["content_digest"])
+                for entry in manifest.files
+            },
+        )
+
+    def _validate_rendered_view_manifest(
+        self, manifest: ViewManifest, views: Mapping[str, bytes]
+    ) -> None:
+        expected = {
+            str(entry["relative_path"]): str(entry["content_digest"])
+            for entry in manifest.files
+        }
+        actual = {relative: _view_digest(payload) for relative, payload in views.items()}
+        if manifest.schema_version != SCHEMA_VERSION or expected != actual:
+            self._raise_corrupt("Rendered views do not match the supplied view manifest")
+
+    def _verify_view_bytes(
+        self,
+        expected_views: Mapping[str, bytes],
+        message: str,
+        *,
+        expected_digests: Mapping[str, str] | None = None,
+    ) -> None:
+        actual_paths = set(self._managed_view_paths())
+        expected_paths = set(expected_views)
+        if actual_paths != expected_paths:
+            self._raise_corrupt(message)
+        for relative in sorted(expected_paths):
+            path = self._root / relative
+            if path.is_symlink() or not path.is_file():
+                self._raise_corrupt(message)
+            try:
+                payload = path.read_bytes()
+            except OSError as error:
+                self._raise_corrupt(message, cause=error)
+            expected_digest = (
+                expected_digests[relative]
+                if expected_digests is not None
+                else _view_digest(expected_views[relative])
+            )
+            if _view_digest(payload) != expected_digest:
+                self._raise_corrupt(message)
+
+    def _managed_view_paths(self) -> tuple[str, ...]:
+        paths = ["views/TREE.md"]
+        for directory in ("responsibilities", "behaviors", "capabilities"):
+            view_directory = self._root / "views" / directory
+            if not view_directory.is_dir() or view_directory.is_symlink():
+                self._raise_corrupt("Managed view directory is invalid")
+            paths.extend(
+                f"views/{directory}/{path.name}"
+                for path in view_directory.iterdir()
+                if path.suffix == ".md"
+            )
+            if any(path.is_symlink() or not path.is_file() for path in view_directory.iterdir()):
+                self._raise_corrupt("Managed view directory contains an invalid entry")
+        return tuple(sorted(paths))
 
     def _backup_existing(self, backup_root: Path, relative: str) -> bool:
         source = _checked_relative(self._root, relative)
@@ -982,6 +1103,59 @@ def _source_baseline_from_json(data: Mapping[str, object]) -> SourceBaseline:
         repository_source_digest=_optional_string(data, "repository_source_digest"),
         files=_object_tuple(data, "files"),
     )
+
+
+def view_manifest_for(
+    graph_revision: int, views: Mapping[str, bytes]
+) -> ViewManifest:
+    """Create the canonical manifest that exactly covers rendered views."""
+    if type(graph_revision) is not int or graph_revision < 0:
+        raise ValueError("View manifest graph revision must be a non-negative integer")
+    entries: list[JsonObject] = []
+    for relative, payload in sorted(views.items()):
+        entries.append(
+            {
+                "relative_path": relative,
+                "content_digest": _view_digest(payload),
+            }
+        )
+    files = tuple(entries)
+    if not files or any(not relative.startswith("views/") for relative in views):
+        raise ValueError("View manifest requires only managed view paths")
+    return ViewManifest(SCHEMA_VERSION, graph_revision, files)
+
+
+def _view_manifest_to_json(manifest: ViewManifest) -> dict[str, object]:
+    return {
+        "schema_version": manifest.schema_version,
+        "graph_revision": manifest.graph_revision,
+        "files": list(manifest.files),
+    }
+
+
+def _view_manifest_from_json(data: Mapping[str, object]) -> ViewManifest:
+    files = _object_tuple(data, "files")
+    for entry in files:
+        if set(entry) != _VIEW_MANIFEST_FILE_FIELDS:
+            raise ValueError("View manifest file entry has unexpected fields")
+        relative = entry.get("relative_path")
+        digest = entry.get("content_digest")
+        if (
+            not isinstance(relative, str)
+            or not relative.startswith("views/")
+            or not _is_repository_pattern(relative)
+            or not _is_digest(digest)
+        ):
+            raise ValueError("View manifest file entry is invalid")
+    return ViewManifest(
+        schema_version=_integer(data, "schema_version"),
+        graph_revision=_integer(data, "graph_revision"),
+        files=files,
+    )
+
+
+def _view_digest(payload: bytes) -> str:
+    return f"sha256:{sha256(payload).hexdigest()}"
 
 
 def _integer(data: Mapping[str, object], key: str) -> int:
