@@ -1,0 +1,23 @@
+{
+  "anchors": {
+    "behavior.import-records": "src/m1a_fixture/ingestion/service.py:import_records",
+    "behavior.render-report": "src/m1a_fixture/reporting/service.py:render_report",
+    "capability.record-validation": "src/m1a_fixture/validation/rules.py:validate_record",
+    "responsibility.ingestion": "src/m1a_fixture/ingestion/service.py:import_records",
+    "responsibility.reporting": "src/m1a_fixture/reporting/service.py:render_report"
+  },
+  "behaviors": [
+    "behavior.import-records",
+    "behavior.render-report"
+  ],
+  "flows": [
+    "behavior.import-records"
+  ],
+  "responsibilities": [
+    "responsibility.ingestion",
+    "responsibility.reporting"
+  ],
+  "shared_capabilities": [
+    "capability.record-validation"
+  ]
+}
