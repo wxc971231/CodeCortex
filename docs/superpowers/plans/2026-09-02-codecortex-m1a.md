@@ -366,7 +366,7 @@ def test_source_change_after_parse_retries_before_commit(sync_with_parse_barrier
     assert result.repository_source_digest == sync_with_parse_barrier.current_digest()
 ```
 
-- [ ] **Step 2: Run tests and confirm missing sync service**
+- [x] **Step 2: Run tests and confirm missing sync service**
 
 Run: `pytest tests/integration/test_fact_sync.py tests/integration/test_cache_replacement.py -q`
 
@@ -411,7 +411,7 @@ git commit -m "feat: synchronize repository facts"
 - Produces: `Responsibility`, `Behavior`, `Capability`, `CognitiveEdge`, `LogicalFlow`, `FlowStep`, `ImplementationMapping`, `Evidence`
 - Produces: `validate_cognitive_graph(graph: CognitiveGraph) -> tuple[GraphViolation, ...]`
 
-- [ ] **Step 1: Write failing graph-invariant tests**
+- [x] **Step 1: Write failing graph-invariant tests**
 
 ```python
 def test_behavior_requires_exactly_one_responsibility_parent(valid_graph):
@@ -424,13 +424,13 @@ def test_unmaterialized_flow_has_no_steps(valid_behavior):
     assert violation_codes(invalid) == {"UNMATERIALIZED_FLOW_HAS_STEPS"}
 ```
 
-- [ ] **Step 2: Run graph tests and confirm missing schema**
+- [x] **Step 2: Run graph tests and confirm missing schema**
 
 Run: `pytest tests/unit/domain/test_graph_constraints.py -q`
 
 Expected: collection fails because full graph types are absent.
 
-- [ ] **Step 3: Implement all node, edge, flow, mapping, evidence, epistemic, and provenance rules**
+- [x] **Step 3: Implement all node, edge, flow, mapping, evidence, epistemic, and provenance rules**
 
 Allow only Responsibility/Behavior/Capability nodes and the specified edge matrix; require one Responsibility parent per Behavior; prohibit hierarchy cycles; validate Flow ordering and materialization states; constrain Mapping target kinds and confidence; require evidence for inferred/uncertain relations; validate repository-relative source locations; require `approval_event_id` on formal semantic objects; keep `intent` nullable and `epistemic_status` independent from approval.
 
@@ -444,13 +444,13 @@ if (source.kind, edge.edge_type, target.kind) not in ALLOWED_EDGES:
     violations.append(GraphViolation("EDGE_KIND_NOT_ALLOWED", edge.edge_id))
 ```
 
-- [ ] **Step 4: Run allowed/forbidden graph matrix**
+- [x] **Step 4: Run allowed/forbidden graph matrix**
 
 Run: `pytest tests/unit/domain/test_graph_constraints.py -q`
 
 Expected: every allowed edge passes; every forbidden edge, cycle, dangling target, duplicate ID/alias, invalid Flow, invalid Mapping, and wrong approval namespace fails with one stable violation code.
 
-- [ ] **Step 5: Commit graph domain**
+- [x] **Step 5: Commit graph domain**
 
 ```bash
 git add src/codecortex/domain/graph.py src/codecortex/domain/cognition.py tests/unit/domain/test_graph_constraints.py
@@ -727,7 +727,7 @@ git commit -m "feat: apply repository cognition with source baseline"
 - Produces deterministic `TREE.md` and per-kind node pages
 - Extends: `inspect_node(node_id: str) -> NodeInspection`
 
-- [ ] **Step 1: Write failing golden-output and moved-source tests**
+- [x] **Step 1: Write failing golden-output and moved-source tests**
 
 ```python
 def test_tree_view_matches_golden(valid_graph, golden):
@@ -742,13 +742,13 @@ def test_inspect_resolves_current_location_after_entity_move(inspect_fixture):
     assert result.mappings[0].resolution_status == "resolved"
 ```
 
-- [ ] **Step 2: Run tests and confirm rendering/query gaps**
+- [x] **Step 2: Run tests and confirm rendering/query gaps**
 
 Run: `pytest tests/unit/rendering/test_markdown.py tests/integration/test_inspect_node.py -q`
 
 Expected: golden views or current-source fields fail.
 
-- [ ] **Step 3: Implement deterministic projection and UID-first resolution**
+- [x] **Step 3: Implement deterministic projection and UID-first resolution**
 
 Render sorted Responsibility→Behavior hierarchy, shared Capability links, summary/intent/observed/epistemic status, Flow, mappings, evidence, approval event, and repository-relative source links. `inspect_node` loads formal graph, resolves entity UID against current facts, falls back to address/fingerprint, preserves last known location when unresolved, and returns stale status rather than rewriting formal mapping. Create and validate the formal `view_manifest.json` alongside every M1a apply; for a legacy M0 state, verify the old generated views before the first approved migration rather than silently overwriting hand edits.
 
@@ -760,13 +760,13 @@ def resolve_mapping(mapping: ImplementationMapping, facts: FactsDatabase, refs: 
     return ResolvedMapping.from_current_or_last_known(mapping, current, refs[mapping.entity_uid])
 ```
 
-- [ ] **Step 4: Run golden, portability, and unresolved tests**
+- [x] **Step 4: Run golden, portability, and unresolved tests**
 
 Run: `pytest tests/unit/rendering/test_markdown.py tests/integration/test_inspect_node.py -q`
 
 Expected: repeated rendering is byte-identical; no absolute path appears; moved entity resolves; ambiguous/missing entity is reported without deleting cognition.
 
-- [ ] **Step 5: Commit rendering and inspection**
+- [x] **Step 5: Commit rendering and inspection**
 
 ```bash
 git add src/codecortex/infrastructure/rendering src/codecortex/infrastructure/views.py src/codecortex/application/query.py tests
@@ -787,7 +787,7 @@ git commit -m "feat: render and inspect cognitive views"
 - Produces Skill flows `$codecortex init`, `inspect`, `reinitialize`
 - Consumes Analyzer dispatch from Codex, not from Core
 
-- [ ] **Step 1: Write fixture-grounded acceptance assertions**
+- [x] **Step 1: Write fixture-grounded acceptance assertions**
 
 ```python
 @pytest.mark.codex_e2e
@@ -800,7 +800,7 @@ def test_real_init_creates_grounded_graph(codex_m1a_harness):
     assert result.source_line_contains(mapping, "def import_records")
 ```
 
-- [ ] **Step 2: Run without model access and confirm explicit skip; run deterministic fixture gate**
+- [x] **Step 2: Run without model access and confirm explicit skip; run deterministic fixture gate**
 
 Run:
 
@@ -811,7 +811,7 @@ pytest tests/unit tests/integration -q
 
 Expected: real Codex test skips only when access is absent; deterministic tests pass.
 
-- [ ] **Step 3: Implement Skill orchestration and the semantic fixture**
+- [x] **Step 3: Implement Skill orchestration and the semantic fixture**
 
 Skill must run Fact Sync, request analysis scope, force Analyzer for init/reinitialize, validate the returned report, create one aggregate Proposal, display Big Picture/diff/uncertainties, discuss revisions, and call apply only after explicit approval. Reinitialize reads existing intent/history and displays add/delete/move/merge/split/conflict without clearing old graph. Build a 20–50 Python-file fixture whose expected responsibilities, behaviors, shared capability, flows, and source anchors are human-authored in the test oracle. Also run fact indexing and bounded-query performance against one frozen real 100–500 Python-file repository; record its origin, commit, file count, timings, peak database size, and acceptance result in `M1A_ACCEPTANCE.md` rather than silently substituting the small fixture.
 
@@ -821,7 +821,7 @@ fact_sync -> analysis_scope -> spawn_analyzer -> validate_report
           -> require_current_patch_approval -> atomic_apply
 ```
 
-- [ ] **Step 4: Run the complete M1a gate**
+- [x] **Step 4: Run the complete M1a gate**
 
 Run:
 
@@ -836,7 +836,7 @@ git status --short
 
 Expected: all deterministic checks pass; configured Child Codex produces one bounded AnalysisReport and one approved revision; source links resolve; reinitialize preserves user-confirmed intent; worktree is clean.
 
-- [ ] **Step 5: Commit M1a acceptance**
+- [x] **Step 5: Commit M1a acceptance**
 
 ```bash
 git add src/codecortex/application/initialize.py src/codecortex/integrations/codex/resources/SKILL.md tests/fixtures/m1a_repo tests/e2e/test_codex_m1a.py scripts/run_m1a_acceptance.py docs/testing/M1A_ACCEPTANCE.md
