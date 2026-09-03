@@ -221,7 +221,7 @@ git commit -m "feat: parse Python code entities"
 - Produces: `query_entities(scope: FactScope, cursor: str | None, limit: int) -> Page[CodeEntity]`
 - Produces: `query_relations(entity_uids: Sequence[str], relation_types: Sequence[str], limit: int) -> Page[CodeRelation]`
 
-- [ ] **Step 1: Write failing schema and query-plan tests**
+- [x] **Step 1: Write failing schema and query-plan tests**
 
 ```python
 def test_schema_has_foreign_keys_and_required_indexes(facts_db):
@@ -237,13 +237,13 @@ def test_entity_query_is_bounded(facts_db_with_200_entities):
     assert page.truncated is True
 ```
 
-- [ ] **Step 2: Run tests and confirm schema is absent**
+- [x] **Step 2: Run tests and confirm schema is absent**
 
 Run: `pytest tests/unit/persistence/test_facts_schema.py tests/integration/test_facts_queries.py -q`
 
 Expected: collection fails on missing `FactsDatabase`.
 
-- [ ] **Step 3: Implement the exact M1a DDL and connection policy**
+- [x] **Step 3: Implement the exact M1a DDL and connection policy**
 
 Create `cache_metadata`, `source_files`, `entities` with self-parent `ON DELETE CASCADE`, `relations`, `relation_evidence`, `diagnostics`, and `baseline_entity_snapshots`, including every index listed in M1a sections 5–6. Enforce `foreign_keys=ON`, WAL, busy timeout, parameter binding, allowlisted sort/relation values, analyzer URI `mode=ro`, and cursor-based stable ordering. Store `baseline_entity_snapshot_completeness` in metadata.
 
@@ -255,13 +255,13 @@ def open_read(self) -> sqlite3.Connection:
     return connection
 ```
 
-- [ ] **Step 4: Run schema, foreign-key, pagination, and N+1 tests**
+- [x] **Step 4: Run schema, foreign-key, pagination, and N+1 tests**
 
 Run: `pytest tests/unit/persistence/test_facts_schema.py tests/integration/test_facts_queries.py -q`
 
 Expected: `foreign_key_check` is empty; deleting a file removes descendants/relations; query-count assertions remain constant as result size grows; limit above configured maximum is rejected.
 
-- [ ] **Step 5: Commit fact persistence**
+- [x] **Step 5: Commit fact persistence**
 
 ```bash
 git add src/codecortex/infrastructure/persistence/facts_db.py tests/unit/persistence tests/integration/test_facts_queries.py
