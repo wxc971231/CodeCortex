@@ -325,13 +325,7 @@ class ProposalService:
             self._formal_store.recover()
             state = self._formal_store.load()
             if state.view_manifest is None:
-                self._formal_store.verify_legacy_views(
-                    render_legacy_views(state.graph),
-                    # An M0 edit made by this in-development Core already uses
-                    # the M1a renderer.  It is still accepted only when bytes
-                    # exactly match the graph; arbitrary hand edits are not.
-                    self._view_renderer(state.graph),
-                )
+                self._formal_store.verify_legacy_views(render_legacy_views(state.graph))
             proposal = self._pending.load(proposal_id)
             proposal.verify_approval(approval)
             proposal.verify_base_graph_revision(state.graph.graph_revision)

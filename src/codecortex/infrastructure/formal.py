@@ -572,20 +572,11 @@ class FormalStore:
                 )
         return sorted(managed - rendered)
 
-    def verify_legacy_views(
-        self,
-        expected_views: Mapping[str, bytes],
-        alternate_views: Mapping[str, bytes] | None = None,
-    ) -> None:
+    def verify_legacy_views(self, expected_views: Mapping[str, bytes]) -> None:
         """Ensure an M0 state was not hand-edited before M1a takes ownership."""
         if (self._root / "view_manifest.json").exists():
             return
-        try:
-            self._verify_view_bytes(expected_views, "Legacy M0 views differ from graph")
-        except CodeCortexError:
-            if alternate_views is None:
-                raise
-            self._verify_view_bytes(alternate_views, "Legacy M0 views differ from graph")
+        self._verify_view_bytes(expected_views, "Legacy M0 views differ from graph")
 
     def _load_view_manifest(self) -> ViewManifest | None:
         path = self._root / "view_manifest.json"
@@ -610,6 +601,9 @@ class FormalStore:
         expected = {entry["relative_path"] for entry in manifest.files}
         if len(expected) != len(manifest.files):
             self._raise_corrupt("View manifest has duplicate paths")
+        paths = tuple(str(entry["relative_path"]) for entry in manifest.files)
+        if paths != tuple(sorted(paths)):
+            self._raise_corrupt("View manifest paths are not sorted")
         self._verify_view_bytes(
             {
                 str(entry["relative_path"]): b""

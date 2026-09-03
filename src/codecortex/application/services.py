@@ -22,6 +22,7 @@ from codecortex.application.ports import (
 from codecortex.application.query import (
     AnalysisScopeResult,
     EntityContextResult,
+    NodeInspection,
     QueryService,
     RepositoryFactsPage,
     SearchPage,
@@ -210,6 +211,20 @@ class ApplicationServices:
             query,
             kinds,
             limit,
+            expected_source_digest=expected_source_digest,
+            expected_graph_revision=expected_graph_revision,
+        )
+
+    def inspect_node(
+        self,
+        node_id: str,
+        *,
+        expected_source_digest: str | None = None,
+        expected_graph_revision: int | None = None,
+    ) -> NodeInspection:
+        """Return one M1a node inspection with current-source projections."""
+        return self._query().inspect_node(
+            node_id,
             expected_source_digest=expected_source_digest,
             expected_graph_revision=expected_graph_revision,
         )

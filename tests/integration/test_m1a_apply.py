@@ -33,7 +33,7 @@ from codecortex.infrastructure.python.digest import (
 )
 from codecortex.infrastructure.python.discovery import discover_python_source_set
 from codecortex.infrastructure.repository import Repository
-from codecortex.infrastructure.views import render_views
+from codecortex.infrastructure.views import render_legacy_views, render_views
 from tests.conftest import analysis_report_bytes, analysis_report_dict, analysis_ulid
 
 APPROVED_AT = "2026-09-03T02:00:00Z"
@@ -117,13 +117,13 @@ class M1aHarness:
             )
         )
 
-    def m0_services(self) -> ApplicationServices:
+    def m0_services(self, *, legacy_renderer: bool = False) -> ApplicationServices:
         return ApplicationServices(
             repository=self.repository,
             formal_store=self.formal_store,
             repository_lock=self.lock,
             pending_proposals=self.pending,
-            view_renderer=render_views,
+            view_renderer=render_legacy_views if legacy_renderer else render_views,
         )
 
     def _entity_ref_records(self) -> tuple[EntityRefRecord, ...]:
@@ -425,6 +425,54 @@ def test_later_manual_apply_advances_existing_view_manifest(
     assert manifest["graph_revision"] == 2
 
 
+def test_m1a_rejects_pre_migration_views_not_rendered_by_m0(
+    harness: M1aHarness,
+) -> None:
+    current_renderer_m0 = harness.m0_services()
+    legacy = current_renderer_m0.create_cognitive_proposal(
+        operations=(
+            PatchOperation(
+                "add_node",
+                "capability.manual-note",
+                {
+                    "id": "capability.manual-note",
+                    "kind": "capability",
+                    "title": "Hand-reviewed note",
+                },
+            ),
+        ),
+        affected_nodes=("capability.manual-note",),
+        reason="manual note rendered by the current renderer",
+    )
+    current_renderer_m0.apply_cognitive_proposal(
+        legacy.proposal_id, approval_for(legacy)
+    )
+    proposal = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        harness.service.apply_cognitive_proposal(
+            proposal.proposal_id, approval_for(proposal)
+        )
+    assert excinfo.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
+def test_view_manifest_rejects_unsorted_paths(harness: M1aHarness, repo_root: Path) -> None:
+    proposal = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+    harness.service.apply_cognitive_proposal(proposal.proposal_id, approval_for(proposal))
+    path = repo_root / ".codecortex/view_manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["files"] = list(reversed(manifest["files"]))
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        harness.formal_store.load()
+    assert excinfo.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+
+
 def test_any_source_change_makes_the_proposal_stale(
     harness: M1aHarness, repo_root: Path
 ) -> None:
@@ -491,7 +539,7 @@ def test_base_revision_conflict_blocks_the_apply(harness: M1aHarness) -> None:
 
 
 def test_m0_approved_nodes_survive_initialization(harness: M1aHarness) -> None:
-    m0 = harness.m0_services()
+    m0 = harness.m0_services(legacy_renderer=True)
     legacy = m0.create_cognitive_proposal(
         operations=(
             PatchOperation(

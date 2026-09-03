@@ -104,6 +104,12 @@ class InspectNodeOutput(_Dto):
     node: dict[str, Any]
     relations: list[dict[str, Any]]
     approval_event_id: str | None
+    graph_revision: int | None = None
+    repository_source_digest: str | None = None
+    flow: dict[str, Any] | None = None
+    mappings: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    truncated: bool = False
 
 
 class HistoryEventOutput(_Dto):
@@ -143,7 +149,36 @@ def cognitive_graph(services: ApplicationServices) -> CognitiveGraphOutput:
 
 
 def inspect_node(services: ApplicationServices, node_id: str) -> InspectNodeOutput:
-    """Return one node, its directly attached edges, and approval provenance."""
+    """Return M1a source-resolved inspection, retaining M0 compatibility."""
+    if (
+        services.query_service is not None
+        and services.repository_overview().cognition_initialized
+    ):
+        inspection = services.inspect_node(node_id)
+        approval_event_id = _approval_event_id(inspection.node)
+        return InspectNodeOutput(
+            graph_revision=inspection.coordinate.graph_revision,
+            repository_source_digest=inspection.coordinate.repository_source_digest,
+            node=dict(inspection.node),
+            relations=[dict(item) for item in inspection.relations],
+            approval_event_id=approval_event_id,
+            flow=None if inspection.flow is None else dict(inspection.flow),
+            mappings=[
+                {
+                    **dict(mapping.mapping),
+                    "resolution_status": mapping.resolution_status,
+                    "current_location": (
+                        None
+                        if mapping.current_location is None
+                        else asdict(mapping.current_location)
+                    ),
+                    "last_known_location": asdict(mapping.last_known_location),
+                }
+                for mapping in inspection.mappings
+            ],
+            evidence=[dict(item) for item in inspection.evidence],
+            truncated=inspection.truncated,
+        )
     graph = services.cognitive_graph()
     node = next((item for item in graph.nodes if item.get("id") == node_id), None)
     if node is None:
@@ -157,15 +192,19 @@ def inspect_node(services: ApplicationServices, node_id: str) -> InspectNodeOutp
         for edge in graph.semantic_edges
         if node_id in _edge_endpoints(edge)
     ]
+    approval_event_id = _approval_event_id(node)
+    return InspectNodeOutput(
+        node=dict(node), relations=relations, approval_event_id=approval_event_id
+    )
+
+
+def _approval_event_id(node: Mapping[str, object]) -> str | None:
     approval = node.get("approval")
-    approval_event_id = (
+    return (
         approval.get("approval_event_id")
         if isinstance(approval, Mapping)
         and isinstance(approval.get("approval_event_id"), str)
         else None
-    )
-    return InspectNodeOutput(
-        node=dict(node), relations=relations, approval_event_id=approval_event_id
     )
 
 

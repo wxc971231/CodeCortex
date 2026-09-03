@@ -5,12 +5,20 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codecortex.application.fact_sync import FactSyncService
-from codecortex.application.query import QueryService
+from codecortex.application.query import (
+    CacheCoordinate,
+    CurrentSourceLocation,
+    NodeInspection,
+    QueryService,
+    ResolvedMapping,
+)
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.proposals import ApprovalRecord, PatchOperation
 from codecortex.infrastructure.formal import FormalStore
@@ -24,6 +32,7 @@ from codecortex.interfaces.mcp.server import build_server
 from tests.conftest import build_discussion_graph
 
 M1A_READ_TOOLS = {
+    "inspect_node",
     "repository_facts",
     "analysis_scope",
     "resolve_entity_context",
@@ -156,6 +165,57 @@ async def test_analyzer_cannot_call_sync_tool(m1a_repo) -> None:
     analyzer = build_server("analyzer", m1a_repo)
     with pytest.raises(ToolError, match="Unknown tool"):
         await analyzer.call_tool("sync_repository_facts", {"mode": "auto"})
+
+
+@pytest.mark.anyio
+async def test_inspect_node_tool_uses_m1a_query_projection(m1a_repo) -> None:
+    inspection = NodeInspection(
+        coordinate=CacheCoordinate("sha256:" + "a" * 64, 1),
+        node={"id": "behavior.answer-question", "kind": "behavior"},
+        relations=(),
+        flow=None,
+        mappings=(
+            ResolvedMapping(
+                mapping={"id": "map_01", "entity_uid": "ent_01"},
+                resolution_status="resolved",
+                current_location=CurrentSourceLocation(
+                    relative_path="pkg/new.py",
+                    address="pkg.new:answer",
+                    start_line=10,
+                    end_line=12,
+                    signature="() -> str",
+                ),
+                last_known_location=CurrentSourceLocation(
+                    relative_path="pkg/old.py",
+                    address="pkg.old:answer",
+                    start_line=None,
+                    end_line=None,
+                    signature="() -> str",
+                ),
+            ),
+        ),
+        evidence=(),
+    )
+    overview = SimpleNamespace(cognition_initialized=True)
+    with (
+        patch.object(m1a_repo, "repository_overview", return_value=overview),
+        patch.object(m1a_repo, "inspect_node", return_value=inspection),
+    ):
+        server = build_server("analyzer", m1a_repo)
+        result = await server.call_tool(
+            "inspect_node", {"node_id": "behavior.answer-question"}
+        )
+
+    assert result.is_error is False
+    payload = result.structured_content
+    assert payload["graph_revision"] == 1
+    assert payload["repository_source_digest"].startswith("sha256:")
+    assert payload["node"]["id"] == "behavior.answer-question"
+    assert "mappings" in payload
+    assert "flow" in payload
+    assert "evidence" in payload
+    assert payload["mappings"][0]["current_location"]["relative_path"] == "pkg/new.py"
+    assert payload["mappings"][0]["last_known_location"]["relative_path"] == "pkg/old.py"
 
 
 @pytest.mark.anyio
