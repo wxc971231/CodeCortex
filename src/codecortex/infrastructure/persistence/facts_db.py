@@ -276,6 +276,61 @@ class FactsDatabase:
             ).fetchall()
         return {row["relative_path"]: row["content_digest"] for row in rows}
 
+    def replace_baseline_entity_snapshots(self, baseline_source_digest: str) -> None:
+        """Copy every current entity into the baseline snapshot table.
+
+        The whole replacement is one write transaction and the completeness
+        flag in cache metadata flips to ``complete`` only after the copy, so
+        readers never observe a partial baseline snapshot set.
+        """
+        if (
+            not isinstance(baseline_source_digest, str)
+            or not baseline_source_digest.startswith("sha256:")
+            or len(baseline_source_digest) != 71
+        ):
+            raise ValueError("Baseline source digest must be SHA-256")
+        with self.open_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM baseline_entity_snapshots")
+            connection.execute(
+                "INSERT INTO baseline_entity_snapshots "
+                "(uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature) "
+                "SELECT e.uid, ?, sf.relative_path, e.address, e.module_name, "
+                "e.qualname, e.kind, e.fingerprint, e.signature "
+                "FROM entities AS e JOIN source_files AS sf "
+                "ON sf.file_id = e.file_id ORDER BY e.uid",
+                (baseline_source_digest,),
+            )
+            cursor = connection.execute(
+                "UPDATE cache_metadata "
+                "SET baseline_entity_snapshot_completeness = 'complete' "
+                "WHERE singleton_id = 1"
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Fact cache metadata is missing")
+
+    def advance_graph_revision(self, graph_revision: int) -> None:
+        """Point the unchanged fact cache at a newly committed graph revision.
+
+        A cognitive apply changes no source fact, so only the visibility
+        pointer moves; guarded readers keep seeing one consistent snapshot.
+        """
+        if (
+            type(graph_revision) is not int
+            or isinstance(graph_revision, bool)
+            or graph_revision < 0
+        ):
+            raise ValueError("Graph revision must be a non-negative integer")
+        with self.open_write() as connection:
+            cursor = connection.execute(
+                "UPDATE cache_metadata SET graph_revision = ? "
+                "WHERE singleton_id = 1",
+                (graph_revision,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Fact cache metadata is missing")
+
     def identity_hints(
         self, relative_paths: Sequence[str]
     ) -> tuple[EntityIdentityHint, ...]:

@@ -73,7 +73,7 @@ class ProposalStatus(StrEnum):
 
 
 class PatchOperationKind(StrEnum):
-    """The complete M0 patch operation set."""
+    """The complete M1a patch operation set addressed by stable object IDs."""
 
     ADD_NODE = "add_node"
     UPDATE_NODE = "update_node"
@@ -81,6 +81,10 @@ class PatchOperationKind(StrEnum):
     ADD_EDGE = "add_edge"
     UPDATE_EDGE = "update_edge"
     REMOVE_EDGE = "remove_edge"
+    SET_LOGICAL_FLOW = "set_logical_flow"
+    ADD_MAPPING = "add_mapping"
+    UPDATE_MAPPING = "update_mapping"
+    REMOVE_MAPPING = "remove_mapping"
 
 
 @dataclass(frozen=True)
@@ -99,23 +103,37 @@ class PatchOperation:
         object.__setattr__(self, "kind", kind)
 
         is_node = kind.value.endswith("_node")
+        is_mapping = kind.value.endswith("_mapping")
+        is_flow = kind is PatchOperationKind.SET_LOGICAL_FLOW
         is_remove = kind.value.startswith("remove_")
-        if is_node:
+        if is_node or is_flow:
             _validate_semantic_node_id(self.target_id)
+            if is_flow and not self.target_id.startswith("behavior."):
+                raise _invalid_proposal(
+                    "Logical flow operations must target a behavior node"
+                )
         else:
             if not isinstance(self.target_id, str):
                 raise CodeCortexError(
-                    ErrorCode.INVALID_ID, "Edge ID has an invalid namespace"
+                    ErrorCode.INVALID_ID, "Target ID has an invalid namespace"
                 )
-            validate_id(self.target_id, IdPrefix.EDGE)
+            validate_id(
+                self.target_id, IdPrefix.MAPPING if is_mapping else IdPrefix.EDGE
+            )
 
         if is_remove:
             if self.value is not None:
                 raise _invalid_proposal("Remove operations cannot contain a value")
             return
+        if self.value is None and is_flow:
+            # A null set_logical_flow value deletes the behavior's flow.
+            return
         if not isinstance(self.value, Mapping):
-            raise _invalid_proposal("Add and update operations require an object value")
-        if self.value.get("id") != self.target_id:
+            raise _invalid_proposal(
+                "Add, update, and set operations require an object value"
+            )
+        identity_key = "behavior_id" if is_flow else "id"
+        if self.value.get(identity_key) != self.target_id:
             raise _invalid_proposal("Patch value ID must match its target ID")
         if is_node:
             kind_value = self.value.get("kind")

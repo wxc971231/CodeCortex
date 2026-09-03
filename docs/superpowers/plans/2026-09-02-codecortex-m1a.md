@@ -660,7 +660,7 @@ git commit -m "feat: validate bounded analyzer reports"
 - Produces: `create_proposal_from_analysis(report: AnalysisReport, reason: str) -> Proposal`
 - Produces: formal `source_baseline.json` and rebuilt `entity_refs.json`
 
-- [ ] **Step 1: Write failing full-apply and source-stale tests**
+- [x] **Step 1: Write failing full-apply and source-stale tests**
 
 ```python
 def test_approved_initialization_advances_all_formal_state(m1a_app, approved_initial_report):
@@ -681,13 +681,13 @@ def test_any_source_change_makes_proposal_stale(m1a_app, proposal):
     assert exc.value.code is ErrorCode.PROPOSAL_STALE
 ```
 
-- [ ] **Step 2: Run tests and confirm M0 Patch/apply is insufficient**
+- [x] **Step 2: Run tests and confirm M0 Patch/apply is insufficient**
 
 Run: `pytest tests/unit/application/test_graph_patch.py tests/integration/test_m1a_apply.py -q`
 
 Expected: new operations or baseline/entity-ref assertions fail.
 
-- [ ] **Step 3: Implement complete Patch validation and formal baseline advance**
+- [x] **Step 3: Implement complete Patch validation and formal baseline advance**
 
 Convert the report to stable-ID operations, but keep it pending until approval. Apply only when graph revision and full current repository digest equal Proposal preconditions; validate every entity fingerprint/address; recompute entity refs from all formal mappings/evidence; set `cognition_initialized=true`; generate sorted source baseline from current fact digests; write self-contained applied Event and all formal files in the M0 transaction; then refresh graph replica and copy current entities into `baseline_entity_snapshots` with completeness `complete`. If cache refresh fails after formal commit, return success with rebuild-required warning.
 
@@ -701,13 +701,13 @@ new_manifest = old_manifest.advance_graph(
 formal_store.commit(new_manifest, new_graph, entity_refs, source_baseline, event, views)
 ```
 
-- [ ] **Step 4: Run operation, stale, transaction, and cache-refresh tests**
+- [x] **Step 4: Run operation, stale, transaction, and cache-refresh tests**
 
 Run: `pytest tests/unit/application/test_graph_patch.py tests/integration/test_m1a_apply.py tests/integration/test_transaction_recovery.py -q`
 
 Expected: every operation validates before mutation; unapproved or stale apply writes nothing; formal transaction cannot split graph/baseline/history; cache failure leaves recoverable formal truth.
 
-- [ ] **Step 5: Commit full graph apply**
+- [x] **Step 5: Commit full graph apply**
 
 ```bash
 git add src/codecortex/application/proposals.py src/codecortex/domain/proposals.py src/codecortex/infrastructure tests
