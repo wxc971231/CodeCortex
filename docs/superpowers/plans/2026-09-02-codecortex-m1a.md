@@ -528,7 +528,7 @@ git commit -m "feat: index cognition for bounded queries"
 - Produces: `repository_facts`, `analysis_scope`, `resolve_entity_context`, `get_discussion_context`, `search_cognitive_graph`
 - Adds Main-only: `sync_repository_facts(mode: Literal["auto", "full"])`
 
-- [ ] **Step 1: Write failing exact-profile and bounded-response tests**
+- [x] **Step 1: Write failing exact-profile and bounded-response tests**
 
 ```python
 @pytest.mark.anyio
@@ -545,13 +545,13 @@ def test_discussion_context_reports_truncation(query_service):
     assert result.truncated is True
 ```
 
-- [ ] **Step 2: Run tests and confirm missing tools**
+- [x] **Step 2: Run tests and confirm missing tools**
 
 Run: `pytest tests/unit/application/test_query_service.py tests/integration/test_m1a_mcp_tools.py -q`
 
 Expected: tool-list and service-method assertions fail.
 
-- [ ] **Step 3: Implement query orchestration and explicit DTO versions**
+- [x] **Step 3: Implement query orchestration and explicit DTO versions**
 
 Every request validates scope/limit, verifies cache source digest and graph revision, then performs batch queries. `analysis_scope` partitions by package/module and reports diagnostics; `resolve_entity_context` accepts exactly one anchor form; discussion context returns nodes, flows, mappings, current entity locations, evidence, and truncation metadata. Add static MCP registrations without widening Analyzer writes.
 
@@ -564,13 +564,13 @@ def get_discussion_context(self, request: ContextRequest) -> DiscussionContext:
     return DiscussionContext.from_bounded(nodes, entities, evidence)
 ```
 
-- [ ] **Step 4: Run application and protocol tests**
+- [x] **Step 4: Run application and protocol tests**
 
 Run: `pytest tests/unit/application/test_query_service.py tests/integration/test_m1a_mcp_tools.py -q`
 
 Expected: invalid anchors/limits fail, cache mismatch never returns mixed facts, and both profiles return schema-versioned bounded payloads.
 
-- [ ] **Step 5: Commit M1a read APIs**
+- [x] **Step 5: Commit M1a read APIs**
 
 ```bash
 git add src/codecortex/application/query.py src/codecortex/interfaces/mcp/tools.py tests
