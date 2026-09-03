@@ -268,6 +268,14 @@ def _validate_nodes(
     alias_owner: dict[str, str] = {}
     for index, node in enumerate(graph.nodes):
         location = f"nodes[{index}]"
+        if not isinstance(node, (Responsibility, Behavior, Capability)):
+            _violation(
+                violations,
+                "INVALID_NODE_KIND",
+                location,
+                "M1a permits only responsibility, behavior, and capability nodes",
+            )
+            continue
         expected_prefix = f"{node.kind.value}."
         if not _valid_semantic_id(node.id, expected_prefix):
             _violation(
@@ -740,7 +748,17 @@ def _validate_evidence(
                 f"{item_location}.entity_uid",
                 "evidence entity UID must exist in formal entity refs",
             )
-        if item.relative_path is not None and not _valid_relative_path(
+        if (
+            item.kind in {"code_entity", "repository_document"}
+            and item.relative_path is None
+        ):
+            _violation(
+                violations,
+                "MISSING_EVIDENCE_LOCATION",
+                f"{item_location}.relative_path",
+                "formal evidence requires a repository-relative source location",
+            )
+        elif item.relative_path is not None and not _valid_relative_path(
             item.relative_path
         ):
             _violation(
