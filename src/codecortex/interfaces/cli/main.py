@@ -22,6 +22,10 @@ from codecortex.application.initialize import InitializationService
 from codecortex.application.ports import RepositoryContextPort
 from codecortex.application.proposals import ManagedSourceSnapshot, ProposalService
 from codecortex.application.query import QueryService
+from codecortex.application.replica_providers import (
+    formal_entity_ref_provider,
+    formal_history_event_provider,
+)
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.facts import DigestProfile, SourceConfig
@@ -138,7 +142,11 @@ def _default_services() -> ApplicationServices:
         formal_store=formal_store,
     )
     facts = fact_sync.database
-    replica = GraphReplica(cache_directory / "cognitive.sqlite3")
+    replica = GraphReplica.create_new(
+        cache_directory / "cognitive.sqlite3",
+        entity_refs=formal_entity_ref_provider(formal_store),
+        history_events=formal_history_event_provider(formal_store),
+    )
     proposal_service = ProposalService(
         formal_store=formal_store,
         repository_lock=repository_lock,
@@ -169,6 +177,7 @@ def _default_services() -> ApplicationServices:
             proposal_service=proposal_service,
         ),
         m1a_proposal_service=proposal_service,
+        cognitive_replica=replica,
     )
 
 
@@ -266,6 +275,12 @@ def main(
     as_json = bool(getattr(arguments, "json", False))
     try:
         if arguments.version:
+            if arguments.command is not None:
+                print(
+                    "codecortex: --version does not accept a command",
+                    file=sys.stderr,
+                )
+                return USAGE_ERROR_EXIT
             print(__version__)
             return 0
         if arguments.command == "validate":

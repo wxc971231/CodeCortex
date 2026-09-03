@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -24,19 +25,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from codecortex.application.fact_sync import FactSyncService
-from codecortex.application.proposals import _typed_graph
-from codecortex.application.query import QueryService
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.facts import SourceConfig
-from codecortex.infrastructure.formal import FormalStore
-from codecortex.infrastructure.locking import RepositoryLock
-from codecortex.infrastructure.pending import PendingProposalStore
+from codecortex.domain.proposals import ApprovalRecord
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
-from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.python.discovery import discover_python_source_set
 from codecortex.infrastructure.repository import Repository
-from codecortex.infrastructure.views import render_views
+from codecortex.interfaces.cli.main import _default_services
 
 DEFAULT_ORIGIN = "https://github.com/pytest-dev/pytest.git"
 # pytest 8.4.2, peeled commit of the annotated tag. Frozen forever.
@@ -97,28 +92,19 @@ def _materialize_repository(worktree: Path, origin: str, commit: str) -> None:
     _run(["git", "checkout", "-q", commit], cwd=worktree)
 
 
-def _compose(root: Path) -> ApplicationServices:
-    repository = Repository(root)
-    formal_store = FormalStore(repository)
-    lock = RepositoryLock(root)
-    cache_directory = root / ".codecortex" / ".cache"
-    fact_sync = FactSyncService(
-        repository, formal_store=formal_store, repository_lock=lock
-    )
-    return ApplicationServices(
-        repository=repository,
-        formal_store=formal_store,
-        repository_lock=lock,
-        pending_proposals=PendingProposalStore(repository),
-        view_renderer=render_views,
-        fact_sync=fact_sync,
-        query_service=QueryService(
-            formal_store=formal_store,
-            facts=FactsDatabase(cache_directory / "facts.sqlite3"),
-            replica=GraphReplica(cache_directory / "cognitive.sqlite3"),
-            repository_lock=lock,
-        ),
-    )
+def _production_services(worktree: Path) -> ApplicationServices:
+    previous_cwd = Path.cwd()
+    os.chdir(worktree)
+    try:
+        # Compose through the real CLI composition root, not a test double.
+        return _default_services()
+    finally:
+        os.chdir(previous_cwd)
+
+
+def _ulid(prefix: str, index: int) -> str:
+    suffix = format(index, "X")
+    return f"{prefix}_01J{'0' * (23 - len(suffix))}{suffix}"
 
 
 def _facts_db_paths(root: Path) -> list[Path]:
@@ -163,14 +149,126 @@ def _cache_fingerprint(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _rebuild_replica(app: ApplicationServices) -> None:
-    state = app.formal_store.load()
-    replica = GraphReplica.create_new(
-        Path(app.repository.root) / ".codecortex" / ".cache" / "cognitive.sqlite3"
+def _analysis_backed_apply(
+    app: ApplicationServices, worktree: Path
+) -> dict[str, object]:
+    """Apply one analysis-backed proposal through the production chain.
+
+    Mirrors the documented init flow: fact-synced coordinate, one aggregate
+    proposal via create_cognitive_proposal_from_analysis, explicit current
+    digest approval, atomic apply, then guarded reads.  The report carries an
+    entity mapping and an evidence-less structural contains edge, so a cache
+    warning here means the composition root or the validators regressed.
+    """
+    if app.initialization_service is None:
+        return {"ok": False, "detail": "initialization service not wired"}
+    coordinate = app.initialization_service.begin_analysis()
+    page = app.repository_facts("src._pytest.capture", None, 1)
+    if not page.entities:
+        return {"ok": False, "detail": "no entities available for mapping"}
+    entity = page.entities[0]
+    evidence = {
+        "id": _ulid("evid", 1),
+        "kind": "code_entity",
+        "entity_uid": entity.uid,
+        "relative_path": entity.relative_path,
+        "start_line": entity.start_line,
+        "end_line": entity.end_line,
+        "observation": "acceptance anchor",
+    }
+    report_payload = {
+        "schema_version": 1,
+        "base_graph_revision": coordinate.graph_revision,
+        "analyzed_source_digest": coordinate.source_digest,
+        "analysis_scope": {"mode": "repository", "files": 260, "modules": 2},
+        "coverage": {
+            "analyzed_partitions": ["src/_pytest"],
+            "unexamined_partitions": [],
+        },
+        "candidate_nodes": [
+            {"id": "responsibility.test-capture", "kind": "responsibility",
+             "title": "Test output capture"},
+            {"id": "behavior.capture-output", "kind": "behavior",
+             "title": "Capture output", "evidence": [evidence]},
+            {"id": "capability.fd-manipulation", "kind": "capability",
+             "title": "File descriptor manipulation"},
+        ],
+        "candidate_edges": [
+            {
+                "id": _ulid("edge", 1),
+                "type": "contains",
+                "source_id": "responsibility.test-capture",
+                "target_id": "behavior.capture-output",
+                "epistemic_status": "inferred",
+            },
+            {
+                "id": _ulid("edge", 2),
+                "type": "uses",
+                "source_id": "behavior.capture-output",
+                "target_id": "capability.fd-manipulation",
+                "epistemic_status": "inferred",
+                "evidence": [dict(evidence, id=_ulid("evid", 2))],
+            },
+        ],
+        "candidate_flows": [],
+        "candidate_mappings": [
+            {
+                "id": _ulid("map", 1),
+                "subject_kind": "node",
+                "subject_id": "behavior.capture-output",
+                "entity_uid": entity.uid,
+                "role": "primary",
+                "resolution_status": "resolved",
+                "evidence_note": "acceptance anchor",
+            }
+        ],
+        "evidence": [],
+        "uncertainties": ["acceptance-scoped cognition only"],
+        "unmapped_regions": [],
+        "diagnostics": [],
+    }
+    payload = json.dumps(report_payload, ensure_ascii=False).encode("utf-8")
+    proposal = app.create_cognitive_proposal_from_analysis(
+        payload, "M1a acceptance initialization"
     )
-    # The replica consumes the typed domain graph; reuse the production
-    # formal-to-typed converter rather than re-implementing it here.
-    replica.rebuild(_typed_graph(state), state.graph.graph_revision)
+    applied = app.apply_cognitive_proposal(
+        proposal.proposal_id,
+        ApprovalRecord(
+            proposal_id=proposal.proposal_id,
+            patch_digest=proposal.patch_digest,
+            approved_by="user",
+            approved_at="2026-09-03T08:00:00Z",
+            approval_summary="Approve acceptance patch",
+        ),
+    )
+    if applied.cache_warnings:
+        return {
+            "ok": False,
+            "detail": f"cache warnings after apply: {list(applied.cache_warnings)}",
+            "graph_revision": applied.graph_revision,
+        }
+    facts_page = app.repository_facts(
+        "src._pytest.capture", None, 5, expected_graph_revision=applied.graph_revision
+    )
+    search = app.search_cognitive_graph(
+        "Capture output", expected_graph_revision=applied.graph_revision
+    )
+    ok = (
+        applied.graph_revision == 1
+        and len(facts_page.entities) > 0
+        and len(search.hits) > 0
+        and any(hit.node_id == "behavior.capture-output" for hit in search.hits)
+    )
+    return {
+        "ok": ok,
+        "detail": (
+            f"revision {applied.graph_revision}, zero cache warnings, "
+            f"{len(facts_page.entities)} facts readable, "
+            f"{len(search.hits)} search hits"
+        ),
+        "graph_revision": applied.graph_revision,
+        "search_hits": len(search.hits),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -193,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         f"HEAD is {head}",
     )
 
-    app = _compose(worktree)
+    app = _production_services(worktree)
     app.initialize_repository()
 
     started = time.perf_counter()
@@ -292,10 +390,6 @@ def main(argv: list[str] | None = None) -> int:
             "SELECT COUNT(*) FROM relations"
         ).fetchone()[0]
 
-    _rebuild_replica(app)
-    replica_path = worktree / ".codecortex" / ".cache" / "cognitive.sqlite3"
-    report.cognitive_replica_bytes = replica_path.stat().st_size
-
     facts_db = FactsDatabase(worktree / ".codecortex" / ".cache" / "facts.sqlite3")
     partitions = facts_db.analysis_partitions(None, None, 100).items
     scope_partition = max(
@@ -333,6 +427,20 @@ def main(argv: list[str] | None = None) -> int:
         f"scope {query_scope!r}: {pages} pages, {entities_seen} entities, "
         f"limit {QUERY_LIMIT} honored, "
         f"max page {report.timings_seconds['bounded_query_max_page'] * 1000:.1f}ms",
+    )
+
+    started = time.perf_counter()
+    apply_detail = _analysis_backed_apply(app, worktree)
+    report.timings_seconds["analysis_backed_apply"] = time.perf_counter() - started
+    report.counts["applied_graph_revision"] = int(apply_detail.get("graph_revision") or 0)
+    report.counts["search_hits_after_apply"] = int(apply_detail.get("search_hits") or 0)
+    report.peak_facts_db_bytes = max(report.peak_facts_db_bytes, _facts_db_size(worktree))
+    replica_path = worktree / ".codecortex" / ".cache" / "cognitive.sqlite3"
+    report.cognitive_replica_bytes = replica_path.stat().st_size
+    report.check(
+        "analysis_backed_apply_and_reads",
+        bool(apply_detail["ok"]),
+        str(apply_detail["detail"]),
     )
 
     report.result = "pass" if report.ok else "fail"

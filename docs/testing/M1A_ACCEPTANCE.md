@@ -45,10 +45,15 @@ python scripts/run_m1a_acceptance.py --artifact-dir /tmp/codecortex-m1a-final
 ```
 
 The script never substitutes the small fixture. It clones one frozen real
-repository at a pinned commit, initializes CodeCortex formal state, and
-measures deterministic fact indexing and bounded-query behaviour through the
-production service wiring. Machine artifact:
-`/tmp/codecortex-m1a-final/m1a_acceptance.json` (regenerate with the command
+repository at a pinned commit, composes services through the real CLI
+composition root (`_default_services`), initializes CodeCortex formal state,
+measures deterministic fact indexing and bounded-query behaviour, and then
+runs one analysis-backed apply through the production chain
+(`begin_analysis` → `create_cognitive_proposal_from_analysis` → explicit
+current-digest approval → transactional apply) with an entity mapping and an
+evidence-less structural `contains` edge in the report, asserting zero cache
+warnings and readable guarded queries at revision 1. Machine artifact:
+`/tmp/codecortex-m1a-final2/m1a_acceptance.json` (regenerate with the command
 above; the artifact directory also holds the cloned repository).
 
 | Field | Value |
@@ -59,14 +64,16 @@ above; the artifact directory also holds the cloned repository).
 | Indexed entities / relations | 6,692 / 39,447 |
 | Diagnostics | 0 |
 | Discovery | 0.009 s |
-| Full fact sync | 23.21 s (260 files parsed) |
-| No-op incremental sync | 0.114 s (0 files parsed) |
-| Single-file change sync | 0.200 s (exactly 1 file parsed) |
-| Restore sync | 0.214 s (exactly 1 file; cache fingerprint returns to pre-touch value) |
-| Full rebuild from empty cache | 23.25 s, cache fingerprint identical to incremental-built cache |
-| Bounded queries | scope `src._pytest.capture`, 6 pages, 135 entities, page limit 25 honored, max page 1.2 ms |
-| Peak facts DB size | 33,139,552 bytes (≈31.6 MiB) |
-| Cognitive replica size | 4,096 bytes (empty revision-0 graph) |
+| Full fact sync | 23.41 s (260 files parsed) |
+| No-op incremental sync | 0.110 s (0 files parsed) |
+| Single-file change sync | 0.199 s (exactly 1 file parsed) |
+| Restore sync | 0.202 s (exactly 1 file; cache fingerprint returns to pre-touch value) |
+| Full rebuild from empty cache | 22.92 s, cache fingerprint identical to incremental-built cache |
+| Bounded queries (revision 0) | scope `src._pytest.capture`, 6 pages, 135 entities, page limit 25 honored, max page 1.2 ms |
+| Analysis-backed apply | 0.65 s, revision 1, zero cache warnings |
+| Guarded reads after apply | `repository_facts` 5 entities at revision 1; `search_cognitive_graph("Capture output")` 2 hits including `behavior.capture-output` |
+| Peak facts DB size | 42,722,136 bytes (≈40.7 MiB, includes post-apply baseline snapshots) |
+| Cognitive replica size | 180,224 bytes (revision-1 graph with mapping) |
 | Acceptance result | **PASS** |
 
 Equivalence note: entity UIDs are cache-local identities (fresh ULIDs on a
@@ -81,5 +88,5 @@ per-file digests — not over ULIDs or row ids.
 - Incremental and full indexes equivalent: verified by content fingerprint above.
 - Incoming relations re-resolve correctly on change/restore: verified by the single-file touch/restore checks.
 - Analyzer report bounds/freshness and single aggregate Proposal: covered by `tests/integration/test_analysis_report_freshness.py` and the Main-only `create_cognitive_proposal_from_analysis` MCP tool (Analyzer profile provably lacks it; see `tests/unit/interfaces/test_mcp_profiles.py`).
-- Approved graph/source baseline/history commit atomically: covered by `ProposalService.apply_cognitive_proposal` integration tests.
+- Approved graph/source baseline/history commit atomically, with the cognitive replica refreshed through the production composition root: verified by the acceptance apply phase above (zero cache warnings) and by `tests/integration/test_default_services_chain.py`, which drives `_default_services` end to end (apply with entity mapping, and an evidence-less `contains` edge, both followed by readable guarded queries).
 - Deterministic views and cache deletion preserving formal cognition: covered by the Task 11 view/inspection suites; the acceptance script additionally deletes the whole facts cache mid-run and rebuilds it to an identical fingerprint.

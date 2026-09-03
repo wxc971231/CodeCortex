@@ -136,6 +136,7 @@ class ApplyProposalOutput(_Dto):
     event_id: str
     graph_revision: int
     applied_proposal_id: str
+    cache_warnings: list[str] = Field(default_factory=list)
 
 
 def repository_overview(services: ApplicationServices) -> RepositoryOverviewOutput:
@@ -325,6 +326,7 @@ def apply_cognitive_proposal(
         event_id=result.event_id,
         graph_revision=result.graph_revision,
         applied_proposal_id=result.applied_proposal_id,
+        cache_warnings=list(result.cache_warnings),
     )
 
 

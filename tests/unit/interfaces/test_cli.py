@@ -198,6 +198,16 @@ def test_argument_errors_exit_2(
     assert capsys.readouterr().out == ""
 
 
+def test_version_with_command_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--version must not silently ignore a trailing command."""
+    assert main(["--version", "validate"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--version" in captured.err
+
+
 def test_missing_command_prints_usage_and_exits_2(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

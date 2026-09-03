@@ -19,6 +19,10 @@ from codecortex.application.query import (
     QueryService,
     ResolvedMapping,
 )
+from codecortex.application.replica_providers import (
+    formal_entity_ref_provider,
+    formal_history_event_provider,
+)
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.proposals import ApprovalRecord, PatchOperation
 from codecortex.infrastructure.formal import FormalStore
@@ -59,7 +63,11 @@ def _compose(root: Path, *, max_graph_objects: int = 500) -> ApplicationServices
         query_service=QueryService(
             formal_store=formal_store,
             facts=FactsDatabase(cache_directory / "facts.sqlite3"),
-            replica=GraphReplica(cache_directory / "cognitive.sqlite3"),
+            replica=GraphReplica(
+                cache_directory / "cognitive.sqlite3",
+                entity_refs=formal_entity_ref_provider(formal_store),
+                history_events=formal_history_event_provider(formal_store),
+            ),
             repository_lock=lock,
         ),
         cognitive_graph_max_objects=max_graph_objects,

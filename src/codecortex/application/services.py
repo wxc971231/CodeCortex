@@ -19,6 +19,7 @@ from codecortex.application.ports import (
     RepositoryLockPort,
     ViewRendererPort,
 )
+from codecortex.application.proposals import typed_graph_from_formal
 from codecortex.application.query import (
     AnalysisScopeResult,
     EntityContextResult,
@@ -51,6 +52,7 @@ from codecortex.infrastructure.formal import view_manifest_for
 from codecortex.infrastructure.persistence.graph_replica import (
     ContextRequest,
     DiscussionContext,
+    GraphReplica,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +78,7 @@ class ApplyResult:
     event_id: str
     graph_revision: int
     applied_proposal_id: str
+    cache_warnings: tuple[str, ...] = ()
 
 
 @dataclass
@@ -92,6 +95,7 @@ class ApplicationServices:
     query_service: QueryService | None = None
     initialization_service: InitializationService | None = None
     m1a_proposal_service: ProposalService | None = None
+    cognitive_replica: GraphReplica | None = None
     cognitive_graph_max_objects: int = 500
 
     def initialize_repository(self) -> RepositoryOverview:
@@ -107,7 +111,19 @@ class ApplicationServices:
             state = self.formal_store.initialize(
                 FormalState.empty(manifest=manifest, source_baseline=baseline)
             )
+            self._refresh_cognitive_replica(state)
             return self._overview(state)
+
+    def _refresh_cognitive_replica(self, state: FormalState) -> None:
+        """(Re)build the disposable cognitive replica from the formal state.
+
+        Initialization is a Main-only write path, so this is where a fresh or
+        outdated replica becomes readable; Analyzer reads never write caches.
+        """
+        if self.cognitive_replica is not None:
+            self.cognitive_replica.rebuild(
+                typed_graph_from_formal(state), state.graph.graph_revision
+            )
 
     def recover_formal_state(self) -> RecoveryResult:
         """Recover an interrupted transaction before a Main entry serves state.
@@ -396,6 +412,7 @@ class ApplicationServices:
                 event_id=m1a_result.event_id,
                 graph_revision=m1a_result.graph_revision,
                 applied_proposal_id=m1a_result.applied_proposal_id,
+                cache_warnings=m1a_result.cache_warnings,
             )
         store = self._pending_store()
         with self.repository_lock.acquire("exclusive", self.lock_timeout_seconds):

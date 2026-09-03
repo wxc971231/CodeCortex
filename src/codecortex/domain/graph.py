@@ -430,7 +430,13 @@ def _validate_edges(
                 location,
                 "edge endpoint kinds are not allowed for this relation",
             )
-        if _requires_evidence(edge.epistemic_status) and not edge.evidence:
+        # Structural contains edges never require evidence (design section
+        # 8.2); inferred/uncertain uses/depends_on edges still fail closed.
+        if (
+            edge_type is not EdgeType.CONTAINS
+            and _requires_evidence(edge.epistemic_status)
+            and not edge.evidence
+        ):
             _violation(
                 violations,
                 "RELATION_EVIDENCE_REQUIRED",
@@ -866,7 +872,7 @@ def _requires_evidence(value: object) -> bool:
 def _enum_value[T: StrEnum](value: object, enum_type: type[T]) -> T | None:
     try:
         return enum_type(value)  # type: ignore[arg-type]
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
 
 

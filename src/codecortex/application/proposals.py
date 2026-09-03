@@ -438,7 +438,7 @@ class ProposalService:
         if self._replica is not None:
             try:
                 self._replica.rebuild(
-                    _typed_graph(applied), applied.graph.graph_revision
+                    typed_graph_from_formal(applied), applied.graph.graph_revision
                 )
             except (CodeCortexError, OSError, sqlite3.Error, ValueError) as error:
                 warnings.append(
@@ -642,7 +642,7 @@ def _mapping_value(mapping: graph_model.ImplementationMapping) -> dict[str, obje
     }
 
 
-def _typed_graph(state: FormalState) -> graph_model.CognitiveGraph:
+def typed_graph_from_formal(state: FormalState) -> graph_model.CognitiveGraph:
     """Convert the validated formal persistence shape into the typed model."""
     graph = state.graph
     return graph_model.CognitiveGraph(
