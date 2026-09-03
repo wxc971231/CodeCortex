@@ -469,7 +469,7 @@ git commit -m "feat: model the cognitive graph"
 - Produces: `GraphReplica.search(query: str, kinds: Sequence[str], limit: int) -> tuple[GraphHit, ...]`
 - Produces: `GraphReplica.context(request: ContextRequest) -> DiscussionContext`
 
-- [ ] **Step 1: Write failing replica consistency tests**
+- [x] **Step 1: Write failing replica consistency tests**
 
 ```python
 def test_replica_rejects_revision_mismatch(graph_replica):
@@ -484,13 +484,13 @@ def test_search_uses_alias_and_stable_tie_break(graph_replica_with_graph):
     assert [hit.node_id for hit in hits] == ["behavior.checkpoint-resume"]
 ```
 
-- [ ] **Step 2: Run tests and confirm missing replica**
+- [x] **Step 2: Run tests and confirm missing replica**
 
 Run: `pytest tests/unit/persistence/test_graph_replica_schema.py tests/integration/test_graph_replica.py -q`
 
 Expected: collection fails on `GraphReplica`.
 
-- [ ] **Step 3: Implement the complete cognitive replica DDL and importer**
+- [x] **Step 3: Implement the complete cognitive replica DDL and importer**
 
 Create all tables/indexes from M1a section 7. Rebuild within one SQLite transaction after validating graph revision and polymorphic subject/evidence references. Search uses NFKC + casefold, Latin alphanumeric terms, and full short CJK terms plus CJK bi/trigrams; weight exact alias, alias, title, summary, and observed fields according to the detailed design, then break ties by kind and stable node ID without relying on FTS5. Context traversal applies depth, node/entity/evidence maxima before materializing DTOs and reports truncation/continuation.
 
@@ -503,13 +503,13 @@ def normalize_search_terms(text: str) -> tuple[str, ...]:
     return tuple(sorted(set((*latin, *cjk))))
 ```
 
-- [ ] **Step 4: Run import/query/limit tests**
+- [x] **Step 4: Run import/query/limit tests**
 
 Run: `pytest tests/unit/persistence/test_graph_replica_schema.py tests/integration/test_graph_replica.py -q`
 
 Expected: graph import is all-or-nothing; polymorphic dangling refs fail; repeated rebuild is deterministic; bounded context executes a fixed number of queries.
 
-- [ ] **Step 5: Commit graph replica**
+- [x] **Step 5: Commit graph replica**
 
 ```bash
 git add src/codecortex/infrastructure/persistence/graph_replica.py tests
