@@ -57,6 +57,7 @@ from codecortex.infrastructure.persistence.graph_replica import (
 
 if TYPE_CHECKING:
     from codecortex.application.initialize import InitializationService
+    from codecortex.application.preflight import PreflightResult, PreflightService
     from codecortex.application.proposals import ProposalService
 
 
@@ -95,6 +96,7 @@ class ApplicationServices:
     query_service: QueryService | None = None
     initialization_service: InitializationService | None = None
     m1a_proposal_service: ProposalService | None = None
+    preflight_service: PreflightService | None = None
     cognitive_replica: GraphReplica | None = None
     cognitive_graph_max_objects: int = 500
 
@@ -152,6 +154,15 @@ class ApplicationServices:
                 "Fact synchronization is not configured",
             )
         return self.fact_sync.sync(cast(Literal["auto", "full"], mode))
+
+    def run_preflight(self) -> PreflightResult:
+        """Run the single mandatory M1b readiness gate for an explicit operation."""
+        if self.preflight_service is None:
+            raise CodeCortexError(
+                ErrorCode.NOT_INITIALIZED,
+                "Fact Preflight is not configured",
+            )
+        return self.preflight_service.run()
 
     def repository_facts(
         self,
