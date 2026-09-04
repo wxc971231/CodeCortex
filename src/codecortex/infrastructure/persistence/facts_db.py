@@ -149,6 +149,19 @@ class CacheMetadata:
 
 
 @dataclass(frozen=True)
+class FactEntitySnapshot:
+    """A compact entity projection used for baseline-to-current comparison."""
+
+    uid: str
+    baseline_source_digest: str | None
+    relative_path: str
+    address: str
+    kind: str
+    signature: str | None
+    fingerprint: str
+
+
+@dataclass(frozen=True)
 class ModulePartition:
     """One package/module partition of the current managed-source facts."""
 
@@ -288,6 +301,47 @@ class FactsDatabase:
                 "ORDER BY relative_path"
             ).fetchall()
         return {row["relative_path"]: row["content_digest"] for row in rows}
+
+    def current_entity_snapshots(self) -> tuple[FactEntitySnapshot, ...]:
+        """Return all current entities in a stable, narrow comparison projection."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT e.uid, sf.relative_path, e.address, e.kind, e.signature, "
+                "e.fingerprint FROM entities AS e JOIN source_files AS sf "
+                "ON sf.file_id = e.file_id ORDER BY e.uid"
+            ).fetchall()
+        return tuple(
+            FactEntitySnapshot(
+                uid=row["uid"],
+                baseline_source_digest=None,
+                relative_path=row["relative_path"],
+                address=row["address"],
+                kind=row["kind"],
+                signature=row["signature"],
+                fingerprint=row["fingerprint"],
+            )
+            for row in rows
+        )
+
+    def baseline_entity_snapshots(self) -> tuple[FactEntitySnapshot, ...]:
+        """Return the formal-baseline cache snapshot, never an implicit fallback."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT uid, baseline_source_digest, relative_path, address, kind, "
+                "signature, fingerprint FROM baseline_entity_snapshots ORDER BY uid"
+            ).fetchall()
+        return tuple(
+            FactEntitySnapshot(
+                uid=row["uid"],
+                baseline_source_digest=row["baseline_source_digest"],
+                relative_path=row["relative_path"],
+                address=row["address"],
+                kind=row["kind"],
+                signature=row["signature"],
+                fingerprint=row["fingerprint"],
+            )
+            for row in rows
+        )
 
     def replace_baseline_entity_snapshots(self, baseline_source_digest: str) -> None:
         """Copy every current entity into the baseline snapshot table.
