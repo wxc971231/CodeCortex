@@ -9,7 +9,7 @@ search restriction and stale graph material is only baseline navigation.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from codecortex.application.freshness import FreshnessService, QueryFreshnessResult
@@ -23,12 +23,16 @@ DiscussionRoute = Literal[
     "offer_materialization",
 ]
 BehaviorMaterialization = Literal["materialized", "unmaterialized"]
+MaterializationDecision = Literal["expand", "transient"]
+SemanticSyncExecutor = Literal["main", "analyzer"]
 
 _MAX_CANDIDATES = 20
 _CONTEXT_DEPTH = 2
 _MAX_CONTEXT_NODES = 40
 _MAX_CONTEXT_ENTITIES = 80
 _MAX_CONTEXT_EVIDENCE = 80
+_MAX_MAIN_SYNC_NODES = 10
+_MAX_MAIN_SYNC_ENTITIES = 20
 
 
 def _unique_identifiers(values: tuple[str, ...], name: str) -> None:
@@ -51,6 +55,7 @@ class QuestionScope:
     confirmed_node_ids: tuple[str, ...] = ()
     entity_ids: tuple[str, ...] = ()
     behavior_materialization: BehaviorMaterialization | None = None
+    semantic_sync_scope: SemanticSyncScope | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.question, str) or not self.question.strip():
@@ -63,6 +68,63 @@ class QuestionScope:
             "unmaterialized",
         ):
             raise ValueError("Behavior materialization status is invalid")
+        if self.semantic_sync_scope is not None and not isinstance(
+            self.semantic_sync_scope, SemanticSyncScope
+        ):
+            raise TypeError("Semantic sync scope is invalid")
+
+
+@dataclass(frozen=True)
+class SemanticSyncScope:
+    """Bounded scope used to select Main analysis or the read-only Analyzer."""
+
+    affected_node_ids: tuple[str, ...]
+    responsibility_ids: tuple[str, ...]
+    affected_entity_ids: tuple[str, ...]
+    scope_confidence: Literal["complete", "partial", "unknown"]
+
+    def __post_init__(self) -> None:
+        _unique_identifiers(self.affected_node_ids, "Affected node IDs")
+        _unique_identifiers(self.responsibility_ids, "Responsibility IDs")
+        _unique_identifiers(self.affected_entity_ids, "Affected entity IDs")
+        if any(not identifier.startswith("responsibility.") for identifier in self.responsibility_ids):
+            raise ValueError("Responsibility IDs must use the responsibility namespace")
+        if self.scope_confidence not in {"complete", "partial", "unknown"}:
+            raise ValueError("Semantic sync scope confidence is invalid")
+
+
+@dataclass(frozen=True)
+class SemanticSyncPlan:
+    """An instruction for Main; Core never dispatches either kind of Agent."""
+
+    executor: SemanticSyncExecutor
+    scope: SemanticSyncScope
+    reason_codes: tuple[str, ...]
+    creates_proposal_after_analysis: bool = True
+    auto_apply: bool = False
+
+
+@dataclass(frozen=True)
+class MaterializationOffer:
+    """The one-time A/B choice for one relevant unmaterialized Behavior."""
+
+    behavior_id: str
+    route: Literal["offer_materialization", "source_first"]
+    should_ask_user: bool
+    choices: tuple[MaterializationDecision, ...]
+    decision: MaterializationDecision | None
+    requires_current_facts: bool
+    requires_current_source: bool
+    expansion_requires_later_patch_approval: bool
+    semantic_sync: SemanticSyncPlan | None
+    explanation: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PendingProposalSummary:
+    """A per-invocation reminder gate; callers supply the actual pending data."""
+
+    should_notify: bool
 
 
 @dataclass
@@ -77,10 +139,54 @@ class InvocationState:
 
     anchor_ids: tuple[str, ...] = ()
     serialized_chat_history: None = None
+    _materialization_decisions: dict[str, MaterializationDecision] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _materialization_offers: set[str] = field(default_factory=set, init=False, repr=False)
+    _pending_summary_shown: bool = field(default=False, init=False, repr=False)
 
     def set_anchors(self, anchor_ids: tuple[str, ...]) -> None:
         _unique_identifiers(anchor_ids, "Invocation anchor IDs")
         self.anchor_ids = anchor_ids
+
+    def record_materialization_decision(
+        self, behavior_id: str, decision: MaterializationDecision
+    ) -> None:
+        """Record the user's one explicit choice for this live invocation only."""
+        _behavior_id(behavior_id)
+        if decision not in {"expand", "transient"}:
+            raise ValueError("Materialization decision is invalid")
+        existing = self._materialization_decisions.get(behavior_id)
+        if existing is not None and existing != decision:
+            raise ValueError("Materialization decision is already recorded")
+        self._materialization_decisions[behavior_id] = decision
+
+    def has_materialization_decision(self, behavior_id: str) -> bool:
+        _behavior_id(behavior_id)
+        return behavior_id in self._materialization_decisions
+
+    def record_materialization_offer_shown(self, behavior_id: str) -> None:
+        """Remember an unanswered prompt so Main does not repeat it this invocation."""
+        _behavior_id(behavior_id)
+        self._materialization_offers.add(behavior_id)
+
+    def materialization_offer_shown(self, behavior_id: str) -> bool:
+        _behavior_id(behavior_id)
+        return behavior_id in self._materialization_offers
+
+    def materialization_decision(
+        self, behavior_id: str
+    ) -> MaterializationDecision | None:
+        _behavior_id(behavior_id)
+        return self._materialization_decisions.get(behavior_id)
+
+    def record_pending_summary_shown(self) -> None:
+        """Suppress further pending-Proposal reminders for this invocation."""
+        self._pending_summary_shown = True
+
+    @property
+    def pending_summary_shown(self) -> bool:
+        return self._pending_summary_shown
 
 
 @dataclass(frozen=True)
@@ -98,6 +204,9 @@ class DiscussionPlan:
     graph_is_baseline_navigation: bool
     native_search_unrestricted: bool
     explanation: tuple[str, ...]
+    materialization_offer: MaterializationOffer | None = None
+    semantic_sync: SemanticSyncPlan | None = None
+    auto_mutates_cognition: bool = False
 
 
 class DiscussionPlanner:
@@ -133,16 +242,142 @@ class DiscussionPlanner:
         ):
             raise ValueError("Behavior materialization requires a confirmed behavior")
         invocation.set_anchors(question_scope.confirmed_node_ids)
-        return self._plan(question_scope, candidate_ids)
+        return self._plan(question_scope, candidate_ids, invocation)
 
     def plan_follow_up(self, question: str, invocation: InvocationState) -> DiscussionPlan:
         """Reuse live anchors only; no full transcript is serialized or persisted."""
         if not isinstance(invocation, InvocationState):
             raise TypeError("Follow-up planning requires an InvocationState")
-        return self._plan(QuestionScope(question, invocation.anchor_ids), ())
+        return self._plan(QuestionScope(question, invocation.anchor_ids), (), invocation)
+
+    def offer_for(
+        self,
+        behavior_id: str,
+        invocation: InvocationState,
+        sync_scope: SemanticSyncScope | None = None,
+    ) -> MaterializationOffer:
+        """Return the current one-time materialization choice without writing state."""
+        _behavior_id(behavior_id)
+        if not isinstance(invocation, InvocationState):
+            raise TypeError("Materialization offer requires an InvocationState")
+        if sync_scope is not None and not isinstance(sync_scope, SemanticSyncScope):
+            raise TypeError("Materialization offer requires a SemanticSyncScope")
+        decision = invocation.materialization_decision(behavior_id)
+        if decision is None:
+            if invocation.materialization_offer_shown(behavior_id):
+                return MaterializationOffer(
+                    behavior_id=behavior_id,
+                    route="source_first",
+                    should_ask_user=False,
+                    choices=(),
+                    decision=None,
+                    requires_current_facts=True,
+                    requires_current_source=True,
+                    expansion_requires_later_patch_approval=False,
+                    semantic_sync=None,
+                    explanation=(
+                        "MATERIALIZATION_CHOICE_ALREADY_SHOWN",
+                        "ANSWER_TRANSIENTLY_UNLESS_USER_CHOOSES_EXPANSION",
+                        "NO_FORMAL_COGNITION_WRITE",
+                    ),
+                )
+            invocation.record_materialization_offer_shown(behavior_id)
+            return MaterializationOffer(
+                behavior_id=behavior_id,
+                route="offer_materialization",
+                should_ask_user=True,
+                choices=("expand", "transient"),
+                decision=None,
+                requires_current_facts=False,
+                requires_current_source=False,
+                expansion_requires_later_patch_approval=True,
+                semantic_sync=None,
+                explanation=(
+                    "ASK_ONCE_PER_EXPLICIT_CODE_CORTEX_INVOCATION",
+                    "EXPANSION_AUTHORIZES_ANALYSIS_NOT_PATCH_APPROVAL",
+                ),
+            )
+        if decision == "transient":
+            return MaterializationOffer(
+                behavior_id=behavior_id,
+                route="source_first",
+                should_ask_user=False,
+                choices=(),
+                decision=decision,
+                requires_current_facts=True,
+                requires_current_source=True,
+                expansion_requires_later_patch_approval=False,
+                semantic_sync=None,
+                explanation=(
+                    "TRANSIENT_MATERIALIZATION_SELECTED",
+                    "ANSWER_WITH_CURRENT_GRAPH_FACTS_AND_SOURCE",
+                    "NO_FORMAL_COGNITION_WRITE",
+                ),
+            )
+        semantic_sync = self.semantic_sync_plan(
+            sync_scope if sync_scope is not None else _unknown_sync_scope(behavior_id)
+        )
+        return MaterializationOffer(
+            behavior_id=behavior_id,
+            route="source_first",
+            should_ask_user=False,
+            choices=(),
+            decision=decision,
+            requires_current_facts=True,
+            requires_current_source=True,
+            expansion_requires_later_patch_approval=True,
+            semantic_sync=semantic_sync,
+            explanation=(
+                "PROPOSAL_BACKED_EXPANSION_SELECTED",
+                "ANALYZE_CURRENT_FACTS_AND_SOURCE",
+                "DISPLAY_PROPOSAL_BEFORE_ANY_FORMAL_WRITE",
+                *semantic_sync.reason_codes,
+            ),
+        )
+
+    def pending_summary(self, invocation: InvocationState) -> PendingProposalSummary:
+        """Return the one-time reminder gate for an already-known pending Proposal."""
+        if not isinstance(invocation, InvocationState):
+            raise TypeError("Pending summary requires an InvocationState")
+        return PendingProposalSummary(should_notify=not invocation.pending_summary_shown)
+
+    @staticmethod
+    def semantic_sync_plan(scope: SemanticSyncScope) -> SemanticSyncPlan:
+        """Choose a bounded Main pass only when scope has one proven owner."""
+        if not isinstance(scope, SemanticSyncScope):
+            raise TypeError("Semantic sync planning requires a SemanticSyncScope")
+        if scope.scope_confidence != "complete":
+            return SemanticSyncPlan(
+                executor="analyzer",
+                scope=scope,
+                reason_codes=("SCOPE_NOT_COMPLETE", "ANALYZER_REQUIRED"),
+            )
+        if len(scope.responsibility_ids) != 1:
+            return SemanticSyncPlan(
+                executor="analyzer",
+                scope=scope,
+                reason_codes=("CROSS_OR_UNOWNED_RESPONSIBILITY_SCOPE", "ANALYZER_REQUIRED"),
+            )
+        if (
+            len(scope.affected_node_ids) > _MAX_MAIN_SYNC_NODES
+            or len(scope.affected_entity_ids) > _MAX_MAIN_SYNC_ENTITIES
+        ):
+            return SemanticSyncPlan(
+                executor="analyzer",
+                scope=scope,
+                reason_codes=("SCOPE_EXCEEDS_MAIN_BOUNDED_ANALYSIS", "ANALYZER_REQUIRED"),
+            )
+        return SemanticSyncPlan(
+            executor="main",
+            scope=scope,
+            reason_codes=("SINGLE_RESPONSIBILITY_BOUNDED_SCOPE", "MAIN_ANALYSIS_ALLOWED"),
+        )
 
     def _plan(
-        self, question_scope: QuestionScope, candidate_ids: tuple[str, ...]
+        self,
+        question_scope: QuestionScope,
+        candidate_ids: tuple[str, ...],
+        invocation: InvocationState,
     ) -> DiscussionPlan:
         freshness = self._freshness.for_query(
             question_scope.confirmed_node_ids, question_scope.entity_ids
@@ -194,6 +429,26 @@ class DiscussionPlanner:
                 ),
             )
         if question_scope.behavior_materialization == "unmaterialized":
+            behavior_id = _confirmed_behavior_id(question_scope)
+            offer = self.offer_for(
+                behavior_id, invocation, question_scope.semantic_sync_scope
+            )
+            if not offer.should_ask_user:
+                return DiscussionPlan(
+                    route="source_first",
+                    anchor_ids=anchors,
+                    entity_ids=question_scope.entity_ids,
+                    candidate_node_ids=candidate_ids,
+                    freshness=freshness,
+                    context_request=context,
+                    requires_current_facts=True,
+                    requires_current_source=True,
+                    graph_is_baseline_navigation=False,
+                    native_search_unrestricted=False,
+                    explanation=offer.explanation,
+                    materialization_offer=offer,
+                    semantic_sync=offer.semantic_sync,
+                )
             return DiscussionPlan(
                 route="offer_materialization",
                 anchor_ids=anchors,
@@ -205,11 +460,8 @@ class DiscussionPlanner:
                 requires_current_source=False,
                 graph_is_baseline_navigation=False,
                 native_search_unrestricted=False,
-                explanation=(
-                    "UNMATERIALIZED_BEHAVIOR_RELEVANT",
-                    "OFFER_TRANSIENT_OR_PROPOSAL_BACKED_EXPANSION",
-                    *freshness.reason_codes,
-                ),
+                explanation=(*offer.explanation, *freshness.reason_codes),
+                materialization_offer=offer,
             )
 
         route: DiscussionRoute = (
@@ -249,3 +501,29 @@ class DiscussionPlanner:
         ids = tuple(hit.node_id for hit in result)
         _unique_identifiers(ids, "Discussion candidate IDs")
         return ids
+
+
+def _behavior_id(behavior_id: str) -> None:
+    if not isinstance(behavior_id, str) or not behavior_id.startswith("behavior."):
+        raise ValueError("Materialization requires a behavior ID")
+
+
+def _confirmed_behavior_id(question_scope: QuestionScope) -> str:
+    behavior_ids = tuple(
+        node_id
+        for node_id in question_scope.confirmed_node_ids
+        if node_id.startswith("behavior.")
+    )
+    if not behavior_ids:
+        raise ValueError("Behavior materialization requires a confirmed behavior")
+    return behavior_ids[0]
+
+
+def _unknown_sync_scope(behavior_id: str) -> SemanticSyncScope:
+    """Conservatively require Analyzer when Main did not provide bounded scope."""
+    return SemanticSyncScope(
+        affected_node_ids=(behavior_id,),
+        responsibility_ids=(),
+        affected_entity_ids=(),
+        scope_confidence="unknown",
+    )

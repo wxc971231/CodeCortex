@@ -95,3 +95,54 @@ M1a supports deterministic Python facts, bounded Analyzer reports,
 analysis-backed aggregate Proposals, source baselines, rendering/inspection,
 and the safe Proposal lifecycle. General freshness-routed project Q&A remains
 an M1b capability.
+
+## M1b explicit project discussions and semantic synchronization
+
+For every explicit `$codecortex ask`, `inspect`, `sync`, `expand`, or
+reinitialize operation, run deterministic Fact Preflight before drawing a
+conclusion. It refreshes only disposable facts and computes one current
+baseline-to-source ChangeSet; it never calls an Agent and never needs user
+approval. Do not make ordinary Codex coding run this workflow.
+
+For a question, use `search_cognitive_graph` for bounded candidate recall, use
+your own reasoning to confirm relevant Responsibility/Behavior/Capability
+anchors, obtain `effective_query_freshness`, then pull only bounded discussion
+context and the necessary current facts/source. A graph result is a preference,
+not a search restriction. If there is no confirmed semantic anchor, use normal
+Native Codex `rg`, directory, source, configuration, test, and documentation
+exploration without restriction.
+
+If query freshness is `affected_source_first` or `unknown_source_first`, label
+the graph as baseline navigation only. Read current facts and source before
+answering, distinguish approved graph conclusions from current-source evidence
+and uncertainty, and do not block the answer waiting for a graph update.
+
+For a relevant unmaterialized Behavior, ask **once per explicit CodeCortex
+invocation**:
+
+```text
+A. Expand it now: analyze the current bounded scope, then show one aggregate
+   Proposal. This authorizes analysis only; it is not approval of an unknown
+   patch. Apply only after the user explicitly approves the displayed current
+   patch_digest.
+B. Keep it transient: answer now from current graph coverage, indexed facts,
+   and source. Create no Proposal and do not repeat this question for the same
+   Behavior during this invocation.
+```
+
+Keep that one-time decision only in the live Main invocation; do not persist a
+Codex thread or chat history in Core or `.codecortex/`. Never auto-apply,
+auto-create a formal graph change, or turn a per-file observation into a
+Proposal.
+
+For explicit `$codecortex sync`, use a small, complete, single-Responsibility
+scope for Main Codex analysis. Use the read-only `codecortex-analyzer` for a
+large, cross-Responsibility, unresolved, or otherwise unbounded scope. Either
+path may produce an aggregate Proposal only after analysis; semantic changes
+still require exact user approval to apply. A no-semantic-change conclusion may
+use the audited baseline-advance path described by Core.
+
+Summarize pending Proposals at most once per explicit CodeCortex invocation.
+After the user defers or rejects one, do not repeat the reminder in that
+invocation. Mention high-impact deletion or migration only at a natural
+checkpoint; never interrupt ordinary Codex work for it.
