@@ -524,10 +524,31 @@ class GraphReplica:
     def create_new(cls, path: Path, **providers: object) -> GraphReplica:
         """Create the replica schema (or verify a compatible one) at *path*."""
         replica = cls(path, **providers)  # type: ignore[arg-type]
-        replica.path.parent.mkdir(parents=True, exist_ok=True)
-        with replica.open_write() as connection:
-            connection.executescript(_DDL)
+        try:
+            replica._create_schema()
+        except sqlite3.DatabaseError as error:
+            if not _is_corrupt_sqlite(error):
+                raise
+            # This database is a wholly disposable local projection.  A
+            # damaged file must never prevent the formal-state recovery path
+            # from starting on a new machine.
+            replica.reset()
         return replica
+
+    def reset(self) -> None:
+        """Discard a damaged local replica and recreate only its empty schema."""
+        for path in (
+            self.path,
+            self.path.with_name(f"{self.path.name}-wal"),
+            self.path.with_name(f"{self.path.name}-shm"),
+        ):
+            path.unlink(missing_ok=True)
+        self._create_schema()
+
+    def _create_schema(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.open_write() as connection:
+            connection.executescript(_DDL)
 
     def open_read(self) -> sqlite3.Connection:
         """Open a URI-mode read-only, query-only connection for bounded reads."""
@@ -1556,3 +1577,9 @@ def _bounded_int(value: int, minimum: int, maximum: int, label: str) -> int:
     if value < minimum or value > maximum:
         raise ValueError(f"Context {label} must be between {minimum} and {maximum}")
     return value
+
+
+def _is_corrupt_sqlite(error: sqlite3.DatabaseError) -> bool:
+    """Whether SQLite identified the file itself as unreadable, not merely busy."""
+    message = str(error).lower()
+    return "file is not a database" in message or "database disk image is malformed" in message

@@ -111,10 +111,17 @@ class FactSyncService:
         self.max_retries = max_retries
         self._parse_file = parse_file
 
-    def sync(self, mode: SyncMode = "auto") -> FactSyncResult:
+    def sync(
+        self,
+        mode: SyncMode = "auto",
+        *,
+        identity_hints: Sequence[EntityIdentityHint] = (),
+    ) -> FactSyncResult:
         """Synchronize facts, retrying if source content changes during parsing."""
         if mode not in ("auto", "full"):
             raise ValueError("Fact Sync mode must be 'auto' or 'full'")
+        if any(not isinstance(hint, EntityIdentityHint) for hint in identity_hints):
+            raise TypeError("Fact Sync identity hints must be EntityIdentityHint records")
 
         for retry_count in range(self.max_retries + 1):
             snapshot = self._source_snapshot()
@@ -127,6 +134,7 @@ class FactSyncService:
                 snapshot,
                 current_digests,
                 full_rebuild=full_rebuild,
+                identity_hints=identity_hints,
             )
 
             with self.repository_lock.acquire("exclusive", 10):
@@ -236,18 +244,26 @@ class FactSyncService:
         current_digests: dict[str, str],
         *,
         full_rebuild: bool,
+        identity_hints: Sequence[EntityIdentityHint],
     ) -> tuple[tuple[ParsedFile, ...], tuple[str, ...], dict[str, int]]:
         changed_paths, deleted_paths, counts = self._changes(
             snapshot, current_digests, full_rebuild=full_rebuild
         )
-        try:
-            hints = (
-                self.database.identity_hints((*changed_paths, *deleted_paths))
-                if self.database.path.exists()
-                else ()
+        if full_rebuild and identity_hints:
+            hints = tuple(
+                hint
+                for hint in identity_hints
+                if hint.relative_path in set(changed_paths)
             )
-        except (OSError, sqlite3.DatabaseError):
-            hints = ()
+        else:
+            try:
+                hints = (
+                    self.database.identity_hints((*changed_paths, *deleted_paths))
+                    if self.database.path.exists()
+                    else ()
+                )
+            except (OSError, sqlite3.DatabaseError):
+                hints = ()
         hints_by_path: dict[str, list[EntityIdentityHint]] = {}
         for hint in hints:
             hints_by_path.setdefault(hint.relative_path, []).append(hint)

@@ -24,6 +24,7 @@ from codecortex.application.ports import RepositoryContextPort
 from codecortex.application.preflight import PreflightService
 from codecortex.application.proposals import ManagedSourceSnapshot, ProposalService
 from codecortex.application.query import QueryService
+from codecortex.application.recovery import RecoveryService
 from codecortex.application.replica_providers import (
     formal_entity_ref_provider,
     formal_history_event_provider,
@@ -160,12 +161,21 @@ def _default_services() -> ApplicationServices:
         facts=facts,
         replica=replica,
     )
+    recovery = RecoveryService(
+        formal_store=formal_store,
+        fact_sync=fact_sync,
+        facts=facts,
+        freshness_store=FreshnessStore(cache_directory),
+        repository_lock=repository_lock,
+        cognitive_replica=replica,
+    )
     preflight = PreflightService(
         formal_store=formal_store,
         fact_sync=fact_sync,
         facts=facts,
         freshness_store=FreshnessStore(cache_directory),
         repository_lock=repository_lock,
+        recovery_service=recovery,
     )
     return ApplicationServices(
         repository=context,

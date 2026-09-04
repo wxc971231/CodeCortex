@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from codecortex.application.affected_scope import AffectedScopeCalculator
 from codecortex.application.change_detection import ChangeDetector
@@ -16,6 +17,9 @@ from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.freshness import ChangeSet
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
+
+if TYPE_CHECKING:
+    from codecortex.application.recovery import RecoveryService
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,7 @@ class PreflightService:
         facts: FactsDatabase,
         freshness_store: FreshnessStore,
         repository_lock: RepositoryLockPort,
+        recovery_service: RecoveryService | None = None,
         lock_timeout_seconds: float = 10,
         max_retries: int = 2,
     ) -> None:
@@ -56,11 +61,19 @@ class PreflightService:
         self.facts = facts
         self.freshness_store = freshness_store
         self.repository_lock = repository_lock
+        self.recovery_service = recovery_service
         self.lock_timeout_seconds = lock_timeout_seconds
         self.max_retries = max_retries
 
     def run(self) -> PreflightResult:
         """Return current facts plus the one baseline-to-current effective ChangeSet."""
+        if self.recovery_service is not None and self.recovery_service.requires_recovery():
+            recovered = self.recovery_service.ensure_cache()
+            return PreflightResult(
+                fact_sync=recovered.fact_sync,
+                change_set=recovered.change_set,
+                repository_status=recovered.repository_status,
+            )
         self._recover_and_require_initialized()
         for attempt in range(self.max_retries + 1):
             synced = self.fact_sync.sync("auto")

@@ -241,6 +241,11 @@ class FormalStore:
             )
         if not self._all_required_paths_exist():
             self._raise_corrupt("Formal state is only partially initialized")
+        # Git does not preserve empty directories.  The directory names are
+        # structural containers rather than formal payload, so a fresh clone
+        # may recreate only these empty paths before loading the canonical
+        # files they contain.
+        self._create_directories()
 
         self._validate_config()
         self._read_text(self._root / "PROJECT.md")
@@ -747,9 +752,9 @@ class FormalStore:
         return any((self._root / relative).exists() for relative in (*_FORMAL_FILES, *_FORMAL_DIRECTORIES))
 
     def _all_required_paths_exist(self) -> bool:
-        return all((self._root / relative).is_file() for relative in _FORMAL_FILES) and all(
-            (self._root / relative).is_dir() for relative in _FORMAL_DIRECTORIES
-        ) and (self._root / "views/TREE.md").is_file()
+        return all((self._root / relative).is_file() for relative in _FORMAL_FILES) and (
+            self._root / "views/TREE.md"
+        ).is_file()
 
     def _create_directories(self) -> None:
         self._root.mkdir(parents=True, exist_ok=True)

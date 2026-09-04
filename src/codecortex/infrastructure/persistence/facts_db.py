@@ -440,6 +440,60 @@ class FactsDatabase:
             if cursor.rowcount != 1:
                 raise ValueError("Fact cache metadata is missing")
 
+    def seed_partial_baseline_entity_snapshots(
+        self,
+        baseline_source_digest: str,
+        entities: Sequence[CodeEntity],
+    ) -> None:
+        """Seed only formally resolvable historical entities after cache recovery.
+
+        A clone has no prior cache for entities not referenced by formal
+        cognition.  These rows are useful anchors for diagnostics, but are
+        deliberately marked ``partial`` so ChangeDetector can never claim a
+        complete entity diff from this subset.
+        """
+        if (
+            not isinstance(baseline_source_digest, str)
+            or not baseline_source_digest.startswith("sha256:")
+            or len(baseline_source_digest) != 71
+        ):
+            raise ValueError("Baseline source digest must be SHA-256")
+        records = tuple(entities)
+        if any(not isinstance(entity, CodeEntity) for entity in records):
+            raise TypeError("Baseline seed entities must be CodeEntity records")
+        if len({entity.uid for entity in records}) != len(records):
+            raise ValueError("Baseline seed entities must have unique UIDs")
+        with self.open_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM baseline_entity_snapshots")
+            connection.executemany(
+                "INSERT INTO baseline_entity_snapshots "
+                "(uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(
+                    (
+                        entity.uid,
+                        baseline_source_digest,
+                        entity.relative_path,
+                        entity.address,
+                        entity.module_name,
+                        entity.qualname,
+                        entity.kind,
+                        entity.fingerprint,
+                        entity.signature,
+                    )
+                    for entity in records
+                ),
+            )
+            cursor = connection.execute(
+                "UPDATE cache_metadata "
+                "SET baseline_entity_snapshot_completeness = 'partial' "
+                "WHERE singleton_id = 1"
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Fact cache metadata is missing")
+
     def advance_graph_revision(self, graph_revision: int) -> None:
         """Point the unchanged fact cache at a newly committed graph revision.
 
