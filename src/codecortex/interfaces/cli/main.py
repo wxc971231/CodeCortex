@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from codecortex import __version__
+from codecortex.application.baseline import BaselineAdvanceService
 from codecortex.application.fact_sync import FactSyncService
 from codecortex.application.initialize import InitializationService
 from codecortex.application.ports import RepositoryContextPort
@@ -187,6 +188,13 @@ def _default_services() -> ApplicationServices:
         ),
         m1a_proposal_service=proposal_service,
         preflight_service=preflight,
+        baseline_advance_service=BaselineAdvanceService(
+            formal_store=formal_store,
+            fact_sync=fact_sync,
+            facts=facts,
+            freshness_store=FreshnessStore(cache_directory),
+            repository_lock=repository_lock,
+        ),
         cognitive_replica=replica,
     )
 

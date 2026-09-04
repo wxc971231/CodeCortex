@@ -79,6 +79,11 @@ class FormalStorePort(Protocol):
     ) -> None:
         """Commit one validated formal revision as a journaled transaction."""
 
+    def commit_baseline_advance(
+        self, state: FormalState, event: Mapping[str, object]
+    ) -> None:
+        """Commit a formal source-baseline advance without a graph revision change."""
+
     def recover(self) -> RecoveryResult:
         """Resolve interrupted transactions to a complete old or new revision."""
 

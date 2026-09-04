@@ -103,8 +103,9 @@ async def test_freshness_tools_are_readable_by_both_profiles(tmp_path: Path) -> 
 
     assert M1B_READ_TOOLS <= await _tool_names(build_server("main", services))
     assert M1B_READ_TOOLS <= await _tool_names(build_server("analyzer", services))
+    assert "advance_cognition_baseline" in await _tool_names(build_server("main", services))
     assert "advance_cognition_baseline" not in await _tool_names(
-        build_server("main", services)
+        build_server("analyzer", services)
     )
     assert "sync_repository_facts" not in await _tool_names(
         build_server("analyzer", services)

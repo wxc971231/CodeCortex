@@ -38,6 +38,7 @@ MAIN_ONLY_TOOL_NAMES = frozenset(
         "revise_cognitive_proposal",
         "cognitive_proposal",
         "apply_cognitive_proposal",
+        "advance_cognition_baseline",
     }
 )
 
@@ -372,6 +373,22 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:
+            raise tools.as_tool_error(tools.invalid_argument(error)) from error
+
+    @server.tool(name="advance_cognition_baseline")
+    def advance_cognition_baseline(
+        change_set_id: str,
+        reason: Literal["no_semantic_change", "user_accepted"],
+        decision_record: tools.DecisionRecordInput,
+        approval_record: tools.BaselineApprovalRecordInput | None = None,
+    ) -> tools.BaselineAdvanceOutput:
+        try:
+            return tools.advance_cognition_baseline(
+                services, change_set_id, reason, decision_record, approval_record
+            )
+        except CodeCortexError as error:
+            raise tools.as_tool_error(error) from error
+        except (TypeError, ValueError) as error:
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
 

@@ -112,6 +112,9 @@ _JOURNAL_FIELDS = {
     "event_id",
     "base_graph_revision",
     "target_graph_revision",
+    "transaction_kind",
+    "base_cognition_baseline",
+    "target_cognition_baseline",
     "targets",
     "removals",
 }
@@ -180,6 +183,9 @@ class _Journal:
     event_id: str
     base_graph_revision: int
     target_graph_revision: int
+    transaction_kind: str
+    base_cognition_baseline: str | None
+    target_cognition_baseline: str | None
     targets: tuple[_JournalTarget, ...]
     removals: tuple[str, ...]
 
@@ -301,6 +307,9 @@ class FormalStore:
         state: FormalState,
         event: Mapping[str, object],
         views: Mapping[str, bytes],
+        *,
+        baseline_advance: bool = False,
+        preserve_views: bool = False,
     ) -> None:
         """Commit one validated formal revision as a journaled transaction.
 
@@ -326,10 +335,13 @@ class FormalStore:
                 details={"event_id": event_id},
             )
         base_revision = self._manifest_revision()
-        if state.manifest.graph_revision != base_revision + 1:
+        expected_revision = base_revision if baseline_advance else base_revision + 1
+        if state.manifest.graph_revision != expected_revision:
             self._raise_corrupt(
                 "Commit revision does not follow the on-disk graph revision"
             )
+        if baseline_advance and event.get("event_type") != "cognition_baseline_advanced":
+            self._raise_corrupt("Baseline transaction has the wrong event type")
 
         payloads: dict[str, bytes] = {
             event_relative: canonical_json_bytes(dict(event)),
@@ -342,7 +354,7 @@ class FormalStore:
             ),
             "manifest.json": canonical_json_bytes(_manifest_to_json(state.manifest)),
         }
-        if state.view_manifest is not None:
+        if state.view_manifest is not None and not preserve_views:
             self._validate_rendered_view_manifest(state.view_manifest, views)
             payloads["view_manifest.json"] = canonical_json_bytes(
                 _view_manifest_to_json(state.view_manifest)
@@ -353,7 +365,7 @@ class FormalStore:
             payloads[relative] = payload
         for relative in payloads:
             _checked_relative(self._root, relative)
-        removals = self._view_removals(set(views))
+        removals = [] if preserve_views else self._view_removals(set(views))
 
         transaction_root = self._transactions_root()
         transaction_directory = transaction_root / event_id
@@ -385,6 +397,9 @@ class FormalStore:
             "event_id": event_id,
             "base_graph_revision": base_revision,
             "target_graph_revision": state.manifest.graph_revision,
+            "transaction_kind": "baseline_advance" if baseline_advance else "graph_apply",
+            "base_cognition_baseline": self._manifest_baseline(),
+            "target_cognition_baseline": state.manifest.cognition_baseline,
             "targets": journal_targets,
             "removals": journal_removals,
         }
@@ -400,7 +415,11 @@ class FormalStore:
             "views": sorted(
                 [
                     *views,
-                    *(["view_manifest.json"] if state.view_manifest is not None else []),
+                    *(
+                        ["view_manifest.json"]
+                        if state.view_manifest is not None and not preserve_views
+                        else []
+                    ),
                 ]
             ),
         }
@@ -417,6 +436,12 @@ class FormalStore:
         self._fsync_formal_parents((*payloads, *removals))
         shutil.rmtree(transaction_directory)
         _fsync_directory(transaction_root)
+
+    def commit_baseline_advance(
+        self, state: FormalState, event: Mapping[str, object]
+    ) -> None:
+        """Commit a source-baseline-only transaction without replacing views."""
+        self.commit(state, event, {}, baseline_advance=True, preserve_views=True)
 
     def recover(self) -> RecoveryResult:
         """Resolve interrupted formal transactions to a provable revision.
@@ -460,7 +485,16 @@ class FormalStore:
             return
         journal = self._read_journal(journal_path, transaction_directory.name)
         current_revision = self._manifest_revision()
-        if current_revision == journal.base_graph_revision:
+        if journal.transaction_kind == "baseline_advance":
+            current_baseline = self._manifest_baseline()
+            if current_baseline == journal.base_cognition_baseline:
+                self._rollback(transaction_directory, journal)
+                restored.append(transaction_directory.name)
+            elif current_baseline == journal.target_cognition_baseline:
+                completed.append(transaction_directory.name)
+            else:
+                self._raise_corrupt("Interrupted baseline transaction has an unknown baseline")
+        elif current_revision == journal.base_graph_revision:
             self._rollback(transaction_directory, journal)
             restored.append(transaction_directory.name)
         elif current_revision == journal.target_graph_revision:
@@ -515,9 +549,20 @@ class FormalStore:
             type(base_revision) is not int
             or type(target_revision) is not int
             or base_revision < 0
-            or target_revision != base_revision + 1
+            or target_revision < base_revision
         ):
             self._raise_corrupt("Transaction journal revisions are invalid")
+        transaction_kind = data["transaction_kind"]
+        base_baseline = data["base_cognition_baseline"]
+        target_baseline = data["target_cognition_baseline"]
+        if transaction_kind not in ("graph_apply", "baseline_advance"):
+            self._raise_corrupt("Transaction journal kind is invalid")
+        if transaction_kind == "graph_apply" and target_revision != base_revision + 1:
+            self._raise_corrupt("Graph transaction revisions are invalid")
+        if transaction_kind == "baseline_advance" and target_revision != base_revision:
+            self._raise_corrupt("Baseline transaction revisions are invalid")
+        if not all(value is None or _is_digest(value) for value in (base_baseline, target_baseline)):
+            self._raise_corrupt("Transaction journal baseline digest is invalid")
         targets = data["targets"]
         removals = data["removals"]
         if not isinstance(targets, list) or not all(
@@ -547,6 +592,9 @@ class FormalStore:
             event_id=event_id,
             base_graph_revision=base_revision,
             target_graph_revision=target_revision,
+            transaction_kind=transaction_kind,
+            base_cognition_baseline=base_baseline,
+            target_cognition_baseline=target_baseline,
             targets=tuple(journal_targets),
             removals=tuple(journal_removals),
         )
@@ -557,6 +605,12 @@ class FormalStore:
         if type(revision) is not int:
             self._raise_corrupt("manifest.json graph_revision must be an integer")
         return revision
+
+    def _manifest_baseline(self) -> str | None:
+        baseline = self._read_object(self._root / "manifest.json").get("cognition_baseline")
+        if baseline is not None and (not isinstance(baseline, str) or not _is_digest(baseline)):
+            self._raise_corrupt("manifest.json cognition_baseline is invalid")
+        return baseline
 
     def _transactions_root(self) -> Path:
         return self._root / ".cache" / "transactions"
@@ -834,9 +888,59 @@ class FormalStore:
                 self._raise_corrupt("History event identity or type is invalid", cause=error)
             if path.stem != event_id:
                 self._raise_corrupt("History event filename does not match its event ID")
-            self._validate_applied_event(data)
+            self._validate_history_event(data)
             events.append(HistoryEventRef(event_id, event_type))
         return tuple(events)
+
+    def _validate_history_event(self, event: Mapping[str, object]) -> None:
+        if event.get("event_type") == "cognition_baseline_advanced":
+            self._validate_baseline_advanced_event(event)
+            return
+        self._validate_applied_event(event)
+
+    def _validate_baseline_advanced_event(self, event: Mapping[str, object]) -> None:
+        required = {
+            "schema_version", "event_id", "event_type", "graph_revision",
+            "change_set_id", "before_source_digest", "after_source_digest", "reason",
+            "decision_record", "approval", "change_set_summary", "applied_at",
+        }
+        if set(event) != required:
+            self._raise_corrupt("Baseline advance event fields are invalid")
+        if not _is_id(event.get("event_id"), IdPrefix.EVENT) or not _is_id(
+            event.get("change_set_id"), IdPrefix.CHANGE_SET
+        ):
+            self._raise_corrupt("Baseline advance event IDs are invalid")
+        graph_revision = event.get("graph_revision")
+        if type(graph_revision) is not int or graph_revision < 0:
+            self._raise_corrupt("Baseline advance event graph revision is invalid")
+        if not _is_digest(event.get("before_source_digest")) or not _is_digest(event.get("after_source_digest")):
+            self._raise_corrupt("Baseline advance event digests are invalid")
+        reason = event.get("reason")
+        if reason not in ("no_semantic_change", "user_accepted"):
+            self._raise_corrupt("Baseline advance reason is invalid")
+        decision = event.get("decision_record")
+        if not isinstance(decision, Mapping) or decision.get("decided_by") not in ("analyzer", "main_codex") or not isinstance(decision.get("evidence_summary"), str) or not decision["evidence_summary"].strip() or not isinstance(decision.get("decided_at"), str) or not decision["decided_at"].endswith("Z"):
+            self._raise_corrupt("Baseline advance decision record is invalid")
+        approval = event.get("approval")
+        if reason == "no_semantic_change" and approval is not None:
+            self._raise_corrupt("Automatic baseline advance cannot carry approval")
+        if reason == "user_accepted" and (
+            not isinstance(approval, Mapping)
+            or approval.get("change_set_id") != event.get("change_set_id")
+            or approval.get("source_digest") != event.get("after_source_digest")
+            or approval.get("approved_by") != "user"
+            or not isinstance(approval.get("approved_at"), str)
+            or not approval["approved_at"].endswith("Z")
+            or not isinstance(approval.get("approval_summary"), str)
+            or not approval["approval_summary"].strip()
+        ):
+            self._raise_corrupt("Baseline advance approval is invalid")
+        summary = event.get("change_set_summary")
+        if not isinstance(summary, Mapping) or _CHANGE_SET_SUMMARY_REQUIRED_FIELDS - set(summary) or summary.get("before_source_digest") != event.get("before_source_digest") or summary.get("after_source_digest") != event.get("after_source_digest"):
+            self._raise_corrupt("Baseline advance ChangeSet summary is invalid")
+        applied_at = event.get("applied_at")
+        if not isinstance(applied_at, str) or not applied_at.endswith("Z"):
+            self._raise_corrupt("Baseline advance timestamp is invalid")
 
     def _validate_applied_event(self, event: Mapping[str, object]) -> None:
         """Validate the M0 audit payload, not merely its filename and type.

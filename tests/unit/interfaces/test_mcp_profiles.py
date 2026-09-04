@@ -33,6 +33,7 @@ MAIN_TOOLS = ANALYZER_TOOLS | {
     "revise_cognitive_proposal",
     "cognitive_proposal",
     "apply_cognitive_proposal",
+    "advance_cognition_baseline",
 }
 
 

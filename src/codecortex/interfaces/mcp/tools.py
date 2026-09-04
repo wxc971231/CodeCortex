@@ -8,6 +8,7 @@ from typing import Any, Literal
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
 
+from codecortex.application.baseline import BaselineApprovalRecord, DecisionRecord
 from codecortex.application.freshness import FreshnessService
 from codecortex.application.services import ApplicationServices, RepositoryOverview
 from codecortex.domain.cognition import CognitiveGraph, ValidationResult
@@ -138,6 +139,36 @@ class ApplyProposalOutput(_Dto):
     graph_revision: int
     applied_proposal_id: str
     cache_warnings: list[str] = Field(default_factory=list)
+
+
+class DecisionRecordInput(_Dto):
+    decided_by: Literal["analyzer", "main_codex"]
+    evidence_summary: str = Field(min_length=1, max_length=4_000)
+    decided_at: str = Field(min_length=1, max_length=64)
+
+    def to_domain(self) -> DecisionRecord:
+        return DecisionRecord(self.decided_by, self.evidence_summary, self.decided_at)
+
+
+class BaselineApprovalRecordInput(_Dto):
+    change_set_id: str = Field(min_length=1, max_length=64)
+    source_digest: str = Field(min_length=1, max_length=80)
+    approved_by: Literal["user"]
+    approved_at: str = Field(min_length=1, max_length=64)
+    approval_summary: str = Field(min_length=1, max_length=4_000)
+
+    def to_domain(self) -> BaselineApprovalRecord:
+        return BaselineApprovalRecord(
+            self.change_set_id, self.source_digest, self.approved_by,
+            self.approved_at, self.approval_summary,
+        )
+
+
+class BaselineAdvanceOutput(_Dto):
+    event_id: str
+    graph_revision: int
+    previous_source_digest: str
+    current_source_digest: str
 
 
 def repository_overview(services: ApplicationServices) -> RepositoryOverviewOutput:
@@ -328,6 +359,27 @@ def apply_cognitive_proposal(
         graph_revision=result.graph_revision,
         applied_proposal_id=result.applied_proposal_id,
         cache_warnings=list(result.cache_warnings),
+    )
+
+
+def advance_cognition_baseline(
+    services: ApplicationServices,
+    change_set_id: str,
+    reason: Literal["no_semantic_change", "user_accepted"],
+    decision_record: DecisionRecordInput,
+    approval_record: BaselineApprovalRecordInput | None = None,
+) -> BaselineAdvanceOutput:
+    result = services.advance_cognition_baseline(
+        change_set_id,
+        reason,
+        decision_record.to_domain(),
+        None if approval_record is None else approval_record.to_domain(),
+    )
+    return BaselineAdvanceOutput(
+        event_id=result.event_id,
+        graph_revision=result.graph_revision,
+        previous_source_digest=result.previous_source_digest,
+        current_source_digest=result.current_source_digest,
     )
 
 

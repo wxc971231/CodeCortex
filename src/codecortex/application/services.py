@@ -61,6 +61,13 @@ from codecortex.infrastructure.persistence.graph_replica import (
 )
 
 if TYPE_CHECKING:
+    from codecortex.application.baseline import (
+        BaselineAdvanceReason,
+        BaselineAdvanceResult,
+        BaselineAdvanceService,
+        BaselineApprovalRecord,
+        DecisionRecord,
+    )
     from codecortex.application.initialize import InitializationService
     from codecortex.application.preflight import PreflightResult, PreflightService
     from codecortex.application.proposals import ProposalService
@@ -117,6 +124,7 @@ class ApplicationServices:
     initialization_service: InitializationService | None = None
     m1a_proposal_service: ProposalService | None = None
     preflight_service: PreflightService | None = None
+    baseline_advance_service: BaselineAdvanceService | None = None
     cognitive_replica: GraphReplica | None = None
     cognitive_graph_max_objects: int = 500
 
@@ -183,6 +191,19 @@ class ApplicationServices:
                 "Fact Preflight is not configured",
             )
         return self.preflight_service.run()
+
+    def advance_cognition_baseline(
+        self,
+        change_set_id: str,
+        reason: BaselineAdvanceReason,
+        decision_record: DecisionRecord,
+        approval_record: BaselineApprovalRecord | None,
+    ) -> BaselineAdvanceResult:
+        if self.baseline_advance_service is None:
+            raise CodeCortexError(ErrorCode.NOT_INITIALIZED, "Baseline advance is not configured")
+        return self.baseline_advance_service.advance(
+            change_set_id, reason, decision_record, approval_record
+        )
 
     def freshness_snapshot(self, *, preflight: bool) -> FreshnessSnapshot:
         """Return freshness after Main preparation or from Analyzer's read view.
