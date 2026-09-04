@@ -3,12 +3,18 @@
 import hashlib
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from codecortex.application.discussion import (
+    DiscussionPlan,
+    DiscussionPlanner,
+    InvocationState,
+    QuestionScope,
+)
 from codecortex.application.fact_sync import FactSyncResult
 from codecortex.application.freshness import (
     FreshnessService,
@@ -57,6 +63,7 @@ from codecortex.infrastructure.formal import view_manifest_for
 from codecortex.infrastructure.persistence.graph_replica import (
     ContextRequest,
     DiscussionContext,
+    GraphHit,
     GraphReplica,
 )
 
@@ -191,6 +198,24 @@ class ApplicationServices:
                 "Fact Preflight is not configured",
             )
         return self.preflight_service.run()
+
+    def plan_discussion(
+        self,
+        question_scope: QuestionScope,
+        candidates: Sequence[GraphHit],
+        invocation: InvocationState,
+    ) -> DiscussionPlan:
+        """Prepare one explicit discussion through the mandatory fact gate.
+
+        The caller performs bounded candidate recall and semantic confirmation;
+        this entry recomputes the deterministic source coordinate immediately
+        before deriving the route.  It has no Agent invocation and no formal
+        cognition write path.
+        """
+        result = self.run_preflight()
+        return DiscussionPlanner(FreshnessService(result.change_set)).plan(
+            question_scope, candidates, invocation
+        )
 
     def advance_cognition_baseline(
         self,
