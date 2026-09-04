@@ -162,6 +162,15 @@ class FactEntitySnapshot:
 
 
 @dataclass(frozen=True)
+class SourceFileStatus:
+    """Current parse state needed for conservative freshness decisions."""
+
+    relative_path: str
+    parse_status: str
+    diagnostic_count: int
+
+
+@dataclass(frozen=True)
 class ModulePartition:
     """One package/module partition of the current managed-source facts."""
 
@@ -342,6 +351,60 @@ class FactsDatabase:
             )
             for row in rows
         )
+
+    def source_file_statuses(self) -> tuple[SourceFileStatus, ...]:
+        """Return every current source file's parse state in stable path order."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relative_path, parse_status, diagnostic_count FROM source_files "
+                "ORDER BY relative_path"
+            ).fetchall()
+        return tuple(
+            SourceFileStatus(
+                relative_path=row["relative_path"],
+                parse_status=row["parse_status"],
+                diagnostic_count=row["diagnostic_count"],
+            )
+            for row in rows
+        )
+
+    def diagnostic_codes_for_paths(
+        self, relative_paths: Sequence[str]
+    ) -> dict[str, tuple[str, ...]]:
+        """Return current parse/analysis diagnostic codes for explicit source paths."""
+        paths = _validated_non_empty_strings(relative_paths, "Source path list")
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT sf.relative_path, d.code FROM diagnostics AS d "
+                "JOIN source_files AS sf ON sf.file_id = d.file_id "
+                f"WHERE sf.relative_path IN ({_placeholders(paths)}) "
+                "ORDER BY sf.relative_path, d.code",
+                paths,
+            ).fetchall()
+        codes: dict[str, list[str]] = {}
+        for row in rows:
+            codes.setdefault(row["relative_path"], []).append(row["code"])
+        return {path: tuple(values) for path, values in codes.items()}
+
+    def relations_touching_entity_uids(
+        self, entity_uids: Sequence[str]
+    ) -> tuple[CodeRelation, ...]:
+        """Return one-hop local dependency facts touching the supplied entities."""
+        uids = _validated_non_empty_strings(entity_uids, "Entity UID list")
+        if len(uids) > self.max_relation_entity_uids:
+            raise ValueError("Entity UID list exceeds the configured maximum")
+        placeholders = _placeholders(uids)
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relation_id, relation_type, source_uid, source_file_id, "
+                "target_uid, target_module, target_address, raw_expression, "
+                "resolution_status, confidence, resolver_version, relation_key "
+                "FROM relations WHERE relation_type IN ('imports', 'inherits', 'calls') "
+                f"AND (source_uid IN ({placeholders}) OR target_uid IN ({placeholders})) "
+                "ORDER BY relation_id",
+                (*uids, *uids),
+            ).fetchall()
+        return tuple(_code_relation_from_row(row) for row in rows)
 
     def replace_baseline_entity_snapshots(self, baseline_source_digest: str) -> None:
         """Copy every current entity into the baseline snapshot table.

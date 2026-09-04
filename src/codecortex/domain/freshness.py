@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 DiffCompleteness = Literal["complete", "partial"]
@@ -71,6 +71,55 @@ class EntityChanges:
 
 
 @dataclass(frozen=True)
+class UnmappedChange:
+    """A concrete source item Core could not prove safe for cognition scope."""
+
+    relative_path: str
+    reason: str
+    entity_uid: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.relative_path, str) or not self.relative_path:
+            raise ValueError("Unmapped change path must be non-empty")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("Unmapped change reason must be non-empty")
+        if self.entity_uid is not None and (
+            not isinstance(self.entity_uid, str) or not self.entity_uid
+        ):
+            raise ValueError("Unmapped change entity ID must be text or null")
+
+
+@dataclass(frozen=True)
+class AffectedScope:
+    """Conservative formal-cognition scope of one still-pending ChangeSet."""
+
+    affected_nodes: tuple[str, ...] = ()
+    affected_flows: tuple[str, ...] = ()
+    affected_entities: tuple[str, ...] = ()
+    unmapped_changes: tuple[UnmappedChange, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+    scope_confidence: ScopeConfidence = "unknown"
+
+    def __post_init__(self) -> None:
+        for name, values in (
+            ("affected node IDs", self.affected_nodes),
+            ("affected flow IDs", self.affected_flows),
+            ("affected entity IDs", self.affected_entities),
+            ("diagnostics", self.diagnostics),
+        ):
+            _sorted_unique(values, name)
+        if self.unmapped_changes != tuple(
+            sorted(
+                set(self.unmapped_changes),
+                key=lambda item: (item.relative_path, item.entity_uid or "", item.reason),
+            )
+        ):
+            raise ValueError("Unmapped changes must be sorted and unique")
+        if self.scope_confidence not in ("complete", "partial", "unknown"):
+            raise ValueError("Scope confidence is invalid")
+
+
+@dataclass(frozen=True)
 class ChangeSet:
     """The one effective difference from accepted cognition baseline to now."""
 
@@ -120,6 +169,25 @@ class ChangeSet:
             _sorted_unique(values, name)
         if not all(isinstance(value, dict) for value in self.unmapped_changes):
             raise ValueError("Unmapped changes must be object records")
+
+    def with_affected_scope(self, scope: AffectedScope) -> ChangeSet:
+        """Return this immutable ChangeSet annotated by deterministic scope work."""
+        return replace(
+            self,
+            affected_nodes=scope.affected_nodes,
+            affected_flows=scope.affected_flows,
+            affected_entities=scope.affected_entities,
+            scope_confidence=scope.scope_confidence,
+            unmapped_changes=tuple(
+                {
+                    "relative_path": item.relative_path,
+                    "entity_uid": item.entity_uid,
+                    "reason": item.reason,
+                }
+                for item in scope.unmapped_changes
+            ),
+            diagnostics=scope.diagnostics,
+        )
 
 
 def _is_digest(value: str) -> bool:
