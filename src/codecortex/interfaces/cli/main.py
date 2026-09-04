@@ -20,6 +20,7 @@ from codecortex import __version__
 from codecortex.application.fact_sync import FactSyncService
 from codecortex.application.initialize import InitializationService
 from codecortex.application.ports import RepositoryContextPort
+from codecortex.application.preflight import PreflightService
 from codecortex.application.proposals import ManagedSourceSnapshot, ProposalService
 from codecortex.application.query import QueryService
 from codecortex.application.replica_providers import (
@@ -32,6 +33,7 @@ from codecortex.domain.facts import DigestProfile, SourceConfig
 from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
+from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.python.digest import (
     digest_source_file,
@@ -157,6 +159,13 @@ def _default_services() -> ApplicationServices:
         facts=facts,
         replica=replica,
     )
+    preflight = PreflightService(
+        formal_store=formal_store,
+        fact_sync=fact_sync,
+        facts=facts,
+        freshness_store=FreshnessStore(cache_directory),
+        repository_lock=repository_lock,
+    )
     return ApplicationServices(
         repository=context,
         formal_store=formal_store,
@@ -177,6 +186,7 @@ def _default_services() -> ApplicationServices:
             proposal_service=proposal_service,
         ),
         m1a_proposal_service=proposal_service,
+        preflight_service=preflight,
         cognitive_replica=replica,
     )
 

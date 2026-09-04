@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from codecortex.application.fact_sync import FactSyncResult
+from codecortex.application.freshness import (
+    FreshnessService,
+    RepositoryFreshnessSummary,
+)
 from codecortex.application.ports import (
     FactSyncPort,
     FormalStorePort,
@@ -38,6 +42,7 @@ from codecortex.domain.cognition import (
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.freshness import ChangeSet
 from codecortex.domain.ids import IdPrefix, new_id
 from codecortex.domain.proposals import (
     ApprovalRecord,
@@ -80,6 +85,21 @@ class ApplyResult:
     graph_revision: int
     applied_proposal_id: str
     cache_warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FreshnessSnapshot:
+    """One verified repository freshness view for an MCP caller.
+
+    Main obtains this by running deterministic Fact Preflight.  Analyzer may
+    only read the already prepared cache/formal coordinate, so its sandbox
+    never receives a cache-writing synchronization path.
+    """
+
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set: ChangeSet | None
+    repository_status: RepositoryFreshnessSummary
 
 
 @dataclass
@@ -163,6 +183,89 @@ class ApplicationServices:
                 "Fact Preflight is not configured",
             )
         return self.preflight_service.run()
+
+    def freshness_snapshot(self, *, preflight: bool) -> FreshnessSnapshot:
+        """Return freshness after Main preparation or from Analyzer's read view.
+
+        A read-only Analyzer is intentionally unable to repair stale cache
+        state.  It must fail closed and ask Main to run the deterministic gate.
+        """
+        if preflight:
+            result = self.run_preflight()
+            change_set = result.change_set
+            return FreshnessSnapshot(
+                baseline_source_digest=(
+                    result.fact_sync.repository_source_digest
+                    if change_set is None
+                    else change_set.baseline_source_digest
+                ),
+                current_source_digest=result.fact_sync.repository_source_digest,
+                change_set=change_set,
+                repository_status=result.repository_status,
+            )
+        return self._prepared_freshness_snapshot()
+
+    def _prepared_freshness_snapshot(self) -> FreshnessSnapshot:
+        """Read a Main-prepared freshness coordinate without modifying cache."""
+        preflight_service = self.preflight_service
+        if preflight_service is None:
+            raise CodeCortexError(
+                ErrorCode.CACHE_REBUILD_REQUIRED,
+                "Read-only freshness is unavailable until Main runs Fact Preflight",
+                suggested_action="Ask Main CodeCortex to run cognitive_freshness first",
+            )
+        try:
+            with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+                state = self.formal_store.load()
+                if not state.manifest.cognition_initialized:
+                    raise CodeCortexError(
+                        ErrorCode.NOT_INITIALIZED,
+                        "M1b freshness requires initialized repository cognition",
+                    )
+                baseline = state.manifest.cognition_baseline
+                if baseline is None:
+                    raise CodeCortexError(
+                        ErrorCode.FORMAL_STATE_CORRUPT,
+                        "Initialized cognition has no formal source baseline",
+                    )
+                metadata = preflight_service.facts.cache_metadata()
+                if metadata.graph_revision != state.manifest.graph_revision:
+                    raise _freshness_cache_error("Fact cache graph revision is stale")
+                if (
+                    metadata.digest_profile_version
+                    != state.manifest.digest_profile_version
+                    or metadata.managed_source_set_version
+                    != state.manifest.managed_source_set_version
+                ):
+                    raise _freshness_cache_error(
+                        "Fact cache digest profile does not match formal source baseline"
+                    )
+                change_set = preflight_service.freshness_store.load_effective()
+                current = metadata.repository_source_digest
+                if current == baseline:
+                    if change_set is not None:
+                        raise _freshness_cache_error(
+                            "Fresh cache has an unexpected effective ChangeSet"
+                        )
+                elif (
+                    change_set is None
+                    or change_set.baseline_source_digest != baseline
+                    or change_set.current_source_digest != current
+                ):
+                    raise _freshness_cache_error(
+                        "Fact cache and effective ChangeSet do not describe one source coordinate"
+                    )
+                summary = FreshnessService(change_set).repository_status()
+                return FreshnessSnapshot(
+                    baseline_source_digest=baseline,
+                    current_source_digest=current,
+                    change_set=change_set,
+                    repository_status=summary,
+                )
+        except CodeCortexError:
+            raise
+        except (OSError, ValueError) as error:
+            raise _freshness_cache_error("Prepared freshness cache is unreadable") from error
 
     def repository_facts(
         self,
@@ -757,4 +860,14 @@ def _invalid_patch(message: str) -> CodeCortexError:
         ErrorCode.ANALYSIS_REPORT_INVALID,
         message,
         suggested_action="Revise or recreate the proposal",
+    )
+
+
+def _freshness_cache_error(message: str) -> CodeCortexError:
+    """Return the single fail-closed error for an Analyzer cache mismatch."""
+    return CodeCortexError(
+        ErrorCode.CACHE_REBUILD_REQUIRED,
+        message,
+        retryable=True,
+        suggested_action="Ask Main CodeCortex to run Fact Preflight and retry",
     )

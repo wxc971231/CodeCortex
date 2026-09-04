@@ -24,6 +24,9 @@ READ_TOOL_NAMES = frozenset(
         "resolve_entity_context",
         "get_discussion_context",
         "search_cognitive_graph",
+        "cognitive_freshness",
+        "pending_changes",
+        "effective_query_freshness",
     }
 )
 MAIN_ONLY_TOOL_NAMES = frozenset(
@@ -46,7 +49,7 @@ def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:
     if profile not in ("main", "analyzer"):
         raise ValueError(f"Unsupported MCP profile: {profile}")
     server = MCPServer("CodeCortex")
-    _register_read_tools(server, services)
+    _register_read_tools(server, services, preflight=(profile == "main"))
     if profile == "main":
         _register_main_tools(server, services)
     return server
@@ -82,14 +85,16 @@ def _recover_main_formal_state(profile: Profile, services: ApplicationServices) 
             raise
 
 
-def _register_read_tools(server: MCPServer, services: ApplicationServices) -> None:
+def _register_read_tools(
+    server: MCPServer, services: ApplicationServices, *, preflight: bool
+) -> None:
     @server.tool(name="repository_overview")
     def repository_overview() -> tools.RepositoryOverviewOutput:
         try:
             return tools.repository_overview(services)
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_graph")
@@ -248,6 +253,48 @@ def _register_read_tools(server: MCPServer, services: ApplicationServices) -> No
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:
+            raise tools.as_tool_error(tools.invalid_argument(error)) from error
+
+    @server.tool(name="cognitive_freshness")
+    def cognitive_freshness() -> tools.CognitiveFreshnessOutput:
+        try:
+            return tools.cognitive_freshness(services, preflight=preflight)
+        except CodeCortexError as error:
+            raise tools.as_tool_error(error) from error
+        except (TypeError, ValueError) as error:
+            raise tools.as_tool_error(tools.invalid_argument(error)) from error
+
+    @server.tool(name="pending_changes")
+    def pending_changes(
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> tools.PendingChangesOutput:
+        try:
+            return tools.pending_changes(
+                services, cursor=cursor, limit=limit, preflight=preflight
+            )
+        except CodeCortexError as error:
+            raise tools.as_tool_error(error) from error
+        except (TypeError, ValueError) as error:
+            raise tools.as_tool_error(tools.invalid_argument(error)) from error
+
+    @server.tool(name="effective_query_freshness")
+    def effective_query_freshness(
+        node_ids: list[str] | None = None,
+        entity_ids: list[str] | None = None,
+        max_unmapped_changes: int = 50,
+    ) -> tools.EffectiveQueryFreshnessOutput:
+        try:
+            return tools.effective_query_freshness(
+                services,
+                node_ids=node_ids or (),
+                entity_ids=entity_ids or (),
+                max_unmapped_changes=max_unmapped_changes,
+                preflight=preflight,
+            )
+        except CodeCortexError as error:
+            raise tools.as_tool_error(error) from error
+        except (TypeError, ValueError) as error:
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
 

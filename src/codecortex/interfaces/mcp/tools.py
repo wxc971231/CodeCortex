@@ -8,6 +8,7 @@ from typing import Any, Literal
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
 
+from codecortex.application.freshness import FreshnessService
 from codecortex.application.services import ApplicationServices, RepositoryOverview
 from codecortex.domain.cognition import CognitiveGraph, ValidationResult
 from codecortex.domain.errors import CodeCortexError, ErrorCode
@@ -411,6 +412,67 @@ class SyncFactsOutput(_Dto):
     diagnostics: list[dict[str, Any]]
 
 
+class CognitiveFreshnessOutput(_Dto):
+    """Bounded repository-level cognition freshness and ChangeSet summary."""
+
+    repository_status: Literal["fresh", "pending", "unresolved"]
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set_id: str | None
+    file_diff_completeness: Literal["complete", "partial"] | None
+    entity_diff_completeness: Literal["complete", "partial"] | None
+    scope_confidence: Literal["complete", "partial", "unknown"] | None
+    affected_nodes: list[str]
+    affected_flows: list[str]
+    affected_entities: list[str]
+    diagnostics: list[str]
+    reason_codes: list[str]
+    truncated: bool
+
+
+class PendingChangesOutput(_Dto):
+    """One bounded page over the single effective baseline-to-current ChangeSet."""
+
+    repository_status: Literal["fresh", "pending", "unresolved"]
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set_id: str | None
+    file_diff_completeness: Literal["complete", "partial"] | None
+    entity_diff_completeness: Literal["complete", "partial"] | None
+    scope_confidence: Literal["complete", "partial", "unknown"] | None
+    changed_files: list[dict[str, Any]]
+    changed_entities: list[dict[str, Any]]
+    affected_nodes: list[str]
+    affected_flows: list[str]
+    affected_entities: list[str]
+    unmapped_changes: list[dict[str, Any]]
+    diagnostics: list[str]
+    reason_codes: list[str]
+    cursor: str | None
+    truncated: bool
+
+
+class EffectiveQueryFreshnessOutput(_Dto):
+    """Bounded, auditable route decision for a supplied graph/entity scope."""
+
+    status: Literal[
+        "current",
+        "unaffected_current",
+        "affected_source_first",
+        "unknown_source_first",
+    ]
+    repository_status: Literal["fresh", "pending", "unresolved"]
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set_id: str | None
+    scope_confidence: Literal["complete", "partial", "unknown"] | None
+    matched_affected_nodes: list[str]
+    matched_affected_entities: list[str]
+    unmapped_changes: list[dict[str, Any]]
+    unmapped_changes_truncated: bool
+    reason_codes: list[str]
+
+
 def repository_facts(
     services: ApplicationServices,
     scope: str,
@@ -586,6 +648,247 @@ def sync_repository_facts(
     )
 
 
+_MAX_FRESHNESS_PAGE_SIZE = 100
+_DEFAULT_FRESHNESS_PAGE_SIZE = 50
+_MAX_QUERY_SCOPE_IDS = 100
+
+
+def cognitive_freshness(
+    services: ApplicationServices, *, preflight: bool
+) -> CognitiveFreshnessOutput:
+    """Return a bounded repository status after Main prep or Analyzer readback."""
+    snapshot = services.freshness_snapshot(preflight=preflight)
+    change_set = snapshot.change_set
+    if change_set is None:
+        return CognitiveFreshnessOutput(
+            repository_status=snapshot.repository_status.status,
+            baseline_source_digest=snapshot.baseline_source_digest,
+            current_source_digest=snapshot.current_source_digest,
+            change_set_id=None,
+            file_diff_completeness=None,
+            entity_diff_completeness=None,
+            scope_confidence=None,
+            affected_nodes=[],
+            affected_flows=[],
+            affected_entities=[],
+            diagnostics=[],
+            reason_codes=list(snapshot.repository_status.reason_codes),
+            truncated=False,
+        )
+    affected_nodes, nodes_truncated = _bounded_items(
+        change_set.affected_nodes, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    affected_flows, flows_truncated = _bounded_items(
+        change_set.affected_flows, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    affected_entities, entities_truncated = _bounded_items(
+        change_set.affected_entities, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    diagnostics, diagnostics_truncated = _bounded_items(
+        change_set.diagnostics, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    return CognitiveFreshnessOutput(
+        repository_status=snapshot.repository_status.status,
+        baseline_source_digest=snapshot.baseline_source_digest,
+        current_source_digest=snapshot.current_source_digest,
+        change_set_id=change_set.change_set_id,
+        file_diff_completeness=change_set.file_diff_completeness,
+        entity_diff_completeness=change_set.entity_diff_completeness,
+        scope_confidence=change_set.scope_confidence,
+        affected_nodes=list(affected_nodes),
+        affected_flows=list(affected_flows),
+        affected_entities=list(affected_entities),
+        diagnostics=list(diagnostics),
+        reason_codes=list(snapshot.repository_status.reason_codes),
+        truncated=(
+            nodes_truncated
+            or flows_truncated
+            or entities_truncated
+            or diagnostics_truncated
+            or len(change_set.unmapped_changes) > _DEFAULT_FRESHNESS_PAGE_SIZE
+        ),
+    )
+
+
+def pending_changes(
+    services: ApplicationServices,
+    cursor: str | None = None,
+    limit: int = _DEFAULT_FRESHNESS_PAGE_SIZE,
+    *,
+    preflight: bool,
+) -> PendingChangesOutput:
+    """Return bounded details of the one effective ChangeSet, if any."""
+    offset, page_size = _page_window(cursor, limit)
+    snapshot = services.freshness_snapshot(preflight=preflight)
+    change_set = snapshot.change_set
+    if change_set is None:
+        return PendingChangesOutput(
+            repository_status=snapshot.repository_status.status,
+            baseline_source_digest=snapshot.baseline_source_digest,
+            current_source_digest=snapshot.current_source_digest,
+            change_set_id=None,
+            file_diff_completeness=None,
+            entity_diff_completeness=None,
+            scope_confidence=None,
+            changed_files=[],
+            changed_entities=[],
+            affected_nodes=[],
+            affected_flows=[],
+            affected_entities=[],
+            unmapped_changes=[],
+            diagnostics=[],
+            reason_codes=list(snapshot.repository_status.reason_codes),
+            cursor=None,
+            truncated=False,
+        )
+    collections: tuple[Sequence[Any], ...] = (
+        _file_changes(change_set),
+        _entity_changes(change_set),
+        change_set.affected_nodes,
+        change_set.affected_flows,
+        change_set.affected_entities,
+        change_set.unmapped_changes,
+        change_set.diagnostics,
+    )
+    pages = [_bounded_items(values, offset, page_size) for values in collections]
+    truncated = any(is_truncated for _, is_truncated in pages)
+    next_cursor = str(offset + page_size) if truncated else None
+    changed_files, changed_entities, nodes, flows, entities, unmapped, diagnostics = (
+        page for page, _ in pages
+    )
+    return PendingChangesOutput(
+        repository_status=snapshot.repository_status.status,
+        baseline_source_digest=snapshot.baseline_source_digest,
+        current_source_digest=snapshot.current_source_digest,
+        change_set_id=change_set.change_set_id,
+        file_diff_completeness=change_set.file_diff_completeness,
+        entity_diff_completeness=change_set.entity_diff_completeness,
+        scope_confidence=change_set.scope_confidence,
+        changed_files=[dict(item) for item in changed_files],
+        changed_entities=[dict(item) for item in changed_entities],
+        affected_nodes=list(nodes),
+        affected_flows=list(flows),
+        affected_entities=list(entities),
+        unmapped_changes=[dict(item) for item in unmapped],
+        diagnostics=list(diagnostics),
+        reason_codes=list(snapshot.repository_status.reason_codes),
+        cursor=next_cursor,
+        truncated=truncated,
+    )
+
+
+def effective_query_freshness(
+    services: ApplicationServices,
+    node_ids: Sequence[str] = (),
+    entity_ids: Sequence[str] = (),
+    max_unmapped_changes: int = _DEFAULT_FRESHNESS_PAGE_SIZE,
+    *,
+    preflight: bool,
+) -> EffectiveQueryFreshnessOutput:
+    """Return Core's local source-first decision without unbounded evidence."""
+    nodes = _bounded_identifiers(node_ids, "node_ids")
+    entities = _bounded_identifiers(entity_ids, "entity_ids")
+    detail_limit = _bounded_limit(max_unmapped_changes, "max_unmapped_changes")
+    snapshot = services.freshness_snapshot(preflight=preflight)
+    result = FreshnessService(snapshot.change_set).for_query(nodes, entities)
+    unmapped, unmapped_truncated = _bounded_items(
+        result.unmapped_changes, 0, detail_limit
+    )
+    return EffectiveQueryFreshnessOutput(
+        status=result.status,
+        repository_status=result.repository_status,
+        baseline_source_digest=snapshot.baseline_source_digest,
+        current_source_digest=snapshot.current_source_digest,
+        change_set_id=result.change_set_id,
+        scope_confidence=result.scope_confidence,
+        matched_affected_nodes=list(result.matched_affected_nodes),
+        matched_affected_entities=list(result.matched_affected_entities),
+        unmapped_changes=[dict(item) for item in unmapped],
+        unmapped_changes_truncated=unmapped_truncated,
+        reason_codes=list(result.reason_codes),
+    )
+
+
+def _file_changes(change_set: Any) -> tuple[dict[str, object], ...]:
+    records = [
+        {"kind": kind, "relative_path": path}
+        for kind, paths in (
+            ("added", change_set.changed_files.added),
+            ("modified", change_set.changed_files.modified),
+            ("deleted", change_set.changed_files.deleted),
+        )
+        for path in paths
+    ]
+    records.extend(
+        {"kind": "renamed", "old_relative_path": old, "relative_path": new}
+        for old, new in change_set.changed_files.renamed
+    )
+    return tuple(sorted(records, key=lambda item: (str(item.get("relative_path")), str(item["kind"]))))
+
+
+def _entity_changes(change_set: Any) -> tuple[dict[str, object], ...]:
+    records = [
+        {"kind": kind, "entity_uid": uid}
+        for kind, entities in (
+            ("added", change_set.changed_entities.added),
+            ("modified", change_set.changed_entities.modified),
+            ("missing", change_set.changed_entities.missing),
+        )
+        for uid in entities
+    ]
+    records.extend(
+        {
+            "kind": "moved",
+            "entity_uid": uid,
+            "old_relative_path": old,
+            "relative_path": new,
+        }
+        for uid, old, new in change_set.changed_entities.moved
+    )
+    return tuple(sorted(records, key=lambda item: (str(item["entity_uid"]), str(item["kind"]))))
+
+
+def _page_window(cursor: str | None, limit: int) -> tuple[int, int]:
+    if cursor is None:
+        offset = 0
+    elif (
+        isinstance(cursor, str)
+        and len(cursor) <= 10
+        and cursor.isascii()
+        and cursor.isdecimal()
+    ):
+        offset = int(cursor)
+    else:
+        raise ValueError("cursor must be a non-negative decimal offset")
+    return offset, _bounded_limit(limit, "limit")
+
+
+def _bounded_limit(value: int, name: str) -> int:
+    if type(value) is not int or not 1 <= value <= _MAX_FRESHNESS_PAGE_SIZE:
+        raise ValueError(f"{name} must be an integer from 1 to {_MAX_FRESHNESS_PAGE_SIZE}")
+    return value
+
+
+def _bounded_identifiers(values: Sequence[str], name: str) -> tuple[str, ...]:
+    if isinstance(values, str):
+        raise TypeError(f"{name} must be a list of identifiers")
+    result = tuple(values)
+    if len(result) > _MAX_QUERY_SCOPE_IDS:
+        raise ValueError(f"{name} may contain at most {_MAX_QUERY_SCOPE_IDS} identifiers")
+    if any(not isinstance(value, str) or not value for value in result):
+        raise ValueError(f"{name} must contain non-empty identifiers")
+    if len(set(result)) != len(result):
+        raise ValueError(f"{name} must not contain duplicates")
+    return result
+
+
+def _bounded_items(
+    values: Sequence[Any], offset: int, limit: int
+) -> tuple[tuple[Any, ...], bool]:
+    page = tuple(values[offset : offset + limit])
+    return page, offset + limit < len(values)
+
+
 def as_tool_error(error: CodeCortexError) -> ToolError:
     """Preserve the stable Core error contract inside an anticipated MCP error."""
     return ToolError(
@@ -597,7 +900,7 @@ def as_tool_error(error: CodeCortexError) -> ToolError:
     )
 
 
-def invalid_argument(error: ValueError) -> CodeCortexError:
+def invalid_argument(error: ValueError | TypeError) -> CodeCortexError:
     """Translate request-validation failures into the stable error contract."""
     return CodeCortexError(
         ErrorCode.INVALID_ARGUMENT,

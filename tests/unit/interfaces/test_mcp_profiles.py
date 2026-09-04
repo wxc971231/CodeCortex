@@ -21,6 +21,9 @@ ANALYZER_TOOLS = {
     "resolve_entity_context",
     "get_discussion_context",
     "search_cognitive_graph",
+    "cognitive_freshness",
+    "pending_changes",
+    "effective_query_freshness",
 }
 MAIN_TOOLS = ANALYZER_TOOLS | {
     "initialize_repository",
