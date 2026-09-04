@@ -47,6 +47,28 @@ Pass the current graph revision and source digest to it. If Core rejects the
 report as stale or invalid, discard it and run a new Analyzer pass; do not
 repair, split, or reuse its patch.
 
+## M1a graph shape rules (Core enforces these fail-closed)
+
+The AnalysisReport must produce a graph that passes Core validation on the
+first try. Teach the analyzer these rules verbatim at dispatch:
+
+- Node kinds: `responsibility` (what the project is accountable for),
+  `behavior` (a user-observable thing it does), `capability` (a shared
+  mechanism behaviors rely on).
+- Exactly three edge types are legal, with fixed endpoint kinds:
+  `contains` (responsibility -> behavior only), `uses`
+  (behavior -> capability only), `depends_on` (capability -> capability
+  only). Anything else is rejected as INVALID_RELATION.
+- Every behavior must have exactly one responsibility parent via `contains`,
+  and the contains hierarchy must be acyclic.
+- Evidence: structural `contains` edges are exempt, but every `uses` or
+  `depends_on` edge with epistemic status `inferred` or `uncertain` must
+  carry at least one report evidence item (entity UID, repository-relative
+  path, and line range) or Core rejects the apply as
+  RELATION_EVIDENCE_REQUIRED.
+- Every implementation mapping must reference a real entity UID returned by
+  the fact/context read tools; never invent an anchor.
+
 `create_cognitive_proposal_from_analysis` is the only normal route from an
 Analyzer report to a pending Proposal. It validates the complete report and
 creates one aggregate Proposal. Show the user its high-level responsibilities,

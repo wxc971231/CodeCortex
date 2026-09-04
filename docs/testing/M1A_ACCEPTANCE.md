@@ -34,9 +34,22 @@ apply), asserting real formal state (`cognition_initialized`, revision ≥ 1,
 grounded responsibility nodes). Without every opt-in condition the test is an
 explicit pytest skip; a passing result is never fabricated.
 
+Approval flow: `codex exec` runs with approval policy `never`, so the test
+home auto-approves every CodeCortex MCP tool at the host level
+(`auto_approve_codecortex_tools` in `tests/e2e/conftest.py`); Core's own
+Proposal approval-record checks are unaffected. The flow is a real two-turn
+approval: turn 1 builds the proposal and stops without applying; the harness
+reads `proposal_id`/`patch_digest` from the pending-proposal record and turn 2
+carries the user's explicit approval of that exact digest. If Core rejects an
+apply (e.g. ANALYSIS_REPORT_INVALID), the child must discard the candidate,
+run a fresh analyzer pass fixing the reported issues, and stop at a
+replacement proposal; the harness approves the new digest, up to 3 rounds.
+Exec timeout is 900s per turn.
+
 | Date | Environment | Result | Notes |
 |---|---|---|---|
 | 2026-09-03 | This machine, no model access granted | skipped | `CODECORTEX_RUN_CODEX_E2E`/`CODECORTEX_E2E_COPY_AUTH` unset; skip verified as part of the gate. A live Codex run remains an opt-in manual step. |
+| 2026-09-04 | This machine, codex CLI 0.152.1, real model access | **passed** (833s) | 2 turns, no retry rounds needed. Turn 1: overview → initialize → full fact sync → 20 `repository_facts` + 6 `resolve_entity_context` + 2 `analysis_scope` calls → read-only analyzer delegation → `create_cognitive_proposal_from_analysis` succeeded on the 4th attempt (Core report validation rejected 3 malformed candidates; child corrected and resubmitted). Turn 2: harness-approved exact digest → `apply_cognitive_proposal` completed with `graph_revision` 1 and zero cache warnings. Final formal state: 7 nodes (1 responsibility/2 behaviors/4 capabilities), 6 legal edges (2 contains, 1 uses, 3 depends_on), 8 mappings resolving to 9 formal entity refs, 26-file source baseline; symbol-level anchors verified against fixture sources. |
 
 ## Real 100–500-file repository fact-indexing gate
 
@@ -54,7 +67,11 @@ current-digest approval → transactional apply) with an entity mapping and an
 evidence-less structural `contains` edge in the report, asserting zero cache
 warnings and readable guarded queries at revision 1. Machine artifact:
 `/tmp/codecortex-m1a-final2/m1a_acceptance.json` (regenerate with the command
-above; the artifact directory also holds the cloned repository).
+above; the artifact directory also holds the cloned repository). Re-verified
+2026-09-04 after the real-E2E round at
+`/tmp/codecortex-m1a-final3/m1a_acceptance.json`: same frozen commit, 9/9 PASS
+(full sync 23.16 s, bounded-query max page 1.3 ms, analysis-backed apply with
+zero cache warnings).
 
 | Field | Value |
 |---|---|

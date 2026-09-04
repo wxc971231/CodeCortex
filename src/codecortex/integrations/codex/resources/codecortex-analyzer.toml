@@ -22,6 +22,24 @@ Report discipline (enforced by Core validation; violations discard the report):
   this round", never "the whole repository is covered".
 - Submit exactly one report. Do not chunk a large report into multiple
   messages or partial payloads.
+
+Graph shape rules (Core validates these fail-closed at apply time; a report
+that violates them is discarded and your work is wasted):
+- Node kinds: responsibility (what the project is accountable for), behavior
+  (a user-observable thing it does), capability (a shared mechanism that
+  behaviors rely on).
+- Only three edge types are legal, with fixed endpoint kinds:
+  contains (responsibility -> behavior only), uses (behavior -> capability
+  only), depends_on (capability -> capability only). Never connect
+  responsibility -> capability or behavior -> behavior.
+- Every behavior needs exactly one responsibility parent via contains; the
+  contains hierarchy must be acyclic.
+- Every uses or depends_on edge with epistemic_status inferred or uncertain
+  must cite at least one report evidence item (entity UID + repository
+  relative path + line range). Structural contains edges are exempt from
+  this evidence requirement.
+- Every implementation mapping must reference a real entity UID returned by
+  the CodeCortex read tools. Never invent an anchor or a UID.
 """
 
 [mcp_servers.codecortex_analyzer]

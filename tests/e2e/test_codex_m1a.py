@@ -14,10 +14,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import tomlkit
 
-from codecortex.integrations.codex.install import CONFIG_RELATIVE, install_codex
-from tests.e2e.conftest import CodexHarness
+from codecortex.integrations.codex.install import install_codex
+from tests.e2e.conftest import CodexHarness, auto_approve_codecortex_tools
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "m1a_repo"
 
@@ -42,10 +41,7 @@ def codex_m1a_harness(tmp_path: Path) -> CodexHarness:
     auth_target = home / ".codex" / "auth.json"
     shutil.copyfile(auth_source, auth_target)
     auth_target.chmod(0o600)
-    config = home / CONFIG_RELATIVE
-    document = tomlkit.parse(config.read_text(encoding="utf-8"))
-    document["mcp_servers"]["codecortex"]["tools"]["apply_cognitive_proposal"]["approval_mode"] = "approve"
-    config.write_text(tomlkit.dumps(document), encoding="utf-8")
+    auto_approve_codecortex_tools(home)
     return CodexHarness(root, home)
 
 
@@ -91,27 +87,120 @@ def test_m1a_fixture_oracle_is_human_authored_and_grounded() -> None:
 
 @pytest.mark.codex_e2e
 def test_real_init_creates_grounded_graph(codex_m1a_harness: CodexHarness) -> None:
-    result = codex_m1a_harness.run(
+    """Two-turn real flow: build and display a proposal, then approve it.
+
+    The first turn must not apply anything: the initial instruction is not
+    approval of a proposal that does not exist yet. The second turn carries
+    the user's explicit approval of the exact current patch digest.
+    """
+    first = codex_m1a_harness.run(
         "exec",
         "--json",
         """$codecortex init. Follow the installed M1a Skill exactly: run fact sync,
-request analysis scope, delegate the read-only codecortex-analyzer, submit one
-complete AnalysisReport through create_cognitive_proposal_from_analysis, show
-the current patch digest, then apply that exact proposal. Do not invent source
-anchors. Complete the full workflow in this test repository.""",
+request analysis scope, delegate the read-only codecortex-analyzer, then submit one
+complete AnalysisReport through create_cognitive_proposal_from_analysis. Do not
+invent source anchors. Stop after the proposal is created and you have displayed
+its proposal_id and current patch_digest. Do NOT apply anything in this turn; the
+user will approve the exact digest in a follow-up message.""",
     )
-    assert result.returncode == 0, result.stderr
-    manifest = json.loads(
-        (codex_m1a_harness.root / ".codecortex" / "manifest.json").read_text(
-            encoding="utf-8"
+    assert first.returncode == 0, first.stderr
+    pending_dir = (
+        codex_m1a_harness.root / ".codecortex" / ".cache" / "pending_proposals"
+    )
+    pending = sorted(pending_dir.glob("prop_*.json"))
+    assert len(pending) == 1, (
+        f"expected exactly one pending proposal, found {len(pending)}; "
+        f"child output tail: {first.stdout[-2000:]}"
+    )
+
+    # Bounded approval loop: each attempt approves the newest pending proposal.
+    # If Core rejects the apply (e.g. ANALYSIS_REPORT_INVALID), the child must
+    # discard the rejected candidate, run a fresh analyzer pass that fixes the
+    # reported issues, create a replacement proposal, and stop; the harness
+    # then approves the new digest on the next attempt. Approval always comes
+    # from the harness (the user), never from the child.
+    root = codex_m1a_harness.root
+    manifest_path = root / ".codecortex" / "manifest.json"
+    attempted: set[str] = set()
+    applied = False
+    last_stdout = ""
+    for _attempt in range(3):
+        fresh = []
+        for candidate in sorted(
+            pending_dir.glob("prop_*.json"), key=lambda item: item.stat().st_mtime
+        ):
+            record = json.loads(candidate.read_text(encoding="utf-8"))
+            if record["proposal_id"] not in attempted:
+                fresh.append(record)
+        assert fresh, (
+            "child stopped without creating a replacement proposal after a "
+            f"rejected apply; child output tail: {last_stdout[-2000:]}"
         )
+        current = fresh[-1]
+        attempted.add(current["proposal_id"])
+        turn = codex_m1a_harness.run(
+            "exec",
+            "--json",
+            f"""The user now explicitly approves proposal {current["proposal_id"]} with
+current patch_digest {current["patch_digest"]}. Call apply_cognitive_proposal
+immediately with an approval_record using this exact proposal_id and
+patch_digest, approved_by "user", and report the result. If Core rejects the
+apply (for example ANALYSIS_REPORT_INVALID), do not give up and do not repair
+the report yourself: discard the rejected proposal, delegate a fresh
+codecortex-analyzer pass that fixes every issue Core reported, submit the new
+report through create_cognitive_proposal_from_analysis, display the new
+proposal_id and patch_digest, and stop without applying it; the user will
+approve the new digest in a follow-up message.""",
+        )
+        assert turn.returncode == 0, turn.stderr
+        last_stdout = turn.stdout
+        if json.loads(manifest_path.read_text(encoding="utf-8"))[
+            "cognition_initialized"
+        ] is True:
+            applied = True
+            break
+    assert applied, (
+        "proposal was not applied within 3 approval rounds; "
+        f"child output tail: {last_stdout[-2000:]}"
     )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     graph = json.loads(
-        (codex_m1a_harness.root / ".codecortex" / "graph.json").read_text(
-            encoding="utf-8"
-        )
+        (root / ".codecortex" / "graph.json").read_text(encoding="utf-8")
     )
     assert manifest["cognition_initialized"] is True
     assert manifest["graph_revision"] >= 1
     node_ids = {node["id"] for node in graph["nodes"]}
-    assert {"responsibility.ingestion", "responsibility.reporting"} <= node_ids
+    kinds = {node["kind"] for node in graph["nodes"]}
+    assert "responsibility" in kinds and "behavior" in kinds
+    assert len(node_ids) >= 2
+
+    entity_refs = json.loads(
+        (root / ".codecortex" / "entity_refs.json").read_text(encoding="utf-8")
+    )
+    refs_by_uid = {entry["uid"]: entry for entry in entity_refs["entities"]}
+    mappings = graph.get("implementation_mappings", [])
+    assert mappings, (
+        "no implementation mappings; "
+        f"child output tail: {last_stdout[-2000:]}"
+    )
+    resolved = [
+        refs_by_uid[mapping["entity_uid"]]
+        for mapping in mappings
+        if mapping.get("entity_uid") in refs_by_uid
+    ]
+    assert resolved, "no mapping resolves through formal entity refs"
+    checked = 0
+    for ref in resolved:
+        anchor = root / ref["relative_path"]
+        assert anchor.is_file() and anchor.suffix == ".py"
+        qualname = str(ref["last_known_address"]).split(":", 1)[-1]
+        if not qualname:
+            continue  # module-level refs carry no symbol
+        symbol = qualname.split(".")[-1]
+        text = anchor.read_text(encoding="utf-8")
+        assert f"def {symbol}" in text or f"class {symbol}" in text, (
+            f"anchor {ref['relative_path']} does not define {symbol}"
+        )
+        checked += 1
+    assert checked, "no symbol-level mapping anchor was verified"

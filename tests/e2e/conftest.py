@@ -9,6 +9,25 @@ import pytest
 import tomlkit
 
 from codecortex.integrations.codex.install import CONFIG_RELATIVE, install_codex
+from codecortex.interfaces.mcp.server import MAIN_ONLY_TOOL_NAMES, READ_TOOL_NAMES
+
+
+def auto_approve_codecortex_tools(home: Path) -> None:
+    """Auto-approve every CodeCortex MCP tool in an isolated test home.
+
+    `codex exec` runs with approval policy `never`, so any MCP tool left at
+    the default prompt mode fails before reaching the server. This is a
+    test-only host setting for the throwaway home; CodeCortex's own Proposal
+    approval record checks are unaffected.
+    """
+    config = home / CONFIG_RELATIVE
+    document = tomlkit.parse(config.read_text(encoding="utf-8"))
+    tools = document["mcp_servers"]["codecortex"].setdefault("tools", tomlkit.table())
+    for name in sorted(READ_TOOL_NAMES | MAIN_ONLY_TOOL_NAMES):
+        tool = tomlkit.table()
+        tool["approval_mode"] = "approve"
+        tools[name] = tool
+    config.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
 class CodexHarness:
@@ -35,7 +54,7 @@ class CodexHarness:
             capture_output=True,
             text=True,
             check=False,
-            timeout=180,
+            timeout=900,
         )
 
 
@@ -59,8 +78,5 @@ def codex_harness(tmp_path: Path) -> CodexHarness:
     auth_target = home / ".codex" / "auth.json"
     shutil.copyfile(auth_source, auth_target)
     auth_target.chmod(0o600)
-    config = home / CONFIG_RELATIVE
-    document = tomlkit.parse(config.read_text(encoding="utf-8"))
-    document["mcp_servers"]["codecortex"]["tools"]["apply_cognitive_proposal"]["approval_mode"] = "approve"
-    config.write_text(tomlkit.dumps(document), encoding="utf-8")
+    auto_approve_codecortex_tools(home)
     return CodexHarness(root, home)
