@@ -507,12 +507,14 @@ class GraphReplica:
         self,
         path: Path,
         *,
+        read_only: bool = False,
         entity_refs: Iterable[EntityRefRecord]
         | Callable[[], Iterable[EntityRefRecord]] = (),
         history_events: Iterable[HistoryEventRecord]
         | Callable[[], Iterable[HistoryEventRecord]] = (),
     ) -> None:
         self.path = Path(path)
+        self._read_only = read_only
         self._entity_refs = (
             entity_refs if callable(entity_refs) else lambda: entity_refs
         )
@@ -537,6 +539,10 @@ class GraphReplica:
 
     def reset(self) -> None:
         """Discard a damaged local replica and recreate only its empty schema."""
+        if self._read_only:
+            raise sqlite3.OperationalError(
+                "Read-only cognitive replica cannot be reset"
+            )
         for path in (
             self.path,
             self.path.with_name(f"{self.path.name}-wal"),
@@ -552,9 +558,7 @@ class GraphReplica:
 
     def open_read(self) -> sqlite3.Connection:
         """Open a URI-mode read-only, query-only connection for bounded reads."""
-        connection = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?mode=ro", uri=True
-        )
+        connection = sqlite3.connect(self._read_uri(), uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
@@ -563,12 +567,28 @@ class GraphReplica:
 
     def open_write(self) -> sqlite3.Connection:
         """Open the only connection mode permitted to mutate the replica."""
+        if self._read_only:
+            raise sqlite3.OperationalError(
+                "Read-only cognitive replica cannot be modified"
+            )
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         return connection
+
+    def _read_uri(self) -> str:
+        uri = f"{self.path.resolve().as_uri()}?mode=ro"
+        if not self._read_only:
+            return uri
+        wal_exists = Path(f"{self.path}-wal").exists()
+        shm_exists = Path(f"{self.path}-shm").exists()
+        if wal_exists != shm_exists:
+            raise sqlite3.OperationalError(
+                "Read-only cognitive replica has an incomplete WAL coordinate"
+            )
+        return uri if wal_exists else f"{uri}&immutable=1"
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:

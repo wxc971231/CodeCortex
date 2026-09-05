@@ -374,6 +374,9 @@ MCP DTO 使用显式版本字段。内部领域对象不得直接暴露，避免
 - AST 解析只读取文本；
 - SQL 全部参数化；
 - Analyzer MCP 从工具注册层移除写工具，不只依赖 prompt 禁止；
+- Analyzer 组合根只构造非创建型只读 cache 句柄和只读共享锁：不得创建
+  cache 目录/schema/lock，不得 reset、unlink 或 recovery；缺失、损坏或 WAL
+  坐标不完整时返回 `CACHE_REBUILD_REQUIRED`，由 Main 创建或修复；
 - Analyzer 自定义 Agent 默认请求 `sandbox_mode="read-only"`，但父会话的实时 sandbox/approval 覆盖可能被 Codex 重新应用；CodeCortex 能硬性保证的是 Analyzer MCP 没有写工具、Core 拒绝 Analyzer profile 的写请求，不能宣称独立撤销 Codex 原生文件写权限；
 - Analyzer 开始前和 Main 消费报告前都校验 repository source digest；期间源码发生任何变化时报告作废，不允许据此创建或应用 Proposal；
 - Core 可以验证结构化 approval record 与 Patch 一致，但不能证明自然语言批准确实来自用户；这属于 Main Codex 信任边界。

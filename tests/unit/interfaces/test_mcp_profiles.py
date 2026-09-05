@@ -1,14 +1,18 @@
 """MCP profile registration and adapter-boundary tests."""
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codecortex.application.services import RepositoryOverview
 from codecortex.domain.errors import CodeCortexError, ErrorCode
-from codecortex.interfaces.mcp.server import _recover_main_formal_state, build_server
+from codecortex.interfaces.mcp.server import (
+    _recover_main_formal_state,
+    build_server,
+    run_stdio,
+)
 
 ANALYZER_TOOLS = {
     "repository_overview",
@@ -133,6 +137,19 @@ def test_analyzer_process_never_attempts_recovery_writes(services: MagicMock) ->
     services.recover_formal_state.assert_not_called()
 
 
+def test_stdio_passes_analyzer_profile_to_composition_before_starting(
+    services: MagicMock,
+) -> None:
+    factory = MagicMock(return_value=services)
+    server = MagicMock()
+    with patch("codecortex.interfaces.mcp.server.build_server", return_value=server):
+        assert run_stdio("analyzer", factory) == 0
+
+    factory.assert_called_once_with("analyzer")
+    services.recover_formal_state.assert_not_called()
+    server.run.assert_called_once_with(transport="stdio")
+
+
 def test_main_process_allows_uninitialized_repository(services: MagicMock) -> None:
     """Main must still start so its initialize tool can create the skeleton."""
     services.recover_formal_state.side_effect = CodeCortexError(
@@ -152,3 +169,24 @@ def test_main_process_refuses_unsafe_recovery_failure(services: MagicMock) -> No
 
     with pytest.raises(CodeCortexError, match="unprovable transaction"):
         _recover_main_formal_state("main", services)
+
+
+@pytest.mark.anyio
+async def test_bootstrap_read_never_bypasses_preflight_for_initialized_cognition(
+    services: MagicMock,
+) -> None:
+    services.run_preflight.side_effect = CodeCortexError(
+        ErrorCode.NOT_INITIALIZED, "misconfigured preflight"
+    )
+    services.repository_overview.return_value = RepositoryOverview(
+        repository_root="/repo",
+        graph_revision=4,
+        cognition_initialized=True,
+        cognition_baseline_source_digest="sha256:current",
+        formal_files={"manifest.json": True},
+    )
+
+    with pytest.raises(ToolError):
+        await build_server("main", services).call_tool("analysis_scope", {})
+
+    services.analysis_scope.assert_not_called()

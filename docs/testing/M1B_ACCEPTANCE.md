@@ -24,6 +24,12 @@ the harness validates and applies that graph through the product Proposal path.
 Scored routes and cognitive anchors come from matching MCP call/result records,
 not text emitted by the Child process.
 
+The deterministic suite also covers the M1a-to-M1b boundary: a fresh Main MCP
+session can run overview → initialize → full Fact Sync → guarded analysis scope,
+while initialized-only M1b reads still return `NOT_INITIALIZED`. Analyzer
+composition and reads are checked against missing, corrupt, and prepared cache
+states; they must never create, repair, delete, or otherwise mutate cache files.
+
 ## Real Child Codex benchmark (manual, opt-in)
 
 Run this only after explicitly authorizing model use:

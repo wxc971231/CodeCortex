@@ -49,10 +49,30 @@ def _main_query[QueryResult](
     services: ApplicationServices,
     preflight: bool,
     operation: Callable[[], QueryResult],
+    *,
+    allow_m1a_bootstrap: bool = False,
 ) -> QueryResult:
-    """Run the one Main fact gate before every M1a query entry."""
+    """Run Main preflight, except for guarded M1a bootstrap fact reads.
+
+    The M1a initialization sequence needs ``repository_facts`` and
+    ``analysis_scope`` while formal cognition is still uninitialized. Those
+    two callers may continue only after preflight reports that exact state;
+    their QueryService CacheGuard still requires a synchronized fact cache and
+    revision-matched cognitive replica. Every initialized/M1b query retains
+    the mandatory preflight path.
+    """
     if preflight:
-        services.run_preflight()
+        try:
+            services.run_preflight()
+        except CodeCortexError as error:
+            if not allow_m1a_bootstrap or error.code is not ErrorCode.NOT_INITIALIZED:
+                raise
+            try:
+                overview = services.repository_overview()
+            except CodeCortexError:
+                raise error
+            if overview.cognition_initialized:
+                raise
     return operation()
 
 
@@ -69,14 +89,14 @@ def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:
 
 def run_stdio(
     profile: str,
-    services_factory: Callable[[], ApplicationServices],
+    services_factory: Callable[[Profile], ApplicationServices],
 ) -> int:
     """Compose CWD-scoped services and serve one MCP STDIO session."""
     if profile not in ("main", "analyzer"):
         raise ValueError(f"Unsupported MCP profile: {profile}")
     checked_profile = cast(Profile, profile)
     _configure_stderr_logging()
-    services = services_factory()
+    services = services_factory(checked_profile)
     _recover_main_formal_state(checked_profile, services)
     server = build_server(checked_profile, services)
     LOGGER.info("CodeCortex MCP server started with %s profile", checked_profile)
@@ -169,6 +189,7 @@ def _register_read_tools(
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
+                allow_m1a_bootstrap=True,
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
@@ -195,6 +216,7 @@ def _register_read_tools(
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
+                allow_m1a_bootstrap=True,
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error

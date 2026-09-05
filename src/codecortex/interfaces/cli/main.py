@@ -14,7 +14,7 @@ import traceback
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from codecortex import __version__
 from codecortex.application.baseline import BaselineAdvanceService
@@ -33,8 +33,9 @@ from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.facts import DigestProfile, SourceConfig
 from codecortex.infrastructure.formal import FormalStore
-from codecortex.infrastructure.locking import RepositoryLock
+from codecortex.infrastructure.locking import ReadOnlyRepositoryLock, RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
+from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.python.digest import (
@@ -131,25 +132,46 @@ def _mcp_unavailable(*, profile: str) -> int:
     return run_stdio(profile, _default_services)
 
 
-def _default_services() -> ApplicationServices:
-    """Compose application services over the repository containing the CWD."""
+def _default_services(
+    profile: Literal["main", "analyzer"] = "main",
+) -> ApplicationServices:
+    """Compose profile-safe services over the repository containing the CWD."""
     repository = find_repository(Path.cwd())
     # Repository.root is a frozen (read-only) dataclass attribute while the port
     # declares a settable one; the composition only ever reads it.
     context = cast(RepositoryContextPort, repository)
     formal_store = FormalStore(repository)
-    repository_lock = RepositoryLock(repository.root)
+    repository_lock = (
+        RepositoryLock(repository.root)
+        if profile == "main"
+        else ReadOnlyRepositoryLock(repository.root)
+    )
     cache_directory = repository.root / ".codecortex" / ".cache"
+    facts = FactsDatabase(
+        cache_directory / "facts.sqlite3", read_only=(profile == "analyzer")
+    )
     fact_sync = FactSyncService(
         repository,
+        database=facts,
         repository_lock=repository_lock,
         formal_store=formal_store,
     )
-    facts = fact_sync.database
-    replica = GraphReplica.create_new(
-        cache_directory / "cognitive.sqlite3",
-        entity_refs=formal_entity_ref_provider(formal_store),
-        history_events=formal_history_event_provider(formal_store),
+    replica_path = cache_directory / "cognitive.sqlite3"
+    entity_refs = formal_entity_ref_provider(formal_store)
+    history_events = formal_history_event_provider(formal_store)
+    replica = (
+        GraphReplica.create_new(
+            replica_path,
+            entity_refs=entity_refs,
+            history_events=history_events,
+        )
+        if profile == "main"
+        else GraphReplica(
+            replica_path,
+            read_only=True,
+            entity_refs=entity_refs,
+            history_events=history_events,
+        )
     )
     proposal_service = ProposalService(
         formal_store=formal_store,
@@ -161,13 +183,17 @@ def _default_services() -> ApplicationServices:
         facts=facts,
         replica=replica,
     )
-    recovery = RecoveryService(
-        formal_store=formal_store,
-        fact_sync=fact_sync,
-        facts=facts,
-        freshness_store=FreshnessStore(cache_directory),
-        repository_lock=repository_lock,
-        cognitive_replica=replica,
+    recovery = (
+        RecoveryService(
+            formal_store=formal_store,
+            fact_sync=fact_sync,
+            facts=facts,
+            freshness_store=FreshnessStore(cache_directory),
+            repository_lock=repository_lock,
+            cognitive_replica=replica,
+        )
+        if profile == "main"
+        else None
     )
     preflight = PreflightService(
         formal_store=formal_store,

@@ -329,6 +329,12 @@ cache 缺失或不匹配时：
 
 `sync_repository_facts` 由 M1a 提供并在所有 CodeCortex 工作前调用。MCP 不提供 `ask` 工具；回答由 Main Codex 完成。
 
+第 4 节的 `cognition_initialized=true` 门槛适用于本节全部 M1b 工具及普通
+认知查询，不因 M1a 首次初始化而放宽。M1a 仅为
+`repository_facts`/`analysis_scope` 定义一个受 CacheGuard 约束的 bootstrap
+读阶段；它不允许 freshness、graph、search、context 或 discussion 路由绕过
+M1b Fact Preflight。
+
 `decision_record` 对 no_semantic_change 保存 decided_by、证据摘要、Analyzer/Main 来源和时间；user_accepted 额外要求与当前 digest 匹配的 approval record。
 
 ## 17. 独立 Child Codex 验收空间

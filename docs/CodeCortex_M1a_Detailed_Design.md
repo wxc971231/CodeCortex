@@ -629,6 +629,13 @@ $codecortex init
 → apply 产生当前 revision + 1 和 cognition baseline
 ```
 
+Main 的普通认知查询仍必须执行 M1b Fact Preflight。首次初始化是唯一例外：
+`repository_facts` 与 `analysis_scope` 可以在
+`cognition_initialized=false` 时继续，但仍必须通过既有 QueryService
+CacheGuard；因此只有 `sync_repository_facts(mode="full")` 已准备好与当前
+revision 一致的 facts 和 cognitive replica 后才能读取。跳过 Fact Sync、
+cache 缺失/损坏/错 revision，或调用其他 M1b/认知入口时一律 fail closed。
+
 Analyzer 顺序：项目文档/入口 → package/module 分区 → 分区职责行为 → 跨区依赖 → 关键 Capability → 全局汇总。初始化优先生成 L0/L1 和关键 L2，不为每个函数制造 Capability。
 
 创建 Proposal 前 Core 重新同步事实并检查 AnalysisReport 的 source digest。Analyzer 开始分析时记录 digest，Main 消费报告时必须再次检查；期间源码有任何变化时，本报告整体作废并重新分析，不使用 affected-scope 规则替旧报告续命。Proposal 创建后，任何 Managed Source Set 摘要变化都使它 stale；MVP 不实现“证明变化无关后继续 apply”的复杂 rebase 优化。
