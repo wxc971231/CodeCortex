@@ -28,9 +28,11 @@ from codecortex.domain.cognition import (
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.facts import DigestProfile
 from codecortex.domain.ids import IdPrefix, validate_id
 from codecortex.domain.proposals import PatchOperation, canonical_patch_digest
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
+from codecortex.infrastructure.python.digest import repository_digest_from_file_digests
 from codecortex.infrastructure.repository import Repository
 
 DEFAULT_CONFIG = b"""schema_version = 1
@@ -241,12 +243,6 @@ class FormalStore:
             )
         if not self._all_required_paths_exist():
             self._raise_corrupt("Formal state is only partially initialized")
-        # Git does not preserve empty directories.  The directory names are
-        # structural containers rather than formal payload, so a fresh clone
-        # may recreate only these empty paths before loading the canonical
-        # files they contain.
-        self._create_directories()
-
         self._validate_config()
         self._read_text(self._root / "PROJECT.md")
         manifest_data = self._read_object(self._root / "manifest.json")
@@ -280,9 +276,26 @@ class FormalStore:
         result = self._validate_state(state)
         if not result.valid:
             self._raise_validation(result.issues)
+        self._validate_source_baseline_digest(state)
         self._validate_empty_views(state)
         self._validate_view_manifest(state)
         return state
+
+    def _validate_source_baseline_digest(self, state: FormalState) -> None:
+        expected = state.source_baseline.repository_source_digest
+        if expected is None:
+            return
+        files = {
+            str(record["relative_path"]): str(record["content_digest"])
+            for record in state.source_baseline.files
+        }
+        actual = repository_digest_from_file_digests(
+            files, DigestProfile(state.source_baseline.digest_profile_version)
+        )
+        if actual != expected:
+            self._raise_corrupt(
+                "Source baseline aggregate digest does not match its file records"
+            )
 
     def formal_file_presence(self) -> dict[str, bool]:
         """Report required formal paths without exposing machine-local cache paths."""
@@ -347,6 +360,11 @@ class FormalStore:
             )
         if baseline_advance and event.get("event_type") != "cognition_baseline_advanced":
             self._raise_corrupt("Baseline transaction has the wrong event type")
+
+        # Empty structural directories are absent in a normal Git clone.
+        # Create them only on this Main write path; FormalStore.load remains
+        # safe for the read-only Analyzer profile.
+        self._create_directories()
 
         payloads: dict[str, bytes] = {
             event_relative: canonical_json_bytes(dict(event)),
@@ -717,6 +735,8 @@ class FormalStore:
         paths = ["views/TREE.md"]
         for directory in ("responsibilities", "behaviors", "capabilities"):
             view_directory = self._root / "views" / directory
+            if not view_directory.exists():
+                continue
             if not view_directory.is_dir() or view_directory.is_symlink():
                 self._raise_corrupt("Managed view directory is invalid")
             paths.extend(
@@ -880,6 +900,10 @@ class FormalStore:
 
     def _load_history_events(self) -> tuple[HistoryEventRef, ...]:
         event_directory = self._root / "history/events"
+        if not event_directory.exists():
+            return ()
+        if not event_directory.is_dir() or event_directory.is_symlink():
+            self._raise_corrupt("History events directory is invalid")
         events: list[HistoryEventRef] = []
         for path in sorted(event_directory.iterdir(), key=lambda item: item.name):
             if not path.is_file() or path.suffix != ".json":
@@ -1088,7 +1112,12 @@ class FormalStore:
         if tree_bytes != EMPTY_TREE_VIEW:
             self._raise_corrupt("Revision-zero cognitive tree view is not canonical")
         for relative in ("views/responsibilities", "views/behaviors", "views/capabilities"):
-            if any((self._root / relative).iterdir()):
+            directory = self._root / relative
+            if not directory.exists():
+                continue
+            if not directory.is_dir() or directory.is_symlink():
+                self._raise_corrupt("Revision-zero detail view directory is invalid")
+            if any(directory.iterdir()):
                 self._raise_corrupt("Revision-zero detail view directories must be empty")
 
     def _raise_validation(self, issues: tuple[object, ...]) -> NoReturn:

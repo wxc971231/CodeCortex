@@ -3,7 +3,7 @@
 import hashlib
 import io
 import tokenize
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from codecortex.domain.facts import DigestProfile, SourceFileDigest, SourceFileInput
 
@@ -41,11 +41,20 @@ def repository_digest(
     paths = [item.source.relative_path for item in ordered]
     if len(set(paths)) != len(paths):
         raise ValueError("Repository digest input contains duplicate source paths")
+    return repository_digest_from_file_digests(
+        {item.source.relative_path: item.content_digest for item in ordered}, profile
+    )
+
+
+def repository_digest_from_file_digests(
+    files: Mapping[str, str], profile: DigestProfile
+) -> str:
+    """Hash canonical path/digest records with the one repository algorithm."""
     payload = bytearray(str(profile.version).encode("ascii"))
     payload.extend(b"\0")
-    for item in ordered:
-        payload.extend(item.source.relative_path.encode("utf-8"))
+    for path in sorted(files, key=lambda item: item.encode("utf-8")):
+        payload.extend(path.encode("utf-8"))
         payload.extend(b"\0")
-        payload.extend(item.content_digest.encode("ascii"))
+        payload.extend(files[path].encode("ascii"))
         payload.extend(b"\n")
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"

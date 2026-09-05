@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -163,3 +164,26 @@ def test_preflight_parse_failure_never_reports_fresh(tmp_path: Path) -> None:
     assert result.change_set is not None
     assert result.change_set.scope_confidence == "unknown"
     assert result.repository_status.status == "unresolved"
+
+
+def test_preflight_retries_when_source_changes_after_fact_sync(tmp_path: Path) -> None:
+    repository, _, sync, preflight = _initialized_preflight(tmp_path)
+    original_probe = sync.probe_source_digest
+    raced = False
+
+    def mutate_before_final_probe() -> str:
+        nonlocal raced
+        if not raced:
+            raced = True
+            _write(repository.root, "app.py", "def answer() -> int:\n    return 2\n")
+        return original_probe()
+
+    with (
+        patch.object(sync, "probe_source_digest", side_effect=mutate_before_final_probe),
+        patch.object(sync, "sync", wraps=sync.sync) as synchronize,
+    ):
+        result = preflight.run()
+
+    assert synchronize.call_count == 2
+    assert result.fact_sync.repository_source_digest == original_probe()
+    assert result.change_set is not None

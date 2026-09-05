@@ -81,16 +81,18 @@ class PreflightService:
                 state = self.formal_store.load()
                 self._require_initialized(state.manifest.cognition_initialized)
                 metadata = self.facts.cache_metadata()
+                live_source_digest = self.fact_sync.probe_source_digest()
                 if (
                     synced.graph_revision != state.manifest.graph_revision
                     or metadata.graph_revision != state.manifest.graph_revision
                     or metadata.repository_source_digest
                     != synced.repository_source_digest
+                    or live_source_digest != synced.repository_source_digest
                 ):
                     if attempt == self.max_retries:
                         raise CodeCortexError(
                             ErrorCode.CACHE_REBUILD_REQUIRED,
-                            "Formal state changed while Fact Preflight was reconciling facts",
+                            "Formal state or managed source changed while Fact Preflight was reconciling facts",
                             retryable=True,
                             suggested_action="Retry the CodeCortex operation",
                         )

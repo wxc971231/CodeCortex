@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from codecortex.domain.cognition import FormalState
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.facts import DigestProfile
 from codecortex.domain.freshness import (
     ChangeSet,
     DiffCompleteness,
@@ -19,6 +20,9 @@ from codecortex.domain.ids import IdPrefix, new_id
 from codecortex.infrastructure.persistence.facts_db import (
     FactEntitySnapshot,
     FactsDatabase,
+)
+from codecortex.infrastructure.python.digest import (
+    repository_digest_from_file_digests,
 )
 
 
@@ -117,7 +121,9 @@ class ChangeDetector:
             files[path] = digest
         if not files or tuple(files) != tuple(sorted(files)):
             raise _formal_corrupt("Source baseline files must be non-empty and sorted")
-        if _repository_digest(files, manifest.digest_profile_version) != manifest.cognition_baseline:
+        if repository_digest_from_file_digests(
+            files, DigestProfile(manifest.digest_profile_version)
+        ) != manifest.cognition_baseline:
             raise _formal_corrupt("Source baseline file digests do not match manifest digest")
         return _Baseline(manifest.cognition_baseline, files)
 
@@ -203,17 +209,6 @@ def _entity_changed(before: FactEntitySnapshot, after: FactEntitySnapshot) -> bo
         or before.signature != after.signature
         or before.fingerprint != after.fingerprint
     )
-
-
-def _repository_digest(files: Mapping[str, str], profile_version: int) -> str:
-    payload = bytearray(str(profile_version).encode("ascii"))
-    payload.extend(b"\0")
-    for path in sorted(files, key=lambda item: item.encode("utf-8")):
-        payload.extend(path.encode("utf-8"))
-        payload.extend(b"\0")
-        payload.extend(files[path].encode("ascii"))
-        payload.extend(b"\n")
-    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _change_set_id(baseline: str, current: str, created_at: str) -> str:

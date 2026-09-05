@@ -102,6 +102,40 @@ class AffectedScopeCalculator:
                 # rule-proven implementation-irrelevant text-only difference.
                 continue
 
+            if (
+                change_set.entity_diff_completeness == "partial"
+                and path not in path_owned
+            ):
+                path_entities = {
+                    uid: entity
+                    for uid, entity in (*current.items(), *baseline.items())
+                    if entity.relative_path == path
+                }
+                formally_owned = {
+                    uid
+                    for uid in path_entities
+                    if _formal_targets(graph, uid, path, nodes, flows)
+                }
+                if not formally_owned:
+                    unmapped.add(
+                        UnmappedChange(path, "changed_path_has_no_formal_owner")
+                    )
+                    continue
+                for uid, entity in sorted(path_entities.items()):
+                    if uid in formally_owned:
+                        continue
+                    if entity.kind == "module":
+                        # A module record is the parser's structural container;
+                        # ownership by any concrete entity proves that container.
+                        continue
+                    unmapped.add(
+                        UnmappedChange(
+                            path,
+                            "changed_entity_ownership_unproven",
+                            uid,
+                        )
+                    )
+
         # Stages 4-6: flow-step → behavior, behavior → responsibility, and
         # capability → direct user behavior.  These are bounded graph edges.
         _propagate_semantic_graph(graph, nodes, flows)

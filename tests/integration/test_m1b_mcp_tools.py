@@ -136,6 +136,41 @@ async def test_main_preflights_and_analyzer_reads_prepared_freshness(
 
 
 @pytest.mark.anyio
+async def test_every_main_m1a_query_route_runs_preflight_but_analyzer_never_does(
+    tmp_path: Path,
+) -> None:
+    services, _ = _services(tmp_path)
+    calls = {
+        "cognitive_graph": {},
+        "inspect_node": {"node_id": "behavior.missing"},
+        "repository_facts": {"scope": "app"},
+        "analysis_scope": {},
+        "resolve_entity_context": {"path": "app.py"},
+        "get_discussion_context": {"node_ids": ["behavior.missing"]},
+        "search_cognitive_graph": {"query": "missing"},
+    }
+
+    main = build_server("main", services)
+    with patch.object(services, "run_preflight", wraps=services.run_preflight) as run:
+        for name, arguments in calls.items():
+            try:
+                await main.call_tool(name, arguments)
+            except ToolError:
+                pass
+            assert run.call_count == 1
+            run.reset_mock()
+
+    analyzer = build_server("analyzer", services)
+    with patch.object(services, "run_preflight", wraps=services.run_preflight) as run:
+        for name, arguments in calls.items():
+            try:
+                await analyzer.call_tool(name, arguments)
+            except ToolError:
+                pass
+        run.assert_not_called()
+
+
+@pytest.mark.anyio
 async def test_pending_changes_is_bounded_and_query_inputs_are_bounded(
     tmp_path: Path,
 ) -> None:

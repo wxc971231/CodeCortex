@@ -45,6 +45,17 @@ MAIN_ONLY_TOOL_NAMES = frozenset(
 LOGGER = logging.getLogger(__name__)
 
 
+def _main_query[QueryResult](
+    services: ApplicationServices,
+    preflight: bool,
+    operation: Callable[[], QueryResult],
+) -> QueryResult:
+    """Run the one Main fact gate before every M1a query entry."""
+    if preflight:
+        services.run_preflight()
+    return operation()
+
+
 def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:
     """Build one fresh server with its static, profile-specific tool set."""
     if profile not in ("main", "analyzer"):
@@ -101,7 +112,9 @@ def _register_read_tools(
     @server.tool(name="cognitive_graph")
     def cognitive_graph() -> tools.CognitiveGraphOutput:
         try:
-            return tools.cognitive_graph(services)
+            return _main_query(
+                services, preflight, lambda: tools.cognitive_graph(services)
+            )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:
@@ -110,7 +123,9 @@ def _register_read_tools(
     @server.tool(name="inspect_node")
     def inspect_node(node_id: str) -> tools.InspectNodeOutput:
         try:
-            return tools.inspect_node(services, node_id)
+            return _main_query(
+                services, preflight, lambda: tools.inspect_node(services, node_id)
+            )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:
@@ -143,13 +158,17 @@ def _register_read_tools(
         expected_source_digest: str | None = None,
     ) -> tools.RepositoryFactsOutput:
         try:
-            return tools.repository_facts(
+            return _main_query(
                 services,
-                scope,
-                cursor,
-                limit,
-                expected_graph_revision=expected_graph_revision,
-                expected_source_digest=expected_source_digest,
+                preflight,
+                lambda: tools.repository_facts(
+                    services,
+                    scope,
+                    cursor,
+                    limit,
+                    expected_graph_revision=expected_graph_revision,
+                    expected_source_digest=expected_source_digest,
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
@@ -165,13 +184,17 @@ def _register_read_tools(
         expected_source_digest: str | None = None,
     ) -> tools.AnalysisScopeOutput:
         try:
-            return tools.analysis_scope(
+            return _main_query(
                 services,
-                scope,
-                cursor,
-                limit,
-                expected_graph_revision=expected_graph_revision,
-                expected_source_digest=expected_source_digest,
+                preflight,
+                lambda: tools.analysis_scope(
+                    services,
+                    scope,
+                    cursor,
+                    limit,
+                    expected_graph_revision=expected_graph_revision,
+                    expected_source_digest=expected_source_digest,
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
@@ -190,16 +213,20 @@ def _register_read_tools(
         expected_source_digest: str | None = None,
     ) -> tools.EntityContextOutput:
         try:
-            return tools.resolve_entity_context(
+            return _main_query(
                 services,
-                entity_uid=entity_uid,
-                path=path,
-                address=address,
-                relation_types=relation_types or (),
-                cursor=cursor,
-                limit=limit,
-                expected_graph_revision=expected_graph_revision,
-                expected_source_digest=expected_source_digest,
+                preflight,
+                lambda: tools.resolve_entity_context(
+                    services,
+                    entity_uid=entity_uid,
+                    path=path,
+                    address=address,
+                    relation_types=relation_types or (),
+                    cursor=cursor,
+                    limit=limit,
+                    expected_graph_revision=expected_graph_revision,
+                    expected_source_digest=expected_source_digest,
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
@@ -218,16 +245,20 @@ def _register_read_tools(
         expected_source_digest: str | None = None,
     ) -> tools.DiscussionContextOutput:
         try:
-            return tools.get_discussion_context(
+            return _main_query(
                 services,
-                node_ids=node_ids or (),
-                entity_ids=entity_ids or (),
-                depth=depth,
-                max_nodes=max_nodes,
-                max_entities=max_entities,
-                max_evidence=max_evidence,
-                expected_graph_revision=expected_graph_revision,
-                expected_source_digest=expected_source_digest,
+                preflight,
+                lambda: tools.get_discussion_context(
+                    services,
+                    node_ids=node_ids or (),
+                    entity_ids=entity_ids or (),
+                    depth=depth,
+                    max_nodes=max_nodes,
+                    max_entities=max_entities,
+                    max_evidence=max_evidence,
+                    expected_graph_revision=expected_graph_revision,
+                    expected_source_digest=expected_source_digest,
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
@@ -243,13 +274,17 @@ def _register_read_tools(
         expected_source_digest: str | None = None,
     ) -> tools.SearchGraphOutput:
         try:
-            return tools.search_cognitive_graph(
+            return _main_query(
                 services,
-                query,
-                kinds=kinds or (),
-                limit=limit,
-                expected_graph_revision=expected_graph_revision,
-                expected_source_digest=expected_source_digest,
+                preflight,
+                lambda: tools.search_cognitive_graph(
+                    services,
+                    query,
+                    kinds=kinds or (),
+                    limit=limit,
+                    expected_graph_revision=expected_graph_revision,
+                    expected_source_digest=expected_source_digest,
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error

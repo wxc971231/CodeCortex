@@ -177,6 +177,7 @@ class Trace:
     """Sanitized observable facts from one isolated Child Codex run."""
 
     route: str | None = None
+    cognitive_anchor_ids: tuple[str, ...] = ()
     source_references: tuple[SourceReference, ...] = ()
     mcp_tool_names: tuple[str, ...] = ()
     analyzer_count: int = 0
@@ -190,6 +191,8 @@ class Trace:
     def __post_init__(self) -> None:
         if self.route is not None and self.route not in _ROUTES:
             raise ValueError("Trace route is invalid")
+        if self.cognitive_anchor_ids != tuple(sorted(set(self.cognitive_anchor_ids))):
+            raise ValueError("Trace cognitive anchor IDs must be sorted and unique")
         if any(not isinstance(item, SourceReference) for item in self.source_references):
             raise TypeError("Trace source references must be SourceReference records")
         if any(not isinstance(name, str) or not name for name in self.mcp_tool_names):

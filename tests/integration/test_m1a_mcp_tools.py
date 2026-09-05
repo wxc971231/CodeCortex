@@ -6,7 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -51,18 +51,23 @@ def _compose(root: Path, *, max_graph_objects: int = 500) -> ApplicationServices
     formal_store = FormalStore(repository)
     lock = RepositoryLock(root)
     cache_directory = root / ".codecortex" / ".cache"
+    facts = FactsDatabase(cache_directory / "facts.sqlite3")
+    fact_sync = FactSyncService(
+        repository,
+        database=facts,
+        formal_store=formal_store,
+        repository_lock=lock,
+    )
     return ApplicationServices(
         repository=repository,
         formal_store=formal_store,
         repository_lock=lock,
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
-        fact_sync=FactSyncService(
-            repository, formal_store=formal_store, repository_lock=lock
-        ),
+        fact_sync=fact_sync,
         query_service=QueryService(
             formal_store=formal_store,
-            facts=FactsDatabase(cache_directory / "facts.sqlite3"),
+            facts=facts,
             replica=GraphReplica(
                 cache_directory / "cognitive.sqlite3",
                 entity_refs=formal_entity_ref_provider(formal_store),
@@ -70,6 +75,9 @@ def _compose(root: Path, *, max_graph_objects: int = 500) -> ApplicationServices
             ),
             repository_lock=lock,
         ),
+        # These M1a projection tests isolate query behavior; M1b integration
+        # tests exercise the real deterministic preflight service.
+        preflight_service=MagicMock(),
         cognitive_graph_max_objects=max_graph_objects,
     )
 

@@ -149,6 +149,26 @@ def test_clone_with_changed_source_recovers_exact_file_diff(
     assert _formal_bytes(cloned_repo_without_cache) == before
 
 
+def test_changed_non_owned_existing_file_is_not_complete_after_partial_recovery(
+    cloned_repo_without_cache: Path,
+) -> None:
+    _write(
+        cloned_repo_without_cache,
+        "src/pkg/a.py",
+        "def unrelated_current_behavior() -> int:\n    return 2\n",
+    )
+
+    result = _recovery(cloned_repo_without_cache).ensure_cache()
+
+    assert result.change_set is not None
+    assert result.change_set.entity_diff_completeness == "partial"
+    assert result.change_set.scope_confidence == "partial"
+    assert {
+        (item["relative_path"], item["reason"])
+        for item in result.change_set.unmapped_changes
+    } == {("src/pkg/a.py", "changed_path_has_no_formal_owner")}
+
+
 def test_clean_clone_becomes_fresh_with_complete_current_baseline(
     cloned_repo_without_cache: Path,
 ) -> None:

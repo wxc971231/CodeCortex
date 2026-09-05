@@ -19,11 +19,13 @@ from codecortex.domain.cognition import (
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.facts import DigestProfile
 from codecortex.domain.freshness import ChangeSet
 from codecortex.domain.ids import IdPrefix, new_id, validate_id
 from codecortex.infrastructure.persistence.entity_refs import recompute_entity_refs
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
+from codecortex.infrastructure.python.digest import repository_digest_from_file_digests
 
 BaselineAdvanceReason = Literal["no_semantic_change", "user_accepted"]
 
@@ -188,6 +190,10 @@ class BaselineAdvanceService:
                     "Baseline advance would produce invalid formal state",
                     details={"issues": [item.message for item in validation.issues]},
                 )
+            if self.fact_sync.probe_source_digest() != current.current_source_digest:
+                raise _stale_change_set(
+                    "Managed source changed after Fact Sync and before baseline commit"
+                )
             event = _baseline_event(event_id, advanced, current, reason, decision_record, approval_record)
             self.formal_store.commit_baseline_advance(advanced, event)
 
@@ -222,6 +228,14 @@ def _advanced_state(
     state: FormalState, facts: FactsDatabase, change_set: ChangeSet, event_id: str
 ) -> FormalState:
     source_files = facts.source_file_digests()
+    aggregate = repository_digest_from_file_digests(
+        source_files, DigestProfile(DIGEST_PROFILE_VERSION)
+    )
+    if aggregate != change_set.current_source_digest:
+        raise CodeCortexError(
+            ErrorCode.FORMAL_STATE_CORRUPT,
+            "Baseline file records do not match the verified current source digest",
+        )
     baseline = SourceBaseline(
         SCHEMA_VERSION,
         DIGEST_PROFILE_VERSION,

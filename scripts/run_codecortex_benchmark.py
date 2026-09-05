@@ -19,6 +19,7 @@ import tempfile
 import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -27,6 +28,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from codecortex.application.fact_sync import FactSyncService
+from codecortex.application.proposals import ManagedSourceSnapshot, ProposalService
+from codecortex.domain.analysis import validate_analysis_report
 from codecortex.domain.cognition import (
     CognitiveGraph,
     EntityRefs,
@@ -34,9 +37,18 @@ from codecortex.domain.cognition import (
     Manifest,
     SourceBaseline,
 )
+from codecortex.domain.facts import DigestProfile, SourceConfig
+from codecortex.domain.proposals import ApprovalRecord
 from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.locking import RepositoryLock
+from codecortex.infrastructure.pending import PendingProposalStore
+from codecortex.infrastructure.python.digest import (
+    digest_source_file,
+    repository_digest,
+)
+from codecortex.infrastructure.python.discovery import discover_python_source_set
 from codecortex.infrastructure.repository import Repository
+from codecortex.infrastructure.views import render_views
 from codecortex.integrations.codex.install import CONFIG_RELATIVE, install_codex
 from tests.benchmark.scoring import (
     BenchmarkCase,
@@ -54,6 +66,10 @@ from tests.e2e.trace import ParsedTrace, parse_sanitized_trace, sanitize_trace
 _DEFAULT_CORPUS = _PROJECT_ROOT / "tests" / "benchmark" / "questions.yaml"
 _DEFAULT_FIXTURE_ROOT = _PROJECT_ROOT / "tests" / "fixtures" / "m1b_repo"
 _FORMAL_FILES = ("manifest.json", "graph.json", "entity_refs.json", "source_baseline.json")
+_FORMAL_GRAPH_TEMPLATE = "formal_graph.json"
+_FORMAL_GRAPH_TEMPLATE_DIGEST = (
+    "sha256:f5c84c4645ac883bd721f93a607e691e379eeafaa63685403d27fc6d440f3b13"
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +85,7 @@ class BenchmarkConfig:
     reasoning_effort: str = "medium"
     sandbox: str = "read-only"
     timeout_seconds: int = 900
+    blind_review_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.repetitions != NonRegressionPolicy().repetitions:
@@ -111,14 +128,17 @@ class BenchmarkCaseResult:
 
 @dataclass(frozen=True)
 class BenchmarkReport:
-    status: Literal["skipped", "completed", "failed"]
-    corpus: str
+    status: Literal["skipped", "pending_human_review", "accepted", "failed"]
+    execution_status: Literal["not_started", "completed", "failed"]
+    corpus_id: str
+    corpus_digest: str
     repetitions: int
     results: tuple[BenchmarkCaseResult, ...] = ()
     graph_outside: dict[str, object] = field(default_factory=dict)
     approval: dict[str, object] = field(default_factory=dict)
     skip_reason: str | None = None
     error: str | None = None
+    blind_review: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -126,6 +146,96 @@ class BenchmarkReport:
 
 class BenchmarkExecutionError(RuntimeError):
     """An opted-in real benchmark ran but did not meet its evidence contract."""
+
+
+@dataclass(frozen=True)
+class BlindReview:
+    """A human decision bound to the exact frozen corpus and all case IDs."""
+
+    corpus_digest: str
+    reviewed_case_ids: tuple[str, ...]
+    blinded: Literal[True]
+    decision: Literal["accepted", "rejected"]
+    reviewer: str
+    reviewed_at: str
+    notes: str
+    schema_version: Literal[1] = 1
+
+
+def corpus_file_digest(path: Path) -> str:
+    """Return the stable digest that binds a blind review to corpus bytes."""
+    return f"sha256:{hashlib.sha256(Path(path).read_bytes()).hexdigest()}"
+
+
+def corpus_identifier(path: Path) -> str:
+    """Return a stable non-machine-specific corpus identifier."""
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(_PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return f"external/{resolved.name}"
+
+
+def load_blind_review(
+    path: Path, cases: Iterable[BenchmarkCase], corpus: Path
+) -> BlindReview:
+    """Load and strictly validate one complete blinded human review."""
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    expected_fields = {
+        "schema_version",
+        "corpus_digest",
+        "reviewed_case_ids",
+        "blinded",
+        "decision",
+        "reviewer",
+        "reviewed_at",
+        "notes",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise ValueError("Blind review has missing or extra fields")
+    expected_ids = tuple(sorted(case.id for case in cases))
+    reviewed_ids = value["reviewed_case_ids"]
+    if not isinstance(reviewed_ids, list) or tuple(reviewed_ids) != expected_ids:
+        raise ValueError("Blind review must cover the exact frozen case set")
+    if value["schema_version"] != 1:
+        raise ValueError("Blind review schema version is unsupported")
+    if value["corpus_digest"] != corpus_file_digest(corpus):
+        raise ValueError("Blind review corpus digest does not match")
+    if value["blinded"] is not True:
+        raise ValueError("Blind review must attest that side labels were hidden")
+    if value["decision"] not in ("accepted", "rejected"):
+        raise ValueError("Blind review decision is invalid")
+    for field_name in ("reviewer", "reviewed_at", "notes"):
+        if not isinstance(value[field_name], str) or not value[field_name].strip():
+            raise ValueError(f"Blind review {field_name} must be non-empty")
+    try:
+        reviewed_at = datetime.fromisoformat(value["reviewed_at"])
+    except ValueError as error:
+        raise ValueError("Blind review timestamp must be RFC3339") from error
+    if reviewed_at.tzinfo is None:
+        raise ValueError("Blind review timestamp must include a timezone")
+    return BlindReview(
+        corpus_digest=value["corpus_digest"],
+        reviewed_case_ids=expected_ids,
+        blinded=True,
+        decision=value["decision"],
+        reviewer=value["reviewer"],
+        reviewed_at=value["reviewed_at"],
+        notes=value["notes"],
+    )
+
+
+def benchmark_acceptance_status(
+    *, automated_failed: bool, blind_review: BlindReview | None
+) -> Literal["failed", "pending_human_review", "accepted"]:
+    """Keep execution completion distinct from benchmark acceptance."""
+    if automated_failed or (
+        blind_review is not None and blind_review.decision == "rejected"
+    ):
+        return "failed"
+    if blind_review is None:
+        return "pending_human_review"
+    return "accepted"
 
 
 class BenchmarkHarness:
@@ -274,11 +384,7 @@ class BenchmarkHarness:
         return str(parent)
 
     def _seed_formal_baseline(self, root: Path) -> None:
-        """Create valid baseline state without pretending it is a semantic graph.
-
-        The benchmark records whatever a real Child Codex does with this valid,
-        empty formal graph.  It does not fabricate graph coverage or answers.
-        """
+        """Apply the pinned, pre-approved semantic fixture to the fresh source tree."""
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         repository = Repository(root)
         lock = RepositoryLock(root)
@@ -303,7 +409,104 @@ class BenchmarkHarness:
             )
         )
         sync.database.replace_baseline_entity_snapshots(first.repository_source_digest)
+        self._apply_formal_graph_fixture(repository, lock, sync, first.repository_source_digest)
         (root / ".gitignore").write_text(".codecortex/.cache/\n", encoding="utf-8")
+
+    def _apply_formal_graph_fixture(
+        self,
+        repository: Repository,
+        lock: RepositoryLock,
+        sync: FactSyncService,
+        source_digest: str,
+    ) -> None:
+        template_path = self.config.fixture_root / _FORMAL_GRAPH_TEMPLATE
+        payload = template_path.read_bytes()
+        actual_digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        if actual_digest != _FORMAL_GRAPH_TEMPLATE_DIGEST:
+            raise BenchmarkExecutionError("Pinned formal graph fixture digest drifted")
+        template = json.loads(payload)
+        if not isinstance(template, dict) or set(template) != {
+            "schema_version",
+            "template_revision",
+            "candidate_nodes",
+            "candidate_edges",
+            "candidate_flows",
+            "candidate_mappings",
+        }:
+            raise BenchmarkExecutionError("Formal graph fixture shape is invalid")
+        if template["schema_version"] != 1 or template["template_revision"] != 1:
+            raise BenchmarkExecutionError("Formal graph fixture version is unsupported")
+        entities = {item.address: item.uid for item in sync.database.current_entity_snapshots()}
+        mappings: list[dict[str, object]] = []
+        for raw in template["candidate_mappings"]:
+            if not isinstance(raw, dict):
+                raise BenchmarkExecutionError("Formal graph mapping fixture is invalid")
+            mapping = dict(raw)
+            address = mapping.pop("entity_address", None)
+            uid = entities.get(address) if isinstance(address, str) else None
+            if uid is None:
+                raise BenchmarkExecutionError(
+                    f"Formal graph mapping address is not present in baseline facts: {address}"
+                )
+            mapping["entity_uid"] = uid
+            mappings.append(mapping)
+        report_payload = json.dumps(
+            {
+                "schema_version": 1,
+                "base_graph_revision": 0,
+                "analyzed_source_digest": source_digest,
+                "analysis_scope": {
+                    "mode": "repository",
+                    "files": len(sync.database.source_file_digests()),
+                    "modules": len(sync.database.source_file_digests()),
+                },
+                "coverage": {
+                    "analyzed_partitions": ["src/forge"],
+                    "unexamined_partitions": [],
+                },
+                "candidate_nodes": template["candidate_nodes"],
+                "candidate_edges": template["candidate_edges"],
+                "candidate_flows": template["candidate_flows"],
+                "candidate_mappings": mappings,
+                "evidence": [],
+                "uncertainties": [],
+                "unmapped_regions": ["src/forge/cli.py"],
+                "diagnostics": [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        report = validate_analysis_report(report_payload, 0, source_digest)
+        formal_store = FormalStore(repository)
+        pending = PendingProposalStore(repository)
+        service = ProposalService(
+            formal_store=formal_store,
+            repository_lock=lock,
+            pending_proposals=pending,
+            view_renderer=render_views,
+            fact_sync=sync,
+            source_probe=lambda: _probe_managed_sources(repository),
+            facts=sync.database,
+        )
+        proposal = service.create_proposal_from_analysis(
+            report,
+            "Apply the reviewed M1b benchmark cognition fixture",
+            proposal_id="prop_01J00000000000000000000001",
+            created_at="2026-09-05T00:00:00Z",
+        )
+        service.apply_cognitive_proposal(
+            proposal.proposal_id,
+            ApprovalRecord(
+                proposal_id=proposal.proposal_id,
+                patch_digest=proposal.patch_digest,
+                approved_by="user",
+                approved_at="2026-09-05T00:01:00Z",
+                approval_summary="Pre-approve the pinned benchmark fixture only.",
+            ),
+        )
+        state = formal_store.load()
+        if state.graph.graph_revision != 1 or not state.graph.implementation_mappings:
+            raise BenchmarkExecutionError("Formal graph fixture did not materialize")
 
     def _replace_source_state(self, root: Path, state: str) -> None:
         current = fixture_state_files(self.config.fixture_root, state)
@@ -385,7 +588,12 @@ class BenchmarkHarness:
             answer=parsed.answer,
             trace=replace(
                 parsed.trace,
-                route="native_fallback" if side == "native" else parsed.trace.route,
+                route=(
+                    "native_fallback"
+                    if side == "native"
+                    or (side == "codecortex" and not parsed.trace.mcp_tool_names)
+                    else parsed.trace.route
+                ),
                 formal_state_mutated=before_formal != _tree_fingerprint(repository / ".codecortex", _FORMAL_FILES),
                 cache_mutated=before_cache != _tree_fingerprint(repository / ".codecortex" / ".cache"),
             ),
@@ -403,12 +611,7 @@ class BenchmarkHarness:
     def _command(self, case: BenchmarkCase, side: Literal["native", "codecortex"]) -> list[str]:
         prompt = case.prompt
         if side == "codecortex":
-            prompt += (
-                "\nFor this isolated benchmark, end your final answer with exactly "
-                "`CODECORTEX_BENCHMARK_ROUTE: <one actual route>` using one of "
-                "graph_current, graph_unaffected, source_first, native_fallback, "
-                "or offer_materialization. Cite accessed source as path:start-end."
-            )
+            prompt += "\nCite accessed source as path:start-end."
         else:
             prompt += "\nCite accessed source as path:start-end."
         command = [
@@ -473,55 +676,70 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
     if not config.execute:
         report = BenchmarkReport(
             status="skipped",
-            corpus=str(config.corpus),
+            execution_status="not_started",
+            corpus_id=corpus_identifier(config.corpus),
+            corpus_digest=corpus_file_digest(config.corpus),
             repetitions=config.repetitions,
             skip_reason=(
                 "Real Child Codex evaluation is opt-in; rerun with --execute --copy-auth "
                 "only when model quota use is authorized."
             ),
         )
-        _write_report(config.artifact_dir, report)
+        write_benchmark_report(config.artifact_dir, report)
         return report
     if not config.copy_auth:
         report = BenchmarkReport(
             status="skipped",
-            corpus=str(config.corpus),
+            execution_status="not_started",
+            corpus_id=corpus_identifier(config.corpus),
+            corpus_digest=corpus_file_digest(config.corpus),
             repetitions=config.repetitions,
             skip_reason="Real evaluation also requires --copy-auth for the temporary isolated home.",
         )
-        _write_report(config.artifact_dir, report)
+        write_benchmark_report(config.artifact_dir, report)
         return report
     if shutil.which("codex") is None or shutil.which("codecortex") is None:
         report = BenchmarkReport(
             status="skipped",
-            corpus=str(config.corpus),
+            execution_status="not_started",
+            corpus_id=corpus_identifier(config.corpus),
+            corpus_digest=corpus_file_digest(config.corpus),
             repetitions=config.repetitions,
             skip_reason="Codex or CodeCortex executable is unavailable; no Child process was started.",
         )
-        _write_report(config.artifact_dir, report)
+        write_benchmark_report(config.artifact_dir, report)
         return report
     if config.approval_case_id is not None:
         prepared = harness.prepare_case(config.approval_case_id, repetition=1)
         try:
             approval = harness.run_approval_case(prepared)
             report = BenchmarkReport(
-                status="completed",
-                corpus=str(config.corpus),
+                status="pending_human_review",
+                execution_status="completed",
+                corpus_id=corpus_identifier(config.corpus),
+                corpus_digest=corpus_file_digest(config.corpus),
                 repetitions=config.repetitions,
                 approval=approval,
             )
         except (BenchmarkExecutionError, subprocess.SubprocessError, OSError, TimeoutError) as error:
             report = BenchmarkReport(
                 status="failed",
-                corpus=str(config.corpus),
+                execution_status="failed",
+                corpus_id=corpus_identifier(config.corpus),
+                corpus_digest=corpus_file_digest(config.corpus),
                 repetitions=config.repetitions,
                 error=str(error),
             )
         finally:
             harness.cleanup(prepared)
-        _write_report(config.artifact_dir, report)
+        write_benchmark_report(config.artifact_dir, report)
         return report
     results: list[BenchmarkCaseResult] = []
+    blind_review = (
+        None
+        if config.blind_review_path is None
+        else load_blind_review(config.blind_review_path, harness.cases, config.corpus)
+    )
     try:
         for case in harness.cases:
             for repetition in range(1, config.repetitions + 1):
@@ -538,21 +756,28 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
             for result in results
         ) or not all(bool(item["passed"]) for item in graph_outside.values())
         report = BenchmarkReport(
-            status="failed" if failed else "completed",
-            corpus=str(config.corpus),
+            status=benchmark_acceptance_status(
+                automated_failed=failed, blind_review=blind_review
+            ),
+            execution_status="completed",
+            corpus_id=corpus_identifier(config.corpus),
+            corpus_digest=corpus_file_digest(config.corpus),
             repetitions=config.repetitions,
             results=tuple(results),
             graph_outside=graph_outside,
+            blind_review=(None if blind_review is None else asdict(blind_review)),
         )
     except (BenchmarkExecutionError, subprocess.SubprocessError, OSError, TimeoutError) as error:
         report = BenchmarkReport(
             status="failed",
-            corpus=str(config.corpus),
+            execution_status="failed",
+            corpus_id=corpus_identifier(config.corpus),
+            corpus_digest=corpus_file_digest(config.corpus),
             repetitions=config.repetitions,
             results=tuple(results),
             error=str(error),
         )
-    _write_report(config.artifact_dir, report)
+    write_benchmark_report(config.artifact_dir, report)
     return report
 
 
@@ -564,6 +789,17 @@ def _native_case(case: BenchmarkCase) -> BenchmarkCase:
         analyzer_permitted=True,
         materialization_prompt_permitted=True,
         expected_codecortex_mcp_calls=None,
+    )
+
+
+def _probe_managed_sources(repository: Repository) -> ManagedSourceSnapshot:
+    discovered = discover_python_source_set(repository, SourceConfig())
+    files = tuple(digest_source_file(source) for source in discovered.sources)
+    return ManagedSourceSnapshot(
+        repository_source_digest=repository_digest(files, DigestProfile()),
+        file_digests={
+            item.source.relative_path: item.content_digest for item in files
+        },
     )
 
 
@@ -629,9 +865,14 @@ def _tree_fingerprint(root: Path, allowed: tuple[str, ...] | None = None) -> tup
     return tuple(sorted(records))
 
 
-def _write_report(artifact_dir: Path, report: BenchmarkReport) -> None:
+def write_benchmark_report(artifact_dir: Path, report: BenchmarkReport) -> None:
+    """Persist only a structurally sanitized benchmark report."""
+    serialized = sanitize_trace(
+        json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True)
+    )
+    sanitized = json.loads(serialized)
     (artifact_dir / "benchmark_report.json").write_text(
-        json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(sanitized, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
@@ -652,6 +893,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument("--sandbox", default="read-only")
     parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser.add_argument(
+        "--blind-review",
+        type=Path,
+        help="validated blinded human-review JSON for the exact frozen corpus",
+    )
     arguments = parser.parse_args(argv)
     report = run_benchmark(
         BenchmarkConfig(
@@ -666,6 +912,7 @@ def main(argv: list[str] | None = None) -> int:
             reasoning_effort=arguments.reasoning_effort,
             sandbox=arguments.sandbox,
             timeout_seconds=arguments.timeout_seconds,
+            blind_review_path=arguments.blind_review,
         )
     )
     print(json.dumps({"status": report.status, "artifact": str(arguments.artifact_dir / "benchmark_report.json")}))

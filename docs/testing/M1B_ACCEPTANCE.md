@@ -18,7 +18,11 @@ is evidence that the guard worked; it is **not** a benchmark pass.
 The deterministic harness verifies that every prepared Native/CodeCortex pair
 uses distinct clean temporary repositories and Codex homes, while sharing one
 temporary Git commit.  It also verifies that persisted traces redact machine
-paths and credentials.
+paths and credentials.  Each prepared repository contains the pinned,
+pre-approved revision-1 formal graph from `tests/fixtures/m1b_repo/formal_graph.json`;
+the harness validates and applies that graph through the product Proposal path.
+Scored routes and cognitive anchors come from matching MCP call/result records,
+not text emitted by the Child process.
 
 ## Real Child Codex benchmark (manual, opt-in)
 
@@ -46,6 +50,29 @@ stored in the artifact directory.  The benchmark uses the frozen corpus and
 scorer; graph-outside records the pre-frozen paired non-regression deltas.
 Any deterministic pass still requires blinded human review for semantic
 correctness, relevance, clarity and grounding.
+
+A successful automated execution writes `execution_status: "completed"` but
+remains `status: "pending_human_review"`.  Acceptance requires a separate JSON
+review supplied with `--blind-review`; it must attest blinded review, cover the
+exact sorted corpus case IDs, and match the persisted corpus digest:
+
+```json
+{
+  "schema_version": 1,
+  "corpus_digest": "sha256:<digest from benchmark_report.json>",
+  "reviewed_case_ids": ["<every frozen case ID, sorted>"],
+  "blinded": true,
+  "decision": "accepted",
+  "reviewer": "<independent reviewer>",
+  "reviewed_at": "2026-09-05T08:00:00Z",
+  "notes": "<review notes>"
+}
+```
+
+Re-run with the same corpus and `--blind-review path/to/review.json` to bind
+that review to the report. A rejected review or failed automated evidence
+produces `status: "failed"`; only a validated accepting review produces
+`status: "accepted"`.
 
 ## Approval/resume mode and VS Code smoke test
 

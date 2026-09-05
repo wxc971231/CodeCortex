@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -20,7 +21,7 @@ from codecortex.domain.cognition import (
     Manifest,
     SourceBaseline,
 )
-from codecortex.domain.errors import CodeCortexError
+from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.infrastructure.formal import FormalStore
 from codecortex.infrastructure.jsonio import canonical_json_bytes
 from codecortex.infrastructure.locking import RepositoryLock
@@ -129,3 +130,60 @@ def test_stale_change_set_does_not_change_formal_baseline(tmp_path: Path) -> Non
 
     assert (repository.root / ".codecortex/manifest.json").read_bytes() == before
     assert formal_store.load().manifest.graph_revision == 1
+
+
+def test_baseline_advance_fails_closed_on_post_sync_source_race(
+    tmp_path: Path,
+) -> None:
+    service, repository, formal_store = _service(tmp_path)
+    _write(repository.root, "def answer() -> int:\n    return 2\n")
+    preflight = service.preflight()
+    assert preflight.change_set is not None
+    accepted_before = formal_store.load().manifest.cognition_baseline
+    original_probe = service.fact_sync.probe_source_digest
+    probe_count = 0
+
+    def race_after_second_sync() -> str:
+        nonlocal probe_count
+        probe_count += 1
+        if probe_count == 2:
+            _write(repository.root, "def answer() -> int:\n    return 3\n")
+        return original_probe()
+
+    with patch.object(
+        service.fact_sync, "probe_source_digest", side_effect=race_after_second_sync
+    ), pytest.raises(CodeCortexError) as raised:
+        service.advance(
+            preflight.change_set.change_set_id,
+            "no_semantic_change",
+            DecisionRecord("analyzer", "No semantic change.", "2026-09-04T08:00:00Z"),
+            None,
+        )
+
+    assert raised.value.code is ErrorCode.PROPOSAL_STALE
+    assert formal_store.load().manifest.cognition_baseline == accepted_before
+
+
+def test_baseline_advance_rejects_file_records_with_wrong_aggregate_digest(
+    tmp_path: Path,
+) -> None:
+    service, repository, formal_store = _service(tmp_path)
+    _write(repository.root, "def answer() -> int:\n    return 2\n")
+    preflight = service.preflight()
+    assert preflight.change_set is not None
+    accepted_before = formal_store.load().manifest.cognition_baseline
+
+    with patch.object(
+        service.facts,
+        "source_file_digests",
+        return_value={"app.py": "sha256:" + "f" * 64},
+    ), pytest.raises(CodeCortexError) as raised:
+        service.advance(
+            preflight.change_set.change_set_id,
+            "no_semantic_change",
+            DecisionRecord("analyzer", "No semantic change.", "2026-09-04T08:00:00Z"),
+            None,
+        )
+
+    assert raised.value.code is ErrorCode.FORMAL_STATE_CORRUPT
+    assert formal_store.load().manifest.cognition_baseline == accepted_before

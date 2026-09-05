@@ -213,6 +213,10 @@ class FactSyncService:
                 )
         raise AssertionError("Fact Sync retry loop unexpectedly exhausted")
 
+    def probe_source_digest(self) -> str:
+        """Hash the live managed source set without reading or writing cache state."""
+        return self._source_snapshot().repository_source_digest
+
     def _source_snapshot(self) -> _SourceSnapshot:
         discovered = discover_python_source_set(self.repository, self.source_config)
         files: list[SourceFileDigest] = []
