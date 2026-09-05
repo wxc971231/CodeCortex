@@ -82,18 +82,21 @@ def parse_sanitized_trace(raw: str, *, elapsed_ms: int | None = None) -> ParsedT
             values.append(json.loads(line))
         except json.JSONDecodeError:
             values.append(line)
-    text = "\n".join(_all_text(value) for value in values)
-    references = _source_references(text)
-    tool_names = tuple(sorted(set(_tool_names(values))))
+    assistant_messages = tuple(_assistant_messages(values))
+    assistant_text = "\n".join(assistant_messages)
+    references = _source_references(assistant_text)
+    tool_names = tuple(name for name, _record in _tool_events(values))
     anchors = _cognitive_anchor_ids(values, tool_names)
-    route = _route_from_mcp_trace(values, tool_names, anchors)
+    materialization_count = sum(
+        _is_materialization_prompt(message) for message in assistant_messages
+    )
+    route = _route_from_mcp_trace(
+        values, tool_names, anchors, materialization_count
+    )
     input_tokens, output_tokens = _token_counts(values)
     analyzer_count = sum("codecortex-analyzer" in name for name in tool_names)
-    materialization_count = len(
-        re.findall(r"\b(?:materialize|materialization)\b", text, re.IGNORECASE)
-    )
     return ParsedTrace(
-        answer=_final_answer(values),
+        answer=assistant_messages[-1] if assistant_messages else "",
         trace=Trace(
             route=route,
             cognitive_anchor_ids=anchors,
@@ -132,6 +135,7 @@ def _route_from_mcp_trace(
     values: Iterable[object],
     tool_names: tuple[str, ...],
     anchors: tuple[str, ...],
+    materialization_prompt_count: int,
 ) -> str | None:
     codecortex_tools = tuple(
         name for name in tool_names if "codecortex" in name.casefold()
@@ -161,7 +165,11 @@ def _route_from_mcp_trace(
         any("get_discussion_context" in name for name in codecortex_tools)
         and "unmaterialized" in materialization_statuses
     ):
-        return "offer_materialization"
+        return (
+            "offer_materialization"
+            if materialization_prompt_count
+            else "source_first"
+        )
     if not effective_records:
         return None
     if statuses & {"affected_source_first", "unknown_source_first"}:
@@ -207,16 +215,6 @@ def _redact_text(value: str) -> str:
     return _ABSOLUTE_PATH.sub("<machine-path>", value)
 
 
-def _all_text(value: object) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, Mapping):
-        return "\n".join(_all_text(item) for item in value.values())
-    if isinstance(value, list):
-        return "\n".join(_all_text(item) for item in value)
-    return ""
-
-
 def _source_references(text: str) -> tuple[SourceReference, ...]:
     found: set[SourceReference] = set()
     for match in _SOURCE_REFERENCE.finditer(text):
@@ -227,41 +225,45 @@ def _source_references(text: str) -> tuple[SourceReference, ...]:
     return tuple(sorted(found, key=lambda item: (item.relative_path, item.start_line, item.end_line)))
 
 
-def _tool_names(values: Iterable[object]) -> Iterable[str]:
+def _tool_events(
+    values: Iterable[object],
+) -> Iterable[tuple[str, Mapping[object, object]]]:
     for value in values:
-        yield from _tool_names_in(value)
+        yield from _tool_events_in(value)
+
+
+def _tool_events_in(
+    value: object,
+) -> Iterable[tuple[str, Mapping[object, object]]]:
+    if isinstance(value, Mapping):
+        direct_name = _direct_tool_name(value)
+        if direct_name is not None:
+            yield direct_name, value
+            return
+        for nested in value.values():
+            yield from _tool_events_in(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _tool_events_in(nested)
 
 
 def _matching_tool_records(
     values: Iterable[object], tool_fragment: str
 ) -> Iterable[Mapping[object, object]]:
-    for value in values:
-        yield from _matching_tool_records_in(value, tool_fragment)
+    for name, record in _tool_events(values):
+        if tool_fragment in name:
+            yield record
 
 
-def _matching_tool_records_in(
-    value: object, tool_fragment: str
-) -> Iterable[Mapping[object, object]]:
-    if isinstance(value, Mapping):
-        direct_names = tuple(_direct_tool_names(value))
-        if any(tool_fragment in name for name in direct_names):
-            yield value
-            return
-        for nested in value.values():
-            yield from _matching_tool_records_in(nested, tool_fragment)
-    elif isinstance(value, list):
-        for nested in value:
-            yield from _matching_tool_records_in(nested, tool_fragment)
-
-
-def _direct_tool_names(value: Mapping[object, object]) -> Iterable[str]:
-    possible = value.get("tool_name") or value.get("name")
-    if isinstance(possible, str) and "codecortex" in possible.casefold():
-        yield possible
+def _direct_tool_name(value: Mapping[object, object]) -> str | None:
     server = value.get("server") or value.get("server_name")
     tool = value.get("tool") or value.get("tool_name")
     if isinstance(server, str) and "codecortex" in server.casefold() and isinstance(tool, str):
-        yield f"{server}.{tool}"
+        return f"{server}.{tool}"
+    possible = value.get("tool_name") or value.get("name")
+    if isinstance(possible, str) and "codecortex" in possible.casefold():
+        return possible
+    return None
 
 
 def _tool_output_pairs(record: Mapping[object, object]) -> Iterable[tuple[str, object]]:
@@ -290,14 +292,43 @@ def _embedded_json_values(value: object) -> Iterable[object]:
             yield from _embedded_json_values(nested)
 
 
-def _tool_names_in(value: object) -> Iterable[str]:
+def _assistant_messages(values: Iterable[object]) -> Iterable[str]:
+    for value in values:
+        yield from _assistant_messages_in(value, top_level=True)
+
+
+def _assistant_messages_in(value: object, *, top_level: bool) -> Iterable[str]:
     if isinstance(value, Mapping):
-        yield from _direct_tool_names(value)
+        if _direct_tool_name(value) is not None:
+            return
+        record_type = value.get("type")
+        role = value.get("role")
+        if record_type in {"agent_message", "assistant_message"} or role == "assistant":
+            for field in ("text", "content", "message"):
+                item = value.get(field)
+                if isinstance(item, str):
+                    yield item
+                    return
+        if top_level and record_type is None:
+            message = value.get("message")
+            if isinstance(message, str):
+                yield message
+                return
         for nested in value.values():
-            yield from _tool_names_in(nested)
+            yield from _assistant_messages_in(nested, top_level=False)
     elif isinstance(value, list):
         for nested in value:
-            yield from _tool_names_in(nested)
+            yield from _assistant_messages_in(nested, top_level=False)
+
+
+def _is_materialization_prompt(message: str) -> bool:
+    lowered = message.casefold()
+    return (
+        "?" in message
+        and re.search(r"\bmaterializ(?:e|ation)\b", lowered) is not None
+        and re.search(r"\b(?:option|choice)\s*a\b", lowered) is not None
+        and re.search(r"\b(?:option|choice)\s*b\b", lowered) is not None
+    )
 
 
 def _token_counts(values: Iterable[object]) -> tuple[int | None, int | None]:
@@ -323,12 +354,3 @@ def _walk_pairs(value: object) -> Iterable[tuple[str, object]]:
     elif isinstance(value, list):
         for item in value:
             yield from _walk_pairs(item)
-
-
-def _final_answer(values: Iterable[object]) -> str:
-    candidates: list[str] = []
-    for value in values:
-        for key, item in _walk_pairs(value):
-            if key.casefold() in {"text", "content", "message", "output"} and isinstance(item, str):
-                candidates.append(item)
-    return candidates[-1] if candidates else ""

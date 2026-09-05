@@ -104,6 +104,47 @@ def test_score_enforces_native_coding_zero_codecortex_side_effects() -> None:
     assert score.passed is False
 
 
+def test_score_binds_unmaterialized_choices_to_observed_tool_actions() -> None:
+    evidence = (SourceReference("src/forge/checkpoint.py", 10, 12),)
+    expand = _case(
+        category="unmaterialized_expand",
+        expected_route="source_first",
+        analyzer_permitted=True,
+    )
+    transient = _case(
+        category="unmaterialized_transient",
+        expected_route="source_first",
+    )
+
+    ignored_expand = score_answer(
+        expand,
+        "Checkpoint is atomic.",
+        Trace(route="source_first", source_references=evidence),
+    )
+    observed_expand = score_answer(
+        expand,
+        "Checkpoint is atomic.",
+        Trace(
+            route="source_first",
+            source_references=evidence,
+            mcp_tool_names=("codecortex.create_cognitive_proposal_from_analysis",),
+        ),
+    )
+    violated_transient = score_answer(
+        transient,
+        "Checkpoint is atomic.",
+        Trace(
+            route="source_first",
+            source_references=evidence,
+            mcp_tool_names=("codecortex.create_cognitive_proposal",),
+        ),
+    )
+
+    assert ignored_expand.route_compliant is False
+    assert observed_expand.route_compliant is True
+    assert violated_transient.route_compliant is False
+
+
 def test_frozen_corpus_validates_fixture_digests_and_ordering() -> None:
     cases = load_corpus(CORPUS_PATH)
 

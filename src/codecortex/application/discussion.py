@@ -410,6 +410,53 @@ class DiscussionPlanner:
             max_entities=_MAX_CONTEXT_ENTITIES,
             max_evidence=_MAX_CONTEXT_EVIDENCE,
         )
+        if question_scope.behavior_materialization == "unmaterialized":
+            behavior_id = _confirmed_behavior_id(question_scope)
+            offer = self.offer_for(
+                behavior_id, invocation, question_scope.semantic_sync_scope
+            )
+            baseline_navigation = freshness.status in {
+                "affected_source_first",
+                "unknown_source_first",
+            }
+            if not offer.should_ask_user:
+                return DiscussionPlan(
+                    route="source_first",
+                    anchor_ids=anchors,
+                    entity_ids=question_scope.entity_ids,
+                    candidate_node_ids=candidate_ids,
+                    freshness=freshness,
+                    context_request=context,
+                    requires_current_facts=True,
+                    requires_current_source=True,
+                    graph_is_baseline_navigation=baseline_navigation,
+                    native_search_unrestricted=False,
+                    explanation=(
+                        *(("GRAPH_IS_BASELINE_NAVIGATION_ONLY",) if baseline_navigation else ()),
+                        *offer.explanation,
+                        *freshness.reason_codes,
+                    ),
+                    materialization_offer=offer,
+                    semantic_sync=offer.semantic_sync,
+                )
+            return DiscussionPlan(
+                route="offer_materialization",
+                anchor_ids=anchors,
+                entity_ids=question_scope.entity_ids,
+                candidate_node_ids=candidate_ids,
+                freshness=freshness,
+                context_request=context,
+                requires_current_facts=False,
+                requires_current_source=False,
+                graph_is_baseline_navigation=baseline_navigation,
+                native_search_unrestricted=False,
+                explanation=(
+                    *(("GRAPH_IS_BASELINE_NAVIGATION_ONLY",) if baseline_navigation else ()),
+                    *offer.explanation,
+                    *freshness.reason_codes,
+                ),
+                materialization_offer=offer,
+            )
         if freshness.status in {"affected_source_first", "unknown_source_first"}:
             return DiscussionPlan(
                 route="source_first",
@@ -428,42 +475,6 @@ class DiscussionPlanner:
                     *freshness.reason_codes,
                 ),
             )
-        if question_scope.behavior_materialization == "unmaterialized":
-            behavior_id = _confirmed_behavior_id(question_scope)
-            offer = self.offer_for(
-                behavior_id, invocation, question_scope.semantic_sync_scope
-            )
-            if not offer.should_ask_user:
-                return DiscussionPlan(
-                    route="source_first",
-                    anchor_ids=anchors,
-                    entity_ids=question_scope.entity_ids,
-                    candidate_node_ids=candidate_ids,
-                    freshness=freshness,
-                    context_request=context,
-                    requires_current_facts=True,
-                    requires_current_source=True,
-                    graph_is_baseline_navigation=False,
-                    native_search_unrestricted=False,
-                    explanation=offer.explanation,
-                    materialization_offer=offer,
-                    semantic_sync=offer.semantic_sync,
-                )
-            return DiscussionPlan(
-                route="offer_materialization",
-                anchor_ids=anchors,
-                entity_ids=question_scope.entity_ids,
-                candidate_node_ids=candidate_ids,
-                freshness=freshness,
-                context_request=context,
-                requires_current_facts=False,
-                requires_current_source=False,
-                graph_is_baseline_navigation=False,
-                native_search_unrestricted=False,
-                explanation=(*offer.explanation, *freshness.reason_codes),
-                materialization_offer=offer,
-            )
-
         route: DiscussionRoute = (
             "graph_current"
             if freshness.status == "current"

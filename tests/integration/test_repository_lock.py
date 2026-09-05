@@ -8,7 +8,7 @@ import pytest
 
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.infrastructure import locking
-from codecortex.infrastructure.locking import RepositoryLock
+from codecortex.infrastructure.locking import ReadOnlyRepositoryLock, RepositoryLock
 
 
 def hold_lock(repo_path: str, mode: str, ready: Event, release: Event) -> None:
@@ -180,3 +180,66 @@ def test_unlock_failure_still_closes_lock_descriptor(
         pass
 
     assert len(closed_descriptors) == 1
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "directory"])
+def test_read_only_lock_rejects_non_regular_lock_targets(
+    repo_path: Path, unsafe_kind: str
+) -> None:
+    cache = repo_path / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    target = cache / "repository.lock"
+    if unsafe_kind == "symlink":
+        outside = repo_path.parent / "outside.lock"
+        outside.write_text("", encoding="utf-8")
+        target.symlink_to(outside)
+    else:
+        target.mkdir()
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+
+
+def test_read_only_lock_rejects_cache_directory_symlink_escape(
+    repo_path: Path,
+) -> None:
+    outside = repo_path.parent / "outside-cache"
+    outside.mkdir()
+    (outside / "repository.lock").write_text("", encoding="utf-8")
+    (repo_path / ".codecortex").mkdir()
+    (repo_path / ".codecortex" / ".cache").symlink_to(outside)
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+
+
+def test_read_only_lock_maps_open_oserror_to_rebuild_required(
+    repo_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with RepositoryLock(repo_path).acquire("shared", 0.05):
+        pass
+    monkeypatch.setattr(
+        locking.os,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("lock cannot be opened")
+        ),
+    )
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED

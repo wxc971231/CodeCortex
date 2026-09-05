@@ -13,7 +13,8 @@ python scripts/run_codecortex_benchmark.py \
 The second command is intentionally safe by default: it validates the frozen
 corpus and writes `benchmark_report.json` with `status: "skipped"`.  It does
 not start Codex, read browser auth, or consume a model quota.  A skipped report
-is evidence that the guard worked; it is **not** a benchmark pass.
+is evidence that the guard worked; it is **not** a benchmark pass, and the CLI
+returns exit code 2 so automation cannot mistake it for acceptance.
 
 The deterministic harness verifies that every prepared Native/CodeCortex pair
 uses distinct clean temporary repositories and Codex homes, while sharing one
@@ -29,6 +30,10 @@ session can run overview → initialize → full Fact Sync → guarded analysis 
 while initialized-only M1b reads still return `NOT_INITIALIZED`. Analyzer
 composition and reads are checked against missing, corrupt, and prepared cache
 states; they must never create, repair, delete, or otherwise mutate cache files.
+Bootstrap authorization and the actual read share one repository lock, and the
+suite interleaves two Main instances to prove a concurrent completed
+initialization cannot retain the exception. Final live-source digest checks are
+also race-tested after Fact Sync, Analyzer preparation, and cache recovery.
 
 ## Real Child Codex benchmark (manual, opt-in)
 
@@ -47,7 +52,9 @@ conversation.  Native receives `--ignore-user-config`; CodeCortex receives an
 isolated, test-only home and MCP configuration.  Both sides use the same
 model, reasoning effort, sandbox, prompt, per-turn timeout, fixture source
 tree, and temporary Git commit.  Browser auth is copied only to temporary
-homes and those homes are deleted after each pair.
+homes. The entire per-pair temporary workspace (both Git copies, the seed, and
+both homes) lives outside the artifact directory and is deleted after each pair,
+including preparation failures.
 
 Artifacts retain only sanitized JSONL under `traces/` plus
 `benchmark_report.json`: source/command access, MCP names, final answer,

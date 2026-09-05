@@ -23,7 +23,10 @@ from codecortex.domain.analysis import (
     AnalysisReport,
     validate_analysis_report,
 )
+from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.proposals import Proposal
+
+_MAX_COORDINATE_RETRIES = 2
 
 
 class AnalysisProposalPort(Protocol):
@@ -100,10 +103,22 @@ class InitializationService:
         # Fact Sync takes the exclusive lock internally and returns the digest
         # of the snapshot it actually committed.  The formal revision is then
         # read under a shared lock; the Main process is the only writer.
-        result = self._fact_sync.sync("auto")
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            revision = self._formal_store.load().graph.graph_revision
-        return AnalysisCoordinate(
-            graph_revision=revision,
-            source_digest=result.repository_source_digest,
+        for _attempt in range(_MAX_COORDINATE_RETRIES + 1):
+            result = self._fact_sync.sync("auto")
+            with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
+                revision = self._formal_store.load().graph.graph_revision
+                live_source_digest = self._fact_sync.probe_source_digest()
+                if (
+                    revision == result.graph_revision
+                    and live_source_digest == result.repository_source_digest
+                ):
+                    return AnalysisCoordinate(
+                        graph_revision=revision,
+                        source_digest=result.repository_source_digest,
+                    )
+        raise CodeCortexError(
+            ErrorCode.PROPOSAL_STALE,
+            "Managed source or formal graph kept changing during analysis preparation",
+            retryable=True,
+            suggested_action="Retry analysis against a stable repository snapshot",
         )

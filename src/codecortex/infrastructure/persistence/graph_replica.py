@@ -584,7 +584,7 @@ class GraphReplica:
             return uri
         wal_exists = Path(f"{self.path}-wal").exists()
         shm_exists = Path(f"{self.path}-shm").exists()
-        if wal_exists != shm_exists:
+        if shm_exists and not wal_exists:
             raise sqlite3.OperationalError(
                 "Read-only cognitive replica has an incomplete WAL coordinate"
             )

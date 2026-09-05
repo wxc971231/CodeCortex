@@ -224,6 +224,8 @@ B. 暂不持久化，基于已有认知 + 代码事实 + 源码回答
 
 选择 B 时立即回答，不写正式认知。本次 CodeCortex 工作流中不重复询问同一 Behavior。Core 不识别 Codex thread；“已询问”由 Skill/Main 在当前对话上下文维护。
 
+已经记录的 A/B 决定先于通用 affected/unknown 路由生效：A 先执行语义同步，再按最新事实/源码回答；B 直接 source-first。只有尚未回答的选择才展示一次询问。
+
 ### 10.4 没有 Responsibility/Behavior/Capability 锚点
 
 才进入 Native Codex fallback：`rg`、目录探索、源码、配置、测试和文档。回答后可以建议未来增加认知覆盖，但不能强迫先建图。
@@ -311,6 +313,8 @@ cache 缺失或不匹配时：
 
 恢复 cache 是确定性操作；此时未被正式引用的历史实体可能无法恢复，因此 ChangeSet 明确标记 `entity_diff_completeness=partial`。判断源码变化是否改变认知是之后按需执行的独立语义任务。
 
+若 revision-0 正式骨架已经存在但 cache 缺失，Main 在显式 full Fact Sync 后只重建 bootstrap replica，不重复 initialize。恢复返回前必须再次探测 live Managed Source digest；发生竞争变化时 fail closed。Analyzer 只使用不创建、不修复的只读 handles，拒绝不安全 lock 路径、损坏数据库和孤立 `-shm` sidecar；有效的 live `-wal` 可只读消费而不得被 checkpoint、删除或改写。
+
 ## 16. M1b MCP 增量
 
 两个 profile 可读：
@@ -333,7 +337,8 @@ cache 缺失或不匹配时：
 认知查询，不因 M1a 首次初始化而放宽。M1a 仅为
 `repository_facts`/`analysis_scope` 定义一个受 CacheGuard 约束的 bootstrap
 读阶段；它不允许 freshness、graph、search、context 或 discussion 路由绕过
-M1b Fact Preflight。
+M1b Fact Preflight。该 bootstrap 例外在同一个 repository shared lock 内重读
+正式状态并执行实际查询；任何并发初始化完成都会使例外立即失效。
 
 `decision_record` 对 no_semantic_change 保存 decided_by、证据摘要、Analyzer/Main 来源和时间；user_accepted 额外要求与当前 digest 匹配的 approval record。
 

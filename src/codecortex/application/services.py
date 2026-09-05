@@ -3,7 +3,7 @@
 import hashlib
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -199,6 +199,28 @@ class ApplicationServices:
             )
         return self.preflight_service.run()
 
+    def run_m1a_bootstrap_read[QueryResult](
+        self, operation: Callable[[], QueryResult]
+    ) -> QueryResult:
+        """Authorize and execute one M1a bootstrap read in one shared snapshot."""
+        preflight = self.preflight_service
+        recovery = None if preflight is None else preflight.recovery_service
+        if recovery is None:
+            raise CodeCortexError(
+                ErrorCode.CACHE_REBUILD_REQUIRED,
+                "Main bootstrap cache recovery is not configured",
+                suggested_action="Start the Main CodeCortex profile",
+            )
+        recovery.ensure_bootstrap_cache()
+        with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+            state = self.formal_store.load()
+            if state.manifest.cognition_initialized:
+                raise CodeCortexError(
+                    ErrorCode.NOT_INITIALIZED,
+                    "M1a bootstrap reads are unavailable after cognition initialization",
+                )
+            return operation()
+
     def plan_discussion(
         self,
         question_scope: QuestionScope,
@@ -288,6 +310,11 @@ class ApplicationServices:
                     )
                 change_set = preflight_service.freshness_store.load_effective()
                 current = metadata.repository_source_digest
+                live = preflight_service.fact_sync.probe_source_digest()
+                if live != current:
+                    raise _freshness_cache_error(
+                        "Managed source changed after Main prepared Analyzer freshness"
+                    )
                 if current == baseline:
                     if change_set is not None:
                         raise _freshness_cache_error(
@@ -310,7 +337,7 @@ class ApplicationServices:
                 )
         except CodeCortexError:
             raise
-        except (OSError, ValueError) as error:
+        except (OSError, TypeError, ValueError) as error:
             raise _freshness_cache_error("Prepared freshness cache is unreadable") from error
 
     def repository_facts(

@@ -91,7 +91,13 @@ class RecoveryService:
                         return True
                 self.freshness_store.load_effective()
                 return False
-        except (CodeCortexError, OSError, sqlite3.DatabaseError, ValueError):
+        except (
+            CodeCortexError,
+            OSError,
+            sqlite3.DatabaseError,
+            TypeError,
+            ValueError,
+        ):
             return True
 
     def ensure_cache(self) -> CacheRecoveryResult:
@@ -130,6 +136,13 @@ class RecoveryService:
                 )
             )
             self._replace_effective(change_set)
+            if self.fact_sync.probe_source_digest() != synced.repository_source_digest:
+                raise CodeCortexError(
+                    ErrorCode.CACHE_REBUILD_REQUIRED,
+                    "Managed source changed while cache recovery was finalizing",
+                    retryable=True,
+                    suggested_action="Retry the CodeCortex operation",
+                )
             return CacheRecoveryResult(
                 fact_sync=synced,
                 change_set=change_set,
@@ -138,6 +151,87 @@ class RecoveryService:
                 rebuilt_facts=True,
                 rebuilt_replica=rebuilt_replica,
             )
+
+    def ensure_bootstrap_cache(self) -> None:
+        """Repair only the revision-zero query replica after explicit Fact Sync.
+
+        M1a initialization is allowed to read facts before cognition is
+        initialized, but it must not silently perform the required full Fact
+        Sync.  This path therefore proves that the fact cache already matches
+        the live source/formal coordinate and reconstructs only the disposable
+        cognitive replica.
+        """
+        with self.repository_lock.acquire("exclusive", self.lock_timeout_seconds):
+            self.formal_store.recover()
+            formal = self.formal_store.load()
+            if formal.manifest.cognition_initialized:
+                raise CodeCortexError(
+                    ErrorCode.NOT_INITIALIZED,
+                    "M1a bootstrap reads are unavailable after cognition initialization",
+                )
+            try:
+                if not self.facts.path.is_file() or not self.facts.integrity_ok():
+                    raise _bootstrap_cache_error(
+                        "M1a bootstrap facts are missing or unreadable"
+                    )
+                metadata = self.facts.cache_metadata()
+                if (
+                    metadata.cache_schema_version != FactsDatabase.schema_version
+                    or metadata.parser_version != self.fact_sync.parser_version
+                    or metadata.digest_profile_version
+                    != formal.manifest.digest_profile_version
+                    or metadata.managed_source_set_version
+                    != formal.manifest.managed_source_set_version
+                    or metadata.graph_revision != formal.manifest.graph_revision
+                    or self.fact_sync.probe_source_digest()
+                    != metadata.repository_source_digest
+                ):
+                    raise _bootstrap_cache_error(
+                        "M1a bootstrap facts do not match the live formal/source coordinate"
+                    )
+            except CodeCortexError:
+                raise
+            except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as error:
+                raise _bootstrap_cache_error(
+                    "M1a bootstrap facts are missing or unreadable"
+                ) from error
+
+            replica_current = False
+            if self.cognitive_replica is not None:
+                try:
+                    replica_current = (
+                        self.cognitive_replica.metadata().graph_revision
+                        == formal.manifest.graph_revision
+                    )
+                except (
+                    CodeCortexError,
+                    OSError,
+                    sqlite3.DatabaseError,
+                    TypeError,
+                    ValueError,
+                ):
+                    replica_current = False
+            if not replica_current:
+                self._rebuild_replica(formal)
+
+            # Recheck both authorities before releasing the lock; rebuilding a
+            # replica for a source or formal coordinate that moved is unsafe.
+            current = self.formal_store.load()
+            current_metadata = self.facts.cache_metadata()
+            if current.manifest.cognition_initialized:
+                raise CodeCortexError(
+                    ErrorCode.NOT_INITIALIZED,
+                    "M1a bootstrap reads are unavailable after cognition initialization",
+                )
+            if (
+                current.manifest.graph_revision != formal.manifest.graph_revision
+                or current_metadata.graph_revision != current.manifest.graph_revision
+                or self.fact_sync.probe_source_digest()
+                != current_metadata.repository_source_digest
+            ):
+                raise _bootstrap_cache_error(
+                    "M1a bootstrap coordinate changed while rebuilding its replica"
+                )
 
     @staticmethod
     def _require_initialized(formal: FormalState) -> None:
@@ -246,3 +340,15 @@ def _resolve_formal_reference(
 def _is_corrupt_sqlite(error: sqlite3.DatabaseError) -> bool:
     message = str(error).lower()
     return "file is not a database" in message or "database disk image is malformed" in message
+
+
+def _bootstrap_cache_error(message: str) -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.CACHE_REBUILD_REQUIRED,
+        message,
+        retryable=True,
+        suggested_action=(
+            "Run sync_repository_facts with mode=full from Main, then retry "
+            "the M1a bootstrap read"
+        ),
+    )

@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import anyio
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -103,6 +104,27 @@ async def test_read_tool_returns_versioned_dto(services: MagicMock) -> None:
 
 
 @pytest.mark.anyio
+async def test_sync_tool_handler_completes_without_worker_thread_deadlock(
+    services: MagicMock,
+) -> None:
+    """Python 3.14 must not strand synchronous MCP callbacks in AnyIO's worker."""
+    services.repository_overview.return_value = RepositoryOverview(
+        repository_root="/repo",
+        graph_revision=0,
+        cognition_initialized=False,
+        cognition_baseline_source_digest=None,
+        formal_files={"manifest.json": True},
+    )
+
+    server = build_server("analyzer", services)
+    assert server._tool_manager._tools["repository_overview"].is_async is True
+    with anyio.fail_after(1):
+        result = await server.call_tool("repository_overview", {})
+
+    assert result.structured_content["graph_revision"] == 0
+
+
+@pytest.mark.anyio
 async def test_domain_error_is_a_stable_structured_tool_error(
     services: MagicMock,
 ) -> None:
@@ -137,7 +159,7 @@ def test_analyzer_process_never_attempts_recovery_writes(services: MagicMock) ->
     services.recover_formal_state.assert_not_called()
 
 
-def test_stdio_passes_analyzer_profile_to_composition_before_starting(
+def test_stdio_uses_supplied_composition_before_starting(
     services: MagicMock,
 ) -> None:
     factory = MagicMock(return_value=services)
@@ -145,7 +167,26 @@ def test_stdio_passes_analyzer_profile_to_composition_before_starting(
     with patch("codecortex.interfaces.mcp.server.build_server", return_value=server):
         assert run_stdio("analyzer", factory) == 0
 
-    factory.assert_called_once_with("analyzer")
+    factory.assert_called_once_with()
+    services.recover_formal_state.assert_not_called()
+    server.run.assert_called_once_with(transport="stdio")
+
+
+def test_stdio_keeps_zero_argument_service_factory_compatibility(
+    services: MagicMock,
+) -> None:
+    calls = 0
+
+    def factory() -> MagicMock:
+        nonlocal calls
+        calls += 1
+        return services
+
+    server = MagicMock()
+    with patch("codecortex.interfaces.mcp.server.build_server", return_value=server):
+        assert run_stdio("analyzer", factory) == 0
+
+    assert calls == 1
     services.recover_formal_state.assert_not_called()
     server.run.assert_called_once_with(transport="stdio")
 

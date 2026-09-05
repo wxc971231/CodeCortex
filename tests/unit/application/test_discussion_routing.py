@@ -8,6 +8,7 @@ from codecortex.application.discussion import (
     DiscussionPlanner,
     InvocationState,
     QuestionScope,
+    SemanticSyncScope,
 )
 from codecortex.application.freshness import FreshnessService
 from codecortex.domain.freshness import ChangeSet, EntityChanges, FileChanges
@@ -138,3 +139,54 @@ def test_unmaterialized_route_requires_a_confirmed_behavior() -> None:
             (_hit("capability.search", kind="capability"),),
             InvocationState(),
         )
+
+
+def test_recorded_expand_precedes_affected_source_first_routing() -> None:
+    planner = DiscussionPlanner(FreshnessService(_change_set()))
+    invocation = InvocationState()
+    invocation.record_materialization_decision("behavior.train", "expand")
+    scope = SemanticSyncScope(
+        affected_node_ids=("behavior.train",),
+        responsibility_ids=("responsibility.training",),
+        affected_entity_ids=(),
+        scope_confidence="complete",
+    )
+
+    plan = planner.plan(
+        QuestionScope(
+            "How does training work?",
+            ("behavior.train",),
+            behavior_materialization="unmaterialized",
+            semantic_sync_scope=scope,
+        ),
+        (_hit("behavior.train"),),
+        invocation,
+    )
+
+    assert plan.route == "source_first"
+    assert plan.semantic_sync is not None
+    assert plan.semantic_sync.executor == "main"
+    assert plan.requires_current_facts is True
+    assert plan.requires_current_source is True
+    assert plan.graph_is_baseline_navigation is True
+
+
+def test_affected_unmaterialized_behavior_is_offered_only_once() -> None:
+    planner = DiscussionPlanner(FreshnessService(_change_set()))
+    invocation = InvocationState()
+    scope = QuestionScope(
+        "How does training work?",
+        ("behavior.train",),
+        behavior_materialization="unmaterialized",
+    )
+
+    first = planner.plan(scope, (_hit("behavior.train"),), invocation)
+    second = planner.plan(scope, (_hit("behavior.train"),), invocation)
+
+    assert first.route == "offer_materialization"
+    assert first.materialization_offer is not None
+    assert first.materialization_offer.should_ask_user is True
+    assert second.route == "source_first"
+    assert second.materialization_offer is not None
+    assert second.materialization_offer.should_ask_user is False
+    assert second.graph_is_baseline_navigation is True

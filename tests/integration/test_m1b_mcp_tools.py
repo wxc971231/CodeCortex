@@ -136,6 +136,22 @@ async def test_main_preflights_and_analyzer_reads_prepared_freshness(
 
 
 @pytest.mark.anyio
+async def test_analyzer_rejects_prepared_freshness_after_live_source_changes(
+    tmp_path: Path,
+) -> None:
+    services, root = _services(tmp_path)
+    await build_server("main", services).call_tool("cognitive_freshness", {})
+    _write(root, "app.py", "def baseline() -> int:\n    return 9\n")
+
+    with pytest.raises(ToolError) as raised:
+        await build_server("analyzer", services).call_tool(
+            "cognitive_freshness", {}
+        )
+
+    assert '"code": "CACHE_REBUILD_REQUIRED"' in str(raised.value)
+
+
+@pytest.mark.anyio
 async def test_every_main_m1a_query_route_runs_preflight_but_analyzer_never_does(
     tmp_path: Path,
 ) -> None:

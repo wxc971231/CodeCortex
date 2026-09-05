@@ -22,6 +22,7 @@ from scripts.run_codecortex_benchmark import (
     run_benchmark,
     write_benchmark_report,
 )
+from scripts.run_codecortex_benchmark import main as benchmark_main
 from tests.e2e.trace import parse_sanitized_trace, sanitize_trace
 
 CORPUS = Path(__file__).parents[1] / "benchmark" / "questions.yaml"
@@ -121,6 +122,41 @@ def test_native_and_codecortex_runs_use_distinct_clean_copies(tmp_path: Path) ->
     assert not (run.codecortex_repo / ".codex").exists()
     assert not (run.native_codex_home / ".codex").exists()
     assert not (run.codecortex_codex_home / ".codex").exists()
+    harness.cleanup(run)
+
+
+def test_cleanup_removes_entire_workspace_outside_artifact_directory(
+    tmp_path: Path,
+) -> None:
+    harness = BenchmarkHarness(_config(tmp_path))
+    prepared = harness.prepare_case("graph-outside-cli-coding", repetition=1)
+
+    assert prepared.workspace.is_dir()
+    assert not prepared.workspace.is_relative_to(harness.config.artifact_dir)
+
+    harness.cleanup(prepared)
+
+    assert not prepared.workspace.exists()
+    assert not (harness.config.artifact_dir / "workspaces").exists()
+
+
+def test_prepare_failure_removes_partial_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = BenchmarkHarness(_config(tmp_path))
+    workspace_parent = tmp_path / "temporary-workspaces"
+    workspace_parent.mkdir()
+    monkeypatch.setattr(harness, "_workspace_parent", lambda: str(workspace_parent))
+
+    def fail_seed(_root: Path) -> None:
+        raise RuntimeError("fixture seed failed")
+
+    monkeypatch.setattr(harness, "_seed_formal_baseline", fail_seed)
+
+    with pytest.raises(RuntimeError, match="fixture seed failed"):
+        harness.prepare_case("graph-outside-cli-coding", repetition=1)
+
+    assert tuple(workspace_parent.iterdir()) == ()
 
 
 def test_prepared_codecortex_copy_contains_pinned_validated_formal_graph(
@@ -142,6 +178,7 @@ def test_prepared_codecortex_copy_contains_pinned_validated_formal_graph(
     assert state.graph.implementation_mappings
     assert any(node.get("evidence") for node in state.graph.nodes)
     assert state.history_events
+    harness.cleanup(run)
 
 
 def test_trace_route_and_anchors_come_from_mcp_evidence_not_self_claim() -> None:
@@ -242,6 +279,128 @@ def test_trace_reads_json_encoded_mcp_results_as_evidence() -> None:
     assert traced.trace.cognitive_anchor_ids == ("behavior.persist-checkpoint",)
 
 
+def test_trace_preserves_ordered_duplicate_mcp_tool_events() -> None:
+    events = [
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex-analyzer",
+                "tool": "search_cognitive_graph",
+                "result": {"hits": [{"node_id": "behavior.render-report"}]},
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex-analyzer",
+                "tool": "search_cognitive_graph",
+                "result": {"hits": [{"node_id": "behavior.render-report"}]},
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex",
+                "tool": "effective_query_freshness",
+                "result": {"status": "current"},
+            },
+        },
+    ]
+
+    traced = parse_sanitized_trace("\n".join(json.dumps(item) for item in events))
+
+    assert traced.trace.mcp_tool_names == (
+        "codecortex-analyzer.search_cognitive_graph",
+        "codecortex-analyzer.search_cognitive_graph",
+        "codecortex.effective_query_freshness",
+    )
+    assert traced.trace.analyzer_count == 2
+
+
+def test_trace_counts_only_real_assistant_materialization_prompts() -> None:
+    events = (
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex",
+                "tool": "search_cognitive_graph",
+                "result": {"hits": [{"node_id": "behavior.evaluate-batch"}]},
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex",
+                "tool": "get_discussion_context",
+                "result": {
+                    "materialization_status": "unmaterialized",
+                    "message": "Option A materialize or option B transient?",
+                },
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "I honored option B and answered from src/forge/evaluation.py:6-10.",
+            },
+        },
+    )
+
+    traced = parse_sanitized_trace("\n".join(json.dumps(item) for item in events))
+
+    assert traced.answer.startswith("I honored option B")
+    assert traced.trace.materialization_prompt_count == 0
+    assert traced.trace.route == "source_first"
+
+
+def test_trace_detects_repeated_assistant_materialization_prompts() -> None:
+    events = (
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex",
+                "tool": "search_cognitive_graph",
+                "result": {"hits": [{"node_id": "behavior.evaluate-batch"}]},
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "codecortex",
+                "tool": "get_discussion_context",
+                "result": {"materialization_status": "unmaterialized"},
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "Choose option A to materialize or option B for a transient answer?",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "Again: option A to materialize, or option B transient?",
+            },
+        },
+    )
+
+    traced = parse_sanitized_trace("\n".join(json.dumps(item) for item in events))
+
+    assert traced.trace.materialization_prompt_count == 2
+    assert traced.trace.route == "offer_materialization"
+
+
 def test_trace_redacts_machine_paths_and_tokens() -> None:
     raw = (
         """{"OPENAI_API_KEY":"sk-secret-token","path":"/home/alice/project/app.py","authorization":"Bearer secret-value","nested":{"cwd":"/tmp/codecortex-run","token":"abc"}}\n"""
@@ -317,6 +476,17 @@ def test_default_benchmark_run_records_an_explicit_opt_in_skip(tmp_path: Path) -
     assert persisted["corpus_digest"] == corpus_file_digest(CORPUS)
     assert "corpus" not in persisted
     assert persisted["results"] == []
+
+
+def test_default_benchmark_cli_skip_is_not_a_success_exit(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+
+    exit_code = benchmark_main(["--artifact-dir", str(artifact_dir)])
+
+    assert exit_code != 0
+    persisted = json.loads((artifact_dir / "benchmark_report.json").read_text())
+    assert persisted["status"] == "skipped"
+    assert persisted["execution_status"] == "not_started"
 
 
 def test_persisted_report_sanitizes_machine_paths(tmp_path: Path) -> None:
@@ -580,3 +750,4 @@ def test_approval_mode_uses_a_persistent_first_turn_and_resume(tmp_path: Path) -
     assert first[:3] == ["codex", "exec", "--json"]
     assert resumed[:4] == ["codex", "exec", "resume", "--json"]
     assert "thread-123" in resumed
+    harness.cleanup(prepared)

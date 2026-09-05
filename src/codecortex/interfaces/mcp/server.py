@@ -67,12 +67,7 @@ def _main_query[QueryResult](
         except CodeCortexError as error:
             if not allow_m1a_bootstrap or error.code is not ErrorCode.NOT_INITIALIZED:
                 raise
-            try:
-                overview = services.repository_overview()
-            except CodeCortexError:
-                raise error
-            if overview.cognition_initialized:
-                raise
+            return services.run_m1a_bootstrap_read(operation)
     return operation()
 
 
@@ -89,14 +84,14 @@ def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:
 
 def run_stdio(
     profile: str,
-    services_factory: Callable[[Profile], ApplicationServices],
+    services_factory: Callable[[], ApplicationServices],
 ) -> int:
     """Compose CWD-scoped services and serve one MCP STDIO session."""
     if profile not in ("main", "analyzer"):
         raise ValueError(f"Unsupported MCP profile: {profile}")
     checked_profile = cast(Profile, profile)
     _configure_stderr_logging()
-    services = services_factory(checked_profile)
+    services = services_factory()
     _recover_main_formal_state(checked_profile, services)
     server = build_server(checked_profile, services)
     LOGGER.info("CodeCortex MCP server started with %s profile", checked_profile)
@@ -121,7 +116,7 @@ def _register_read_tools(
     server: MCPServer, services: ApplicationServices, *, preflight: bool
 ) -> None:
     @server.tool(name="repository_overview")
-    def repository_overview() -> tools.RepositoryOverviewOutput:
+    async def repository_overview() -> tools.RepositoryOverviewOutput:
         try:
             return tools.repository_overview(services)
         except CodeCortexError as error:
@@ -130,7 +125,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_graph")
-    def cognitive_graph() -> tools.CognitiveGraphOutput:
+    async def cognitive_graph() -> tools.CognitiveGraphOutput:
         try:
             return _main_query(
                 services, preflight, lambda: tools.cognitive_graph(services)
@@ -141,7 +136,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="inspect_node")
-    def inspect_node(node_id: str) -> tools.InspectNodeOutput:
+    async def inspect_node(node_id: str) -> tools.InspectNodeOutput:
         try:
             return _main_query(
                 services, preflight, lambda: tools.inspect_node(services, node_id)
@@ -152,7 +147,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="history_event")
-    def history_event(event_id: str) -> tools.HistoryEventOutput:
+    async def history_event(event_id: str) -> tools.HistoryEventOutput:
         try:
             return tools.history_event(services, event_id)
         except CodeCortexError as error:
@@ -161,7 +156,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="validate_graph")
-    def validate_graph() -> tools.ValidationOutput:
+    async def validate_graph() -> tools.ValidationOutput:
         try:
             return tools.validate_graph(services)
         except CodeCortexError as error:
@@ -170,7 +165,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="repository_facts")
-    def repository_facts(
+    async def repository_facts(
         scope: str,
         cursor: str | None = None,
         limit: int = 50,
@@ -197,7 +192,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="analysis_scope")
-    def analysis_scope(
+    async def analysis_scope(
         scope: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
@@ -224,7 +219,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="resolve_entity_context")
-    def resolve_entity_context(
+    async def resolve_entity_context(
         entity_uid: str | None = None,
         path: str | None = None,
         address: str | None = None,
@@ -256,7 +251,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="get_discussion_context")
-    def get_discussion_context(
+    async def get_discussion_context(
         node_ids: list[str] | None = None,
         entity_ids: list[str] | None = None,
         depth: int = 2,
@@ -288,7 +283,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="search_cognitive_graph")
-    def search_cognitive_graph(
+    async def search_cognitive_graph(
         query: str,
         kinds: list[str] | None = None,
         limit: int = 20,
@@ -314,7 +309,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_freshness")
-    def cognitive_freshness() -> tools.CognitiveFreshnessOutput:
+    async def cognitive_freshness() -> tools.CognitiveFreshnessOutput:
         try:
             return tools.cognitive_freshness(services, preflight=preflight)
         except CodeCortexError as error:
@@ -323,7 +318,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="pending_changes")
-    def pending_changes(
+    async def pending_changes(
         cursor: str | None = None,
         limit: int = 50,
     ) -> tools.PendingChangesOutput:
@@ -337,7 +332,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="effective_query_freshness")
-    def effective_query_freshness(
+    async def effective_query_freshness(
         node_ids: list[str] | None = None,
         entity_ids: list[str] | None = None,
         max_unmapped_changes: int = 50,
@@ -358,7 +353,7 @@ def _register_read_tools(
 
 def _register_main_tools(server: MCPServer, services: ApplicationServices) -> None:
     @server.tool(name="initialize_repository")
-    def initialize_repository() -> tools.RepositoryOverviewOutput:
+    async def initialize_repository() -> tools.RepositoryOverviewOutput:
         try:
             return tools.initialize_repository(services)
         except CodeCortexError as error:
@@ -367,7 +362,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="sync_repository_facts")
-    def sync_repository_facts(
+    async def sync_repository_facts(
         mode: Literal["auto", "full"] = "auto",
     ) -> tools.SyncFactsOutput:
         try:
@@ -378,7 +373,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="create_cognitive_proposal")
-    def create_cognitive_proposal(
+    async def create_cognitive_proposal(
         proposal: tools.ProposalInput,
     ) -> tools.ProposalOutput:
         try:
@@ -389,7 +384,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="create_cognitive_proposal_from_analysis")
-    def create_cognitive_proposal_from_analysis(
+    async def create_cognitive_proposal_from_analysis(
         proposal: tools.AnalysisProposalInput,
     ) -> tools.ProposalOutput:
         try:
@@ -400,7 +395,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="revise_cognitive_proposal")
-    def revise_cognitive_proposal(
+    async def revise_cognitive_proposal(
         proposal_id: str,
         revision: tools.ProposalRevisionInput,
     ) -> tools.ProposalOutput:
@@ -412,7 +407,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_proposal")
-    def cognitive_proposal(proposal_id: str) -> tools.ProposalOutput:
+    async def cognitive_proposal(proposal_id: str) -> tools.ProposalOutput:
         try:
             return tools.cognitive_proposal(services, proposal_id)
         except CodeCortexError as error:
@@ -421,7 +416,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="apply_cognitive_proposal")
-    def apply_cognitive_proposal(
+    async def apply_cognitive_proposal(
         proposal_id: str,
         approval_record: tools.ApprovalRecordInput,
     ) -> tools.ApplyProposalOutput:
@@ -433,7 +428,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="advance_cognition_baseline")
-    def advance_cognition_baseline(
+    async def advance_cognition_baseline(
         change_set_id: str,
         reason: Literal["no_semantic_change", "user_accepted"],
         decision_record: tools.DecisionRecordInput,

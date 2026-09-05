@@ -2,6 +2,7 @@
 
 import fcntl
 import os
+import stat
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -70,15 +71,11 @@ class ReadOnlyRepositoryLock:
                 "Read-only Analyzer cannot acquire an exclusive repository lock",
                 suggested_action="Ask Main CodeCortex to prepare the cache",
             )
-        lock_path = self._repository_root / ".codecortex" / ".cache" / "repository.lock"
         try:
-            descriptor = os.open(lock_path, os.O_RDONLY)
-        except FileNotFoundError as error:
-            raise CodeCortexError(
-                ErrorCode.CACHE_REBUILD_REQUIRED,
-                "Repository cache lock is missing",
-                retryable=True,
-                suggested_action="Ask Main CodeCortex to prepare the cache",
+            descriptor = _open_read_only_lock(self._repository_root)
+        except OSError as error:
+            raise _read_only_lock_error(
+                "Repository cache lock is missing or unsafe"
             ) from error
 
         try:
@@ -94,9 +91,56 @@ class ReadOnlyRepositoryLock:
                             "Repository lock timed out",
                         )
                     time.sleep(0.01)
+                except OSError as error:
+                    raise _read_only_lock_error(
+                        "Repository cache lock cannot be acquired safely"
+                    ) from error
             yield
         finally:
+            cleanup_error: OSError | None = None
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError as error:
+                cleanup_error = error
             finally:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    cleanup_error = cleanup_error or error
+            if cleanup_error is not None:
+                raise _read_only_lock_error(
+                    "Repository cache lock could not be released safely"
+                ) from cleanup_error
+
+
+def _open_read_only_lock(repository_root: Path) -> int:
+    """Open the fixed lock with no symlink traversal or special-file access."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        current = os.open(repository_root, directory_flags)
+        descriptors.append(current)
+        for component in (".codecortex", ".cache"):
+            current = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        lock_descriptor = os.open(
+            "repository.lock",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=current,
+        )
+        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+            os.close(lock_descriptor)
+            raise OSError("Repository cache lock is not a regular file")
+        return lock_descriptor
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _read_only_lock_error(message: str) -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.CACHE_REBUILD_REQUIRED,
+        message,
+        retryable=True,
+        suggested_action="Ask Main CodeCortex to prepare the cache",
+    )

@@ -359,36 +359,42 @@ class BenchmarkHarness:
                 dir=self._workspace_parent(),
             )
         )
-        seed = workspace / "seed"
-        materialize_fixture_state(self.config.fixture_root, "fresh", seed)
-        self._seed_formal_baseline(seed)
-        self._replace_source_state(seed, case.fixture_state)
-        self._commit_seed(seed)
-        native = workspace / "native"
-        augmented = workspace / "codecortex"
-        self._clone(seed, native)
-        self._clone(seed, augmented)
-        if case.fixture_state == "cache-deleted":
-            shutil.rmtree(augmented / ".codecortex" / ".cache", ignore_errors=True)
-        native_home = workspace / "native-codex-home"
-        augmented_home = workspace / "codecortex-codex-home"
-        native_home.mkdir()
-        augmented_home.mkdir()
-        native_commit = self._git(native, "rev-parse", "HEAD")
-        augmented_commit = self._git(augmented, "rev-parse", "HEAD")
-        if native_commit != augmented_commit:
-            raise BenchmarkExecutionError("Native and CodeCortex copies diverged before Child Codex execution")
-        return PreparedCase(
-            case=case,
-            repetition=repetition,
-            native_repo=native,
-            codecortex_repo=augmented,
-            native_commit=native_commit,
-            codecortex_commit=augmented_commit,
-            native_codex_home=native_home,
-            codecortex_codex_home=augmented_home,
-            workspace=workspace,
-        )
+        try:
+            seed = workspace / "seed"
+            materialize_fixture_state(self.config.fixture_root, "fresh", seed)
+            self._seed_formal_baseline(seed)
+            self._replace_source_state(seed, case.fixture_state)
+            self._commit_seed(seed)
+            native = workspace / "native"
+            augmented = workspace / "codecortex"
+            self._clone(seed, native)
+            self._clone(seed, augmented)
+            if case.fixture_state == "cache-deleted":
+                shutil.rmtree(augmented / ".codecortex" / ".cache", ignore_errors=True)
+            native_home = workspace / "native-codex-home"
+            augmented_home = workspace / "codecortex-codex-home"
+            native_home.mkdir()
+            augmented_home.mkdir()
+            native_commit = self._git(native, "rev-parse", "HEAD")
+            augmented_commit = self._git(augmented, "rev-parse", "HEAD")
+            if native_commit != augmented_commit:
+                raise BenchmarkExecutionError(
+                    "Native and CodeCortex copies diverged before Child Codex execution"
+                )
+            return PreparedCase(
+                case=case,
+                repetition=repetition,
+                native_repo=native,
+                codecortex_repo=augmented,
+                native_commit=native_commit,
+                codecortex_commit=augmented_commit,
+                native_codex_home=native_home,
+                codecortex_codex_home=augmented_home,
+                workspace=workspace,
+            )
+        except BaseException:
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
 
     def run_case(self, prepared: PreparedCase) -> BenchmarkCaseResult:
         self._install_codecortex_test_home(prepared.codecortex_codex_home)
@@ -477,14 +483,11 @@ class BenchmarkHarness:
         return {"proposal_id": proposal_id, "patch_digest": patch_digest, "event_id": event["event_id"]}
 
     def cleanup(self, prepared: PreparedCase) -> None:
-        """Remove temporary homes (which may contain copied browser auth)."""
-        for home in (prepared.native_codex_home, prepared.codecortex_codex_home):
-            shutil.rmtree(home, ignore_errors=True)
+        """Remove the whole temporary workspace, including copied auth and Git data."""
+        shutil.rmtree(prepared.workspace, ignore_errors=True)
 
     def _workspace_parent(self) -> str:
-        parent = self.config.artifact_dir / "workspaces"
-        parent.mkdir(parents=True, exist_ok=True)
-        return str(parent)
+        return tempfile.gettempdir()
 
     def _seed_formal_baseline(self, root: Path) -> None:
         """Apply the pinned, pre-approved semantic fixture to the fresh source tree."""
@@ -1119,6 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(json.dumps({"status": report.status, "artifact": str(arguments.artifact_dir / "benchmark_report.json")}))
+    if report.status == "skipped":
+        return 2
     return 1 if report.status == "failed" else 0
 
 

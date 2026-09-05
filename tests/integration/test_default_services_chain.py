@@ -10,9 +10,11 @@ analysis-backed apply, with zero cache warnings.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -94,10 +96,7 @@ async def test_main_mcp_bootstrap_reads_require_full_sync_but_not_cognition(
 
     with pytest.raises(ToolError) as unsynchronized:
         await server.call_tool("analysis_scope", {})
-    assert _tool_error_code(unsynchronized.value) in {
-        "NOT_INITIALIZED",
-        "CACHE_REBUILD_REQUIRED",
-    }
+    assert _tool_error_code(unsynchronized.value) == "CACHE_REBUILD_REQUIRED"
 
     synced = await server.call_tool("sync_repository_facts", {"mode": "full"})
     scope = await server.call_tool(
@@ -127,6 +126,84 @@ async def test_main_mcp_bootstrap_reads_require_full_sync_but_not_cognition(
     with pytest.raises(ToolError) as m1b_query:
         await server.call_tool("cognitive_graph", {})
     assert _tool_error_code(m1b_query.value) == "NOT_INITIALIZED"
+
+
+@pytest.mark.anyio
+async def test_bootstrap_read_rechecks_uninitialized_state_after_two_main_interleave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+    first_main = _default_services()
+    second_main = _default_services()
+    first_main.initialize_repository()
+    first_main.synchronize_facts("full")
+    report = _report_payload(
+        second_main,
+        nodes=[
+            {
+                "id": "responsibility.bootstrap-race",
+                "kind": "responsibility",
+                "title": "Bootstrap race",
+            }
+        ],
+        edges=[],
+        mappings=[],
+    )
+    original_guard = first_main.run_m1a_bootstrap_read
+
+    def initialize_between_preflight_and_query(operation):
+        applied = _approve_and_apply(second_main, report)
+        assert applied.graph_revision == 1
+        return original_guard(operation)
+
+    with patch.object(
+        first_main,
+        "run_m1a_bootstrap_read",
+        side_effect=initialize_between_preflight_and_query,
+    ), pytest.raises(ToolError) as raised:
+        await build_server("main", first_main).call_tool("analysis_scope", {})
+
+    assert _tool_error_code(raised.value) == "NOT_INITIALIZED"
+
+
+@pytest.mark.anyio
+async def test_bootstrap_read_rebuilds_deleted_replica_without_reinitialize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+    first_main = _default_services()
+    first_main.initialize_repository()
+    first_main.synchronize_facts("full")
+    formal_before = {
+        path.name: path.read_bytes()
+        for path in (root / ".codecortex").glob("*.json")
+    }
+    shutil.rmtree(root / ".codecortex" / ".cache")
+
+    restarted_main = _default_services()
+    restarted_main.synchronize_facts("full")
+    with patch.object(
+        restarted_main.formal_store,
+        "initialize",
+        wraps=restarted_main.formal_store.initialize,
+    ) as initialize:
+        result = await build_server("main", restarted_main).call_tool(
+            "analysis_scope", {}
+        )
+
+    assert result.is_error is False
+    assert result.structured_content["graph_revision"] == 0
+    initialize.assert_not_called()
+    assert {
+        path.name: path.read_bytes()
+        for path in (root / ".codecortex").glob("*.json")
+    } == formal_before
 
 
 @pytest.mark.anyio
@@ -191,6 +268,88 @@ async def test_analyzer_composition_never_mutates_cache(
     else:
         assert result_error is not None
         assert _tool_error_code(result_error) == "CACHE_REBUILD_REQUIRED"
+
+
+@pytest.mark.anyio
+async def test_analyzer_reads_existing_live_wal_sidecars_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+    main = _default_services()
+    main.initialize_repository()
+    main.synchronize_facts("full")
+    assert main.fact_sync is not None
+    assert main.cognitive_replica is not None
+    facts_connection = main.fact_sync.database.open_write()
+    replica_connection = main.cognitive_replica.open_write()
+    facts_reader: sqlite3.Connection | None = None
+    replica_reader: sqlite3.Connection | None = None
+    try:
+        facts_connection.execute("CREATE TABLE wal_probe(value INTEGER)")
+        facts_connection.execute("INSERT INTO wal_probe VALUES (1)")
+        facts_connection.commit()
+        facts_connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        replica_connection.execute("CREATE TABLE wal_probe(value INTEGER)")
+        replica_connection.execute("INSERT INTO wal_probe VALUES (1)")
+        replica_connection.commit()
+        replica_connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        facts_reader = main.fact_sync.database.open_read()
+        facts_reader.execute("SELECT * FROM cache_metadata").fetchone()
+        replica_reader = main.cognitive_replica.open_read()
+        replica_reader.execute("SELECT * FROM replica_metadata").fetchone()
+        sidecars = tuple(
+            Path(f"{database.path}{suffix}")
+            for database in (main.fact_sync.database, main.cognitive_replica)
+            for suffix in ("-wal", "-shm")
+        )
+        assert all(path.is_file() for path in sidecars[::2])
+        assert any(path.is_file() for path in sidecars[1::2])
+        before = _cache_snapshot(root)
+
+        result = await build_server("analyzer", _default_services("analyzer")).call_tool(
+            "analysis_scope", {}
+        )
+
+        assert result.is_error is False
+        assert _cache_snapshot(root) == before
+    finally:
+        if facts_reader is not None:
+            facts_reader.close()
+        if replica_reader is not None:
+            replica_reader.close()
+        facts_connection.close()
+        replica_connection.close()
+
+
+@pytest.mark.anyio
+async def test_analyzer_rejects_incomplete_wal_sidecar_pair_without_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+    main = _default_services()
+    main.initialize_repository()
+    main.synchronize_facts("full")
+    assert main.fact_sync is not None
+    facts_wal = Path(f"{main.fact_sync.database.path}-wal")
+    facts_shm = Path(f"{main.fact_sync.database.path}-shm")
+    facts_wal.unlink(missing_ok=True)
+    facts_shm.write_bytes(b"orphaned-shared-memory")
+    before_shm = facts_shm.read_bytes()
+
+    with pytest.raises(ToolError) as raised:
+        await build_server("analyzer", _default_services("analyzer")).call_tool(
+            "analysis_scope", {}
+        )
+
+    assert _tool_error_code(raised.value) == "CACHE_REBUILD_REQUIRED"
+    assert facts_shm.read_bytes() == before_shm
+    assert not facts_wal.exists()
 
 
 def _report_payload(

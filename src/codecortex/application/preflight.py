@@ -131,7 +131,7 @@ class PreflightService:
             return None
         try:
             existing = self.freshness_store.load_effective()
-        except (CodeCortexError, OSError, ValueError):
+        except (CodeCortexError, OSError, TypeError, ValueError):
             # Freshness cache is disposable.  The new atomic replacement below
             # makes its current pointer authoritative again.
             self.freshness_store.freshness_path.unlink(missing_ok=True)

@@ -31,7 +31,8 @@ Documented design decisions:
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -377,10 +378,9 @@ class QueryService:
         module = _required_text(scope, "repository_facts scope")
         checked_limit = self._bounded_limit(limit)
         checked_cursor = _optional_cursor(cursor)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             page = self._facts.query_entities(
                 FactScope.module(module), checked_cursor, checked_limit
             )
@@ -406,10 +406,9 @@ class QueryService:
         checked_limit = self._bounded_limit(limit)
         checked_diagnostics_limit = self._bounded_limit(diagnostics_limit)
         checked_cursor = _optional_cursor(cursor)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             totals = self._facts.analysis_totals()
             partitions = self._facts.analysis_partitions(
                 module, checked_cursor, checked_limit
@@ -462,10 +461,9 @@ class QueryService:
         checked_limit = self._bounded_limit(limit)
         checked_cursor = _optional_cursor(cursor)
         types = _relation_types(relation_types)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             if anchor_kind == "entity_uid":
                 entity = self._facts.entity_by_uid(anchor_value)
                 entity_page: Page[CodeEntity] = Page(
@@ -516,10 +514,9 @@ class QueryService:
             raise ValueError(  # noqa: TRY004 - validation contract uses ValueError
                 "Discussion context requires a ContextRequest"
             )
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                request.expected_source_digest, request.expected_graph_revision
-            )
+        with self._guarded_read(
+            request.expected_source_digest, request.expected_graph_revision
+        ) as coordinate:
             return self._replica.context(
                 replace(request, expected_graph_revision=coordinate.graph_revision)
             )
@@ -537,10 +534,9 @@ class QueryService:
         text = _required_text(query, "search query")
         checked_limit = self._bounded_limit(limit)
         kind_filter = _node_kinds(kinds)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             hits = self._replica.search(
                 text, kind_filter, checked_limit, coordinate.graph_revision
             )
@@ -565,11 +561,10 @@ class QueryService:
         outcomes preserve the entity-ref's last known location for the UI.
         """
         checked_node_id = _required_text(node_id, "inspect_node node ID")
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             state = self._formal_store.load()
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
             node = next(
                 (item for item in state.graph.nodes if item.get("id") == checked_node_id),
                 None,
@@ -623,6 +618,27 @@ class QueryService:
             mappings=resolved,
             evidence=evidence,
         )
+
+    @contextmanager
+    def _guarded_read(
+        self,
+        expected_source_digest: str | None,
+        expected_graph_revision: int | None,
+    ) -> Generator[CacheCoordinate]:
+        """Map every cache SQL failure in one guarded query to stable recovery."""
+        try:
+            with self._repository_lock.acquire(
+                "shared", self._lock_timeout_seconds
+            ):
+                yield self.cache_guard.require_current(
+                    expected_source_digest, expected_graph_revision
+                )
+        except CodeCortexError:
+            raise
+        except (OSError, sqlite3.Error) as error:
+            raise _rebuild_required(
+                "Fact or cognitive cache became unreadable during the query"
+            ) from error
 
     def _resolve_mapping(
         self, mapping: Mapping[str, object], refs: Mapping[str, Mapping[str, object]]

@@ -38,6 +38,9 @@ class FactSyncPort(Protocol):
     def sync(self, mode: Literal["auto", "full"] = "auto") -> FactSyncResult:
         """Return the committed cache-generation result for one source snapshot."""
 
+    def probe_source_digest(self) -> str:
+        """Hash the live managed source set without mutating cache state."""
+
 
 ViewRendererPort = Callable[[CognitiveGraph], Mapping[str, bytes]]
 """Render the deterministic view set for one committed graph revision."""

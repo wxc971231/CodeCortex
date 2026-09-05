@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -246,6 +248,55 @@ def test_preflight_routes_missing_clone_cache_through_recovery(
     assert result.change_set is None
     assert result.repository_status.status == "fresh"
     assert recovery.requires_recovery() is False
+
+
+def test_malformed_freshness_payload_shape_triggers_recovery(
+    cloned_repo_without_cache: Path,
+) -> None:
+    recovery = _recovery(cloned_repo_without_cache)
+    recovery.ensure_cache()
+    change_set_id = "chg_01J00000000000000000000001"
+    recovery.freshness_store.change_sets_path.mkdir(parents=True, exist_ok=True)
+    recovery.freshness_store.freshness_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "effective_change_set_id": change_set_id}
+        ),
+        encoding="utf-8",
+    )
+    recovery.freshness_store.change_set_path(change_set_id).write_text(
+        "[]", encoding="utf-8"
+    )
+
+    assert recovery.requires_recovery() is True
+    result = recovery.ensure_cache()
+
+    assert result.change_set is None
+    assert recovery.freshness_store.load_effective() is None
+
+
+def test_recovery_fails_closed_when_source_changes_before_return(
+    cloned_repo_without_cache: Path,
+) -> None:
+    recovery = _recovery(cloned_repo_without_cache)
+    original_probe = recovery.fact_sync.probe_source_digest
+
+    def mutate_at_final_probe() -> str:
+        _write(
+            cloned_repo_without_cache,
+            "src/pkg/a.py",
+            "def answer() -> int:\n    return 2\n",
+        )
+        return original_probe()
+
+    with patch.object(
+        recovery.fact_sync,
+        "probe_source_digest",
+        side_effect=mutate_at_final_probe,
+    ), pytest.raises(CodeCortexError) as raised:
+        recovery.ensure_cache()
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+    assert raised.value.retryable is True
 
 
 def test_unsupported_formal_schema_fails_before_cache_mutation(

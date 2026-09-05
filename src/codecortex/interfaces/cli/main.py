@@ -129,7 +129,8 @@ def _doctor_unavailable(*, as_json: bool) -> int:
 def _mcp_unavailable(*, profile: str) -> int:
     from codecortex.interfaces.mcp.server import run_stdio
 
-    return run_stdio(profile, _default_services)
+    checked_profile = cast(Literal["main", "analyzer"], profile)
+    return run_stdio(profile, lambda: _default_services(checked_profile))
 
 
 def _default_services(

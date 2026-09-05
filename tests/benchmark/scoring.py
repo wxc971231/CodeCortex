@@ -482,6 +482,25 @@ def _state_mutations(fixture_root: Path) -> dict[str, dict[str, object]]:
 def _route_compliant(case: BenchmarkCase, trace: Trace) -> bool:
     if trace.route != case.expected_route:
         return False
+    if case.category == "unmaterialized_expand" and (
+        not any(
+            "create_cognitive_proposal_from_analysis" in name
+            for name in trace.mcp_tool_names
+        )
+        or any("apply_cognitive_proposal" in name for name in trace.mcp_tool_names)
+    ):
+        return False
+    if case.category == "unmaterialized_transient" and any(
+        fragment in name
+        for name in trace.mcp_tool_names
+        for fragment in (
+            "create_cognitive_proposal",
+            "revise_cognitive_proposal",
+            "apply_cognitive_proposal",
+            "advance_cognition_baseline",
+        )
+    ):
+        return False
     if not case.analyzer_permitted and trace.analyzer_count:
         return False
     if not case.materialization_prompt_permitted and trace.materialization_prompt_count:

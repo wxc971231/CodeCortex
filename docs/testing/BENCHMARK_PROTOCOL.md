@@ -49,11 +49,22 @@ side may inherit the development conversation. Native must ignore CodeCortex
 configuration. The CodeCortex side may use only the isolated test MCP/Skill
 configuration.
 
+The complete per-pair workspace is created outside the artifact directory and
+removed after the pair (or after preparation failure). Persisted artifacts are
+restricted to the sanitized traces and report; temporary `.git/config`, copied
+authentication, and machine-absolute workspace paths must not survive cleanup.
+
 Every raw JSONL trace is sanitized before persistence: redact authentication
 tokens and machine-absolute paths, then retain MCP tool names, source/command
 access, final answer, token counts and elapsed time. Approval/resume testing
 is a separate non-ephemeral mode; it must not be folded into ordinary
 single-turn results.
+
+Tool events retain trace order and duplicates. Materialization prompt counts
+come only from actual assistant messages, never MCP payload text, while route
+and anchor validation remains bound to matching MCP call/result records. The
+preselected A case must show analysis-backed Proposal creation without apply;
+the B case rejects every Proposal or baseline-mutation tool action.
 
 ## Deterministic scorecard
 
