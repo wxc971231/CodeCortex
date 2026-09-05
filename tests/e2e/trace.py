@@ -23,7 +23,11 @@ _NON_SECRET_TOKEN_COUNT_KEYS = frozenset(
     {"input_tokens", "input_token_count", "output_tokens", "output_token_count"}
 )
 _ABSOLUTE_PATH = re.compile(
-    r"(?:^|(?<=[\s\"'=]))(?:/(?!/)(?:[^/\s\"']+/)*[^/\s\"']+|[A-Za-z]:\\[^\s\"']+)",
+    r"(?<![A-Za-z0-9_./\\-])(?:"
+    r"/(?!/)(?:[^\s\"'`()\[\]{}<>;,/]+/)*[^\s\"'`()\[\]{}<>;,/]+"
+    r"|\\\\(?:[^\s\"'`()\[\]{}<>;,\\]+\\)+[^\s\"'`()\[\]{}<>;,\\]+"
+    r"|[A-Za-z]:\\(?:[^\s\"'`()\[\]{}<>;,\\]+\\)*[^\s\"'`()\[\]{}<>;,\\]+"
+    r")",
 )
 _BEARER = re.compile(r"\bBearer\s+[^\s\"']+", re.IGNORECASE)
 _BASIC = re.compile(r"\bBasic\s+[A-Za-z0-9+/=_-]+", re.IGNORECASE)

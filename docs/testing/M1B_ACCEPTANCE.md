@@ -54,12 +54,14 @@ correctness, relevance, clarity and grounding.
 A successful automated execution writes `execution_status: "completed"` but
 remains `status: "pending_human_review"`.  Acceptance requires a separate JSON
 review supplied with `--blind-review`; it must attest blinded review, cover the
-exact sorted corpus case IDs, and match the persisted corpus digest:
+exact sorted corpus case IDs, match the persisted corpus digest, and bind to
+the exact completed paired-result and sanitized-trace artifact digest:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "corpus_digest": "sha256:<digest from benchmark_report.json>",
+  "run_digest": "sha256:<run_digest from benchmark_report.json>",
   "reviewed_case_ids": ["<every frozen case ID, sorted>"],
   "blinded": true,
   "decision": "accepted",
@@ -69,9 +71,22 @@ exact sorted corpus case IDs, and match the persisted corpus digest:
 }
 ```
 
-Re-run with the same corpus and `--blind-review path/to/review.json` to bind
-that review to the report. A rejected review or failed automated evidence
-produces `status: "failed"`; only a validated accepting review produces
+Attach the review to the already completed artifact without `--execute`; this
+does not start another Child run:
+
+```bash
+python scripts/run_codecortex_benchmark.py \
+  --corpus tests/benchmark/questions.yaml \
+  --repetitions 3 \
+  --artifact-dir /tmp/codecortex-m1b-final \
+  --blind-review path/to/review.json
+```
+
+The attachment step recomputes `run_digest` from the complete case/repetition
+matrix, both paired arm result records, and the identities and bytes of every
+sanitized trace. An older same-corpus review or any modified report/trace stays
+pending and fails closed. A rejected review produces `status: "failed"`; only
+a validated accepting review for these exact artifacts produces
 `status: "accepted"`.
 
 ## Approval/resume mode and VS Code smoke test

@@ -14,7 +14,9 @@ from scripts.run_codecortex_benchmark import (
     BenchmarkConfig,
     BenchmarkHarness,
     BenchmarkReport,
+    attach_blind_review_to_report,
     benchmark_acceptance_status,
+    benchmark_run_digest,
     corpus_file_digest,
     load_blind_review,
     run_benchmark,
@@ -34,6 +36,76 @@ def _config(tmp_path: Path, *, execute: bool = False) -> BenchmarkConfig:
         repetitions=3,
         execute=execute,
     )
+
+
+def _completed_run_payload(
+    tmp_path: Path,
+) -> tuple[Path, tuple[dict[str, object], ...]]:
+    artifact_dir = tmp_path / "artifacts"
+    native_path = artifact_dir / "traces/case-a/1/native.jsonl"
+    codecortex_path = artifact_dir / "traces/case-a/1/codecortex.jsonl"
+    native_path.parent.mkdir(parents=True)
+    native_path.write_text(
+        sanitize_trace('{"message":"native answer"}'), encoding="utf-8"
+    )
+    codecortex_path.write_text(
+        sanitize_trace('{"message":"codecortex answer"}'), encoding="utf-8"
+    )
+    return artifact_dir, (
+        {
+            "case_id": "case-a",
+            "repetition": 1,
+            "commit": "0123456789abcdef",
+            "native": {
+                "side": "native",
+                "returncode": 0,
+                "trace_path": "traces/case-a/1/native.jsonl",
+                "answer": "native answer",
+            },
+            "codecortex": {
+                "side": "codecortex",
+                "returncode": 0,
+                "trace_path": "traces/case-a/1/codecortex.jsonl",
+                "answer": "codecortex answer",
+            },
+        },
+    )
+
+
+def _completed_corpus_run_payload(
+    tmp_path: Path,
+) -> tuple[Path, tuple[dict[str, object], ...]]:
+    artifact_dir = tmp_path / "artifacts"
+    cases = BenchmarkHarness(_config(tmp_path)).cases
+    results: list[dict[str, object]] = []
+    for case in cases:
+        for repetition in range(1, 4):
+            arms: dict[str, dict[str, object]] = {}
+            for side in ("native", "codecortex"):
+                relative = f"traces/{case.id}/{repetition}/{side}.jsonl"
+                path = artifact_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                answer = f"{side} answer for {case.id} repetition {repetition}"
+                path.write_text(
+                    sanitize_trace(json.dumps({"message": answer})),
+                    encoding="utf-8",
+                )
+                arms[side] = {
+                    "side": side,
+                    "returncode": 0,
+                    "trace_path": relative,
+                    "answer": answer,
+                }
+            results.append(
+                {
+                    "case_id": case.id,
+                    "repetition": repetition,
+                    "commit": "0123456789abcdef",
+                    "native": arms["native"],
+                    "codecortex": arms["codecortex"],
+                }
+            )
+    return artifact_dir, tuple(results)
 
 
 def test_native_and_codecortex_runs_use_distinct_clean_copies(tmp_path: Path) -> None:
@@ -212,6 +284,27 @@ def test_trace_redacts_generic_paths_basic_auth_and_unkeyed_tokens() -> None:
     assert json.loads(sanitized)["output_tokens"] == 9
 
 
+def test_trace_redacts_paths_after_labels_and_markdown_delimiters() -> None:
+    raw = (
+        "cwd:/workspace/private/project\n"
+        "[local checkout](/home/alice/private-repository)\n"
+        "cwd:C:\\Users\\alice\\private-repository\n"
+        "cwd:\\\\fileserver\\private-share\\repository\n"
+        "documentation: https://example.com/reference/path\n"
+        "normal slash text: and/or, ratio 1/2, use / as a separator"
+    )
+
+    sanitized = sanitize_trace(raw)
+
+    assert "/workspace/private/project" not in sanitized
+    assert "/home/alice/private-repository" not in sanitized
+    assert r"C:\Users\alice\private-repository" not in sanitized
+    assert r"\\fileserver\private-share\repository" not in sanitized
+    assert sanitized.count("<machine-path>") == 4
+    assert "https://example.com/reference/path" in sanitized
+    assert "and/or, ratio 1/2, use / as a separator" in sanitized
+
+
 def test_default_benchmark_run_records_an_explicit_opt_in_skip(tmp_path: Path) -> None:
     report = run_benchmark(_config(tmp_path))
 
@@ -254,8 +347,9 @@ def test_successful_execution_remains_pending_until_blind_review_is_validated(
     review_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "corpus_digest": corpus_file_digest(CORPUS),
+                "run_digest": "sha256:" + "a" * 64,
                 "reviewed_case_ids": [case.id for case in harness.cases],
                 "blinded": True,
                 "decision": "accepted",
@@ -267,7 +361,9 @@ def test_successful_execution_remains_pending_until_blind_review_is_validated(
         encoding="utf-8",
     )
 
-    review = load_blind_review(review_path, harness.cases, CORPUS)
+    review = load_blind_review(
+        review_path, harness.cases, CORPUS, "sha256:" + "a" * 64
+    )
 
     assert review.decision == "accepted"
     assert benchmark_acceptance_status(
@@ -281,8 +377,9 @@ def test_blind_review_must_cover_the_exact_pinned_corpus(tmp_path: Path) -> None
     review_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "corpus_digest": corpus_file_digest(CORPUS),
+                "run_digest": "sha256:" + "a" * 64,
                 "reviewed_case_ids": [harness.cases[0].id],
                 "blinded": True,
                 "decision": "accepted",
@@ -295,7 +392,181 @@ def test_blind_review_must_cover_the_exact_pinned_corpus(tmp_path: Path) -> None
     )
 
     with pytest.raises(ValueError, match="exact frozen case set"):
-        load_blind_review(review_path, harness.cases, CORPUS)
+        load_blind_review(
+            review_path, harness.cases, CORPUS, "sha256:" + "a" * 64
+        )
+
+
+def test_same_corpus_review_cannot_accept_a_different_completed_run(
+    tmp_path: Path,
+) -> None:
+    harness = BenchmarkHarness(_config(tmp_path))
+    review_path = tmp_path / "blind-review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "corpus_digest": corpus_file_digest(CORPUS),
+                "run_digest": "sha256:" + "a" * 64,
+                "reviewed_case_ids": [case.id for case in harness.cases],
+                "blinded": True,
+                "decision": "accepted",
+                "reviewer": "independent-reviewer-1",
+                "reviewed_at": "2026-09-05T08:00:00Z",
+                "notes": "Review of the prior run.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="completed run digest"):
+        load_blind_review(
+            review_path, harness.cases, CORPUS, "sha256:" + "b" * 64
+        )
+
+
+def test_run_digest_changes_when_a_sanitized_trace_artifact_is_tampered(
+    tmp_path: Path,
+) -> None:
+    artifact_dir, results = _completed_run_payload(tmp_path)
+
+    before = benchmark_run_digest(results, 3, artifact_dir)
+    (artifact_dir / "traces/case-a/1/codecortex.jsonl").write_text(
+        sanitize_trace('{"message":"tampered answer"}'), encoding="utf-8"
+    )
+    after = benchmark_run_digest(results, 3, artifact_dir)
+
+    assert before != after
+
+
+def test_tampered_trace_cannot_receive_a_matching_blind_review(tmp_path: Path) -> None:
+    artifact_dir, results = _completed_corpus_run_payload(tmp_path)
+    run_digest = benchmark_run_digest(results, 3, artifact_dir)
+    write_benchmark_report(
+        artifact_dir,
+        BenchmarkReport(
+            status="pending_human_review",
+            execution_status="completed",
+            corpus_id="tests/benchmark/questions.yaml",
+            corpus_digest=corpus_file_digest(CORPUS),
+            repetitions=3,
+            results=results,  # type: ignore[arg-type]
+            run_digest=run_digest,
+        ),
+    )
+    harness = BenchmarkHarness(_config(tmp_path))
+    review_path = tmp_path / "blind-review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "corpus_digest": corpus_file_digest(CORPUS),
+                "run_digest": run_digest,
+                "reviewed_case_ids": [case.id for case in harness.cases],
+                "blinded": True,
+                "decision": "accepted",
+                "reviewer": "independent-reviewer-1",
+                "reviewed_at": "2026-09-05T08:00:00Z",
+                "notes": "Review of the untampered artifacts.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "traces/affected-source-first/1/codecortex.jsonl").write_text(
+        sanitize_trace('{"message":"tampered after review"}'), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="stored run digest"):
+        attach_blind_review_to_report(
+            artifact_dir, review_path, CORPUS, FIXTURE_ROOT
+        )
+
+    persisted = json.loads((artifact_dir / "benchmark_report.json").read_text())
+    assert persisted["status"] == "pending_human_review"
+    assert persisted["blind_review"] is None
+
+
+def test_matching_blind_review_attaches_to_the_completed_run(tmp_path: Path) -> None:
+    artifact_dir, results = _completed_corpus_run_payload(tmp_path)
+    run_digest = benchmark_run_digest(results, 3, artifact_dir)
+    write_benchmark_report(
+        artifact_dir,
+        BenchmarkReport(
+            status="pending_human_review",
+            execution_status="completed",
+            corpus_id="tests/benchmark/questions.yaml",
+            corpus_digest=corpus_file_digest(CORPUS),
+            repetitions=3,
+            results=results,  # type: ignore[arg-type]
+            run_digest=run_digest,
+        ),
+    )
+    harness = BenchmarkHarness(_config(tmp_path))
+    review_path = tmp_path / "blind-review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "corpus_digest": corpus_file_digest(CORPUS),
+                "run_digest": run_digest,
+                "reviewed_case_ids": [case.id for case in harness.cases],
+                "blinded": True,
+                "decision": "accepted",
+                "reviewer": "independent-reviewer-1",
+                "reviewed_at": "2026-09-05T08:00:00Z",
+                "notes": "Review of this exact completed run.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    updated = attach_blind_review_to_report(
+        artifact_dir, review_path, CORPUS, FIXTURE_ROOT
+    )
+
+    assert updated["status"] == "accepted"
+    assert updated["run_digest"] == run_digest
+    assert updated["blind_review"]["run_digest"] == run_digest
+
+
+def test_incomplete_result_matrix_cannot_receive_blind_review(tmp_path: Path) -> None:
+    artifact_dir, results = _completed_run_payload(tmp_path)
+    run_digest = benchmark_run_digest(results, 3, artifact_dir)
+    write_benchmark_report(
+        artifact_dir,
+        BenchmarkReport(
+            status="pending_human_review",
+            execution_status="completed",
+            corpus_id="tests/benchmark/questions.yaml",
+            corpus_digest=corpus_file_digest(CORPUS),
+            repetitions=3,
+            results=results,  # type: ignore[arg-type]
+            run_digest=run_digest,
+        ),
+    )
+    harness = BenchmarkHarness(_config(tmp_path))
+    review_path = tmp_path / "blind-review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "corpus_digest": corpus_file_digest(CORPUS),
+                "run_digest": run_digest,
+                "reviewed_case_ids": [case.id for case in harness.cases],
+                "blinded": True,
+                "decision": "accepted",
+                "reviewer": "independent-reviewer-1",
+                "reviewed_at": "2026-09-05T08:00:00Z",
+                "notes": "The report is missing most paired repetitions.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="complete case/repetition matrix"):
+        attach_blind_review_to_report(
+            artifact_dir, review_path, CORPUS, FIXTURE_ROOT
+        )
 
 
 def test_approval_mode_uses_a_persistent_first_turn_and_resume(tmp_path: Path) -> None:

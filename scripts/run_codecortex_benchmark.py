@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -139,6 +139,7 @@ class BenchmarkReport:
     skip_reason: str | None = None
     error: str | None = None
     blind_review: dict[str, object] | None = None
+    run_digest: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -153,13 +154,14 @@ class BlindReview:
     """A human decision bound to the exact frozen corpus and all case IDs."""
 
     corpus_digest: str
+    run_digest: str
     reviewed_case_ids: tuple[str, ...]
     blinded: Literal[True]
     decision: Literal["accepted", "rejected"]
     reviewer: str
     reviewed_at: str
     notes: str
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
 
 
 def corpus_file_digest(path: Path) -> str:
@@ -176,14 +178,101 @@ def corpus_identifier(path: Path) -> str:
         return f"external/{resolved.name}"
 
 
+def benchmark_run_digest(
+    results: Iterable[BenchmarkCaseResult | Mapping[str, object]],
+    repetitions: int,
+    artifact_dir: Path,
+) -> str:
+    """Bind paired result records to the exact sanitized trace artifacts."""
+    if type(repetitions) is not int or repetitions < 1:
+        raise ValueError("Benchmark run digest requires positive repetitions")
+    normalized: list[dict[str, object]] = []
+    coordinates: set[tuple[str, int]] = set()
+    for result in results:
+        payload = asdict(result) if isinstance(result, BenchmarkCaseResult) else dict(result)
+        case_id = payload.get("case_id")
+        repetition = payload.get("repetition")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError("Benchmark run result case ID is invalid")
+        if type(repetition) is not int or not 1 <= repetition <= repetitions:
+            raise ValueError("Benchmark run result repetition is invalid")
+        coordinate = (case_id, repetition)
+        if coordinate in coordinates:
+            raise ValueError("Benchmark run contains a duplicate case repetition")
+        coordinates.add(coordinate)
+        trace_artifacts: list[dict[str, str]] = []
+        for side in ("native", "codecortex"):
+            arm = payload.get(side)
+            if not isinstance(arm, Mapping) or arm.get("side") != side:
+                raise ValueError("Benchmark run result does not contain both paired arms")
+            trace_path = arm.get("trace_path")
+            if not isinstance(trace_path, str):
+                raise TypeError("Benchmark run trace identity must be text")
+            trace_artifacts.append(
+                {
+                    "side": side,
+                    "trace_path": trace_path,
+                    "content_digest": _sanitized_trace_artifact_digest(
+                        artifact_dir, trace_path
+                    ),
+                }
+            )
+        normalized.append(
+            {
+                "case_id": case_id,
+                "repetition": repetition,
+                "result": payload,
+                "trace_artifacts": trace_artifacts,
+            }
+        )
+    if not normalized:
+        raise ValueError("Benchmark run digest requires completed paired results")
+    normalized.sort(key=lambda item: (str(item["case_id"]), int(item["repetition"])))
+    canonical = json.dumps(
+        {
+            "schema_version": 1,
+            "repetitions": repetitions,
+            "paired_results": normalized,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _sanitized_trace_artifact_digest(artifact_dir: Path, relative: str) -> str:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("Benchmark trace path must stay within the artifact directory")
+    root = Path(artifact_dir).resolve()
+    path = root.joinpath(relative_path)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("Benchmark trace artifact is missing") from error
+    if not resolved.is_relative_to(root) or path.is_symlink() or not resolved.is_file():
+        raise ValueError("Benchmark trace artifact is unsafe")
+    content = resolved.read_text(encoding="utf-8")
+    if sanitize_trace(content) != content:
+        raise ValueError("Benchmark trace artifact is not canonically sanitized")
+    return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+
+
 def load_blind_review(
-    path: Path, cases: Iterable[BenchmarkCase], corpus: Path
+    path: Path,
+    cases: Iterable[BenchmarkCase],
+    corpus: Path,
+    completed_run_digest: str,
 ) -> BlindReview:
-    """Load and strictly validate one complete blinded human review."""
+    """Validate one review against the exact completed run it observed."""
+    _validate_sha256_digest(completed_run_digest, "Completed run digest")
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     expected_fields = {
         "schema_version",
         "corpus_digest",
+        "run_digest",
         "reviewed_case_ids",
         "blinded",
         "decision",
@@ -197,10 +286,13 @@ def load_blind_review(
     reviewed_ids = value["reviewed_case_ids"]
     if not isinstance(reviewed_ids, list) or tuple(reviewed_ids) != expected_ids:
         raise ValueError("Blind review must cover the exact frozen case set")
-    if value["schema_version"] != 1:
+    if value["schema_version"] != 2:
         raise ValueError("Blind review schema version is unsupported")
     if value["corpus_digest"] != corpus_file_digest(corpus):
         raise ValueError("Blind review corpus digest does not match")
+    _validate_sha256_digest(value["run_digest"], "Blind review run digest")
+    if value["run_digest"] != completed_run_digest:
+        raise ValueError("Blind review completed run digest does not match")
     if value["blinded"] is not True:
         raise ValueError("Blind review must attest that side labels were hidden")
     if value["decision"] not in ("accepted", "rejected"):
@@ -216,6 +308,7 @@ def load_blind_review(
         raise ValueError("Blind review timestamp must include a timezone")
     return BlindReview(
         corpus_digest=value["corpus_digest"],
+        run_digest=value["run_digest"],
         reviewed_case_ids=expected_ids,
         blinded=True,
         decision=value["decision"],
@@ -223,6 +316,16 @@ def load_blind_review(
         reviewed_at=value["reviewed_at"],
         notes=value["notes"],
     )
+
+
+def _validate_sha256_digest(value: object, name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != 71
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError(f"{name} is invalid")
 
 
 def benchmark_acceptance_status(
@@ -671,6 +774,10 @@ class BenchmarkHarness:
 
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
     """Validate frozen inputs, then run only after explicit paid-model opt-in."""
+    if config.blind_review_path is not None:
+        raise ValueError(
+            "Blind review is a post-execution attachment; do not start a new benchmark run"
+        )
     config.artifact_dir.mkdir(parents=True, exist_ok=True)
     harness = BenchmarkHarness(config)
     if not config.execute:
@@ -735,11 +842,6 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
         write_benchmark_report(config.artifact_dir, report)
         return report
     results: list[BenchmarkCaseResult] = []
-    blind_review = (
-        None
-        if config.blind_review_path is None
-        else load_blind_review(config.blind_review_path, harness.cases, config.corpus)
-    )
     try:
         for case in harness.cases:
             for repetition in range(1, config.repetitions + 1):
@@ -755,17 +857,18 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
             or not result.codecortex.score.passed
             for result in results
         ) or not all(bool(item["passed"]) for item in graph_outside.values())
+        run_digest = benchmark_run_digest(
+            results, config.repetitions, config.artifact_dir
+        )
         report = BenchmarkReport(
-            status=benchmark_acceptance_status(
-                automated_failed=failed, blind_review=blind_review
-            ),
+            status=benchmark_acceptance_status(automated_failed=failed, blind_review=None),
             execution_status="completed",
             corpus_id=corpus_identifier(config.corpus),
             corpus_digest=corpus_file_digest(config.corpus),
             repetitions=config.repetitions,
             results=tuple(results),
             graph_outside=graph_outside,
-            blind_review=(None if blind_review is None else asdict(blind_review)),
+            run_digest=run_digest,
         )
     except (BenchmarkExecutionError, subprocess.SubprocessError, OSError, TimeoutError) as error:
         report = BenchmarkReport(
@@ -779,6 +882,66 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
         )
     write_benchmark_report(config.artifact_dir, report)
     return report
+
+
+def attach_blind_review_to_report(
+    artifact_dir: Path,
+    review_path: Path,
+    corpus: Path = _DEFAULT_CORPUS,
+    fixture_root: Path = _DEFAULT_FIXTURE_ROOT,
+) -> dict[str, object]:
+    """Attach human acceptance only to verified artifacts from one completed run."""
+    cases = load_corpus(corpus)
+    validate_corpus(cases, fixture_root)
+    report_path = Path(artifact_dir) / "benchmark_report.json"
+    value = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError("Benchmark report must be a JSON object")
+    if value.get("execution_status") != "completed":
+        raise ValueError("Blind review requires a completed benchmark execution")
+    if value.get("status") != "pending_human_review":
+        raise ValueError("Benchmark report is not awaiting human review")
+    if value.get("corpus_id") != corpus_identifier(corpus):
+        raise ValueError("Benchmark report corpus identifier does not match")
+    if value.get("corpus_digest") != corpus_file_digest(corpus):
+        raise ValueError("Benchmark report corpus digest does not match")
+    repetitions = value.get("repetitions")
+    results = value.get("results")
+    stored_run_digest = value.get("run_digest")
+    if type(repetitions) is not int or not isinstance(results, list):
+        raise ValueError("Benchmark report completed-run evidence is malformed")
+    _validate_completed_result_matrix(results, cases, repetitions)
+    _validate_sha256_digest(stored_run_digest, "Benchmark report run digest")
+    actual_run_digest = benchmark_run_digest(results, repetitions, artifact_dir)
+    if stored_run_digest != actual_run_digest:
+        raise ValueError("Benchmark report stored run digest does not match its artifacts")
+    review = load_blind_review(review_path, cases, corpus, actual_run_digest)
+    value["blind_review"] = asdict(review)
+    value["status"] = benchmark_acceptance_status(
+        automated_failed=False, blind_review=review
+    )
+    return _write_benchmark_payload(artifact_dir, value)
+
+
+def _validate_completed_result_matrix(
+    results: Iterable[object], cases: Iterable[BenchmarkCase], repetitions: int
+) -> None:
+    expected = {
+        (case.id, repetition)
+        for case in cases
+        for repetition in range(1, repetitions + 1)
+    }
+    actual: set[tuple[str, int]] = set()
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise TypeError("Benchmark report result must be an object")
+        case_id = result.get("case_id")
+        repetition = result.get("repetition")
+        if not isinstance(case_id, str) or type(repetition) is not int:
+            raise ValueError("Benchmark report result coordinate is malformed")
+        actual.add((case_id, repetition))
+    if actual != expected or len(actual) != len(expected):
+        raise ValueError("Benchmark report lacks the complete case/repetition matrix")
 
 
 def _native_case(case: BenchmarkCase) -> BenchmarkCase:
@@ -867,14 +1030,21 @@ def _tree_fingerprint(root: Path, allowed: tuple[str, ...] | None = None) -> tup
 
 def write_benchmark_report(artifact_dir: Path, report: BenchmarkReport) -> None:
     """Persist only a structurally sanitized benchmark report."""
+    _write_benchmark_payload(artifact_dir, report.to_dict())
+
+
+def _write_benchmark_payload(
+    artifact_dir: Path, payload: Mapping[str, object]
+) -> dict[str, object]:
     serialized = sanitize_trace(
-        json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True)
+        json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)
     )
     sanitized = json.loads(serialized)
     (artifact_dir / "benchmark_report.json").write_text(
         json.dumps(sanitized, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    return sanitized
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -899,6 +1069,40 @@ def main(argv: list[str] | None = None) -> int:
         help="validated blinded human-review JSON for the exact frozen corpus",
     )
     arguments = parser.parse_args(argv)
+    if arguments.blind_review is not None:
+        if arguments.execute or arguments.approval_case is not None:
+            parser.error(
+                "--blind-review attaches to an existing completed report; "
+                "do not combine it with --execute or --approval-case"
+            )
+        try:
+            attached = attach_blind_review_to_report(
+                arguments.artifact_dir,
+                arguments.blind_review,
+                arguments.corpus,
+                arguments.fixture_root,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            print(
+                json.dumps(
+                    {
+                        "status": "pending_human_review",
+                        "error": sanitize_trace(str(error)).strip(),
+                    }
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "status": attached["status"],
+                    "artifact": str(
+                        arguments.artifact_dir / "benchmark_report.json"
+                    ),
+                }
+            )
+        )
+        return 1 if attached["status"] == "failed" else 0
     report = run_benchmark(
         BenchmarkConfig(
             corpus=arguments.corpus,
@@ -912,7 +1116,6 @@ def main(argv: list[str] | None = None) -> int:
             reasoning_effort=arguments.reasoning_effort,
             sandbox=arguments.sandbox,
             timeout_seconds=arguments.timeout_seconds,
-            blind_review_path=arguments.blind_review,
         )
     )
     print(json.dumps({"status": report.status, "artifact": str(arguments.artifact_dir / "benchmark_report.json")}))
