@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Literal
@@ -79,6 +80,7 @@ class BaselineAdvanceResult:
     previous_source_digest: str
     current_source_digest: str
     event: dict[str, object]
+    cache_warnings: tuple[str, ...] = ()
 
 
 class BaselineAdvanceService:
@@ -197,17 +199,38 @@ class BaselineAdvanceService:
             event = _baseline_event(event_id, advanced, current, reason, decision_record, approval_record)
             self.formal_store.commit_baseline_advance(advanced, event)
 
-        # Formal truth is durable first. These cache writes are recoverable;
-        # leave the effective ChangeSet in place if either write fails.
-        self.facts.replace_baseline_entity_snapshots(current.current_source_digest)
-        self.freshness_store.replace_effective(None)
+        warnings = self._refresh_caches(current.current_source_digest)
         return BaselineAdvanceResult(
             event_id=event_id,
             graph_revision=advanced.manifest.graph_revision,
             previous_source_digest=current.baseline_source_digest,
             current_source_digest=current.current_source_digest,
             event=event,
+            cache_warnings=warnings,
         )
+
+    def _refresh_caches(self, baseline_source_digest: str) -> tuple[str, ...]:
+        """Refresh disposable baseline caches after formal truth is durable."""
+        try:
+            self.facts.replace_baseline_entity_snapshots(baseline_source_digest)
+        except (CodeCortexError, OSError, sqlite3.Error, ValueError) as error:
+            # Preserve the old effective ChangeSet as another recovery signal.
+            return (
+                (
+                    f"{ErrorCode.CACHE_REBUILD_REQUIRED.value}: baseline entity "
+                    f"snapshot refresh failed after the formal commit: {error}"
+                ),
+            )
+        try:
+            self.freshness_store.replace_effective(None)
+        except (CodeCortexError, OSError, ValueError) as error:
+            return (
+                (
+                    f"{ErrorCode.CACHE_REBUILD_REQUIRED.value}: effective freshness "
+                    f"reset failed after the formal commit: {error}"
+                ),
+            )
+        return ()
 
     def _verified_current_change_set(
         self, state: FormalState, change_set_id: str

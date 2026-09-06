@@ -229,6 +229,29 @@ def test_coordinate_mismatched_cache_is_rebuilt_from_formal_revision(
     assert recovery.facts.cache_metadata().graph_revision == 0
 
 
+def test_baseline_snapshot_digest_mismatch_requires_recovery(
+    cloned_repo_without_cache: Path,
+) -> None:
+    recovery = _recovery(cloned_repo_without_cache)
+    recovery.ensure_cache()
+    with recovery.facts.open_write() as connection:
+        connection.execute(
+            "UPDATE baseline_entity_snapshots SET baseline_source_digest = ?",
+            ("sha256:" + "f" * 64,),
+        )
+
+    assert recovery.requires_recovery() is True
+
+    recovery.ensure_cache()
+
+    formal_digest = recovery.formal_store.load().manifest.cognition_baseline
+    assert {
+        snapshot.baseline_source_digest
+        for snapshot in recovery.facts.baseline_entity_snapshots()
+    } == {formal_digest}
+    assert recovery.requires_recovery() is False
+
+
 def test_preflight_routes_missing_clone_cache_through_recovery(
     cloned_repo_without_cache: Path,
 ) -> None:

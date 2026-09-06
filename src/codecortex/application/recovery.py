@@ -85,12 +85,21 @@ class RecoveryService:
                     or metadata.graph_revision != state.manifest.graph_revision
                 ):
                     return True
+                baseline_digest = state.manifest.cognition_baseline
+                if any(
+                    snapshot.baseline_source_digest != baseline_digest
+                    for snapshot in self.facts.baseline_entity_snapshots()
+                ):
+                    return True
                 if self.cognitive_replica is not None:
                     replica = self.cognitive_replica.metadata()
                     if replica.graph_revision != state.manifest.graph_revision:
                         return True
-                self.freshness_store.load_effective()
-                return False
+                effective = self.freshness_store.load_effective()
+                return bool(
+                    effective is not None
+                    and effective.baseline_source_digest != baseline_digest
+                )
         except (
             CodeCortexError,
             OSError,

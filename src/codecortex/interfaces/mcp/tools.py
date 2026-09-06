@@ -175,6 +175,7 @@ class BaselineAdvanceOutput(_Dto):
     graph_revision: int
     previous_source_digest: str
     current_source_digest: str
+    cache_warnings: list[str] = Field(default_factory=list)
 
 
 def repository_overview(services: ApplicationServices) -> RepositoryOverviewOutput:
@@ -386,6 +387,7 @@ def advance_cognition_baseline(
         graph_revision=result.graph_revision,
         previous_source_digest=result.previous_source_digest,
         current_source_digest=result.current_source_digest,
+        cache_warnings=list(result.cache_warnings),
     )
 
 

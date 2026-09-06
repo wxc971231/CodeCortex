@@ -14,6 +14,8 @@ from codecortex.application.baseline import (
     DecisionRecord,
 )
 from codecortex.application.fact_sync import FactSyncService
+from codecortex.application.preflight import PreflightService
+from codecortex.application.recovery import RecoveryService
 from codecortex.domain.cognition import (
     CognitiveGraph,
     EntityRefs,
@@ -187,3 +189,54 @@ def test_baseline_advance_rejects_file_records_with_wrong_aggregate_digest(
 
     assert raised.value.code is ErrorCode.FORMAL_STATE_CORRUPT
     assert formal_store.load().manifest.cognition_baseline == accepted_before
+
+
+def test_baseline_cache_failure_warns_then_next_preflight_recovers(
+    tmp_path: Path,
+) -> None:
+    service, repository, formal_store = _service(tmp_path)
+    _write(repository.root, "def answer() -> int:\n    return 2\n")
+    preflight = service.preflight()
+    assert preflight.change_set is not None
+
+    with patch.object(
+        service.facts,
+        "replace_baseline_entity_snapshots",
+        side_effect=OSError("simulated baseline snapshot write failure"),
+    ):
+        result = service.advance(
+            preflight.change_set.change_set_id,
+            "no_semantic_change",
+            DecisionRecord("analyzer", "No semantic change.", "2026-09-04T08:00:00Z"),
+            None,
+        )
+
+    assert result.cache_warnings
+    assert ErrorCode.CACHE_REBUILD_REQUIRED.value in result.cache_warnings[0]
+    assert formal_store.load().manifest.cognition_baseline == result.current_source_digest
+
+    recovery = RecoveryService(
+        formal_store=formal_store,
+        fact_sync=service.fact_sync,
+        facts=service.facts,
+        freshness_store=service.freshness_store,
+        repository_lock=service.repository_lock,
+    )
+    guarded = PreflightService(
+        formal_store=formal_store,
+        fact_sync=service.fact_sync,
+        facts=service.facts,
+        freshness_store=service.freshness_store,
+        repository_lock=service.repository_lock,
+        recovery_service=recovery,
+    )
+    assert recovery.requires_recovery() is True
+
+    repaired = guarded.run()
+
+    assert repaired.change_set is None
+    assert recovery.requires_recovery() is False
+    assert {
+        snapshot.baseline_source_digest
+        for snapshot in service.facts.baseline_entity_snapshots()
+    } == {result.current_source_digest}
