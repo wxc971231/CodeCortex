@@ -22,9 +22,13 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codecortex.application.services import ApplicationServices
+from codecortex.domain.facts import DigestProfile, SourceConfig
 from codecortex.domain.proposals import ApprovalRecord
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
-from codecortex.infrastructure.persistence.graph_replica import GraphReplica
+from codecortex.infrastructure.persistence.graph_replica import (
+    ContextRequest,
+    GraphReplica,
+)
 from codecortex.interfaces.cli.main import _default_services
 from codecortex.interfaces.mcp.server import build_server
 
@@ -134,6 +138,115 @@ def test_main_service_composition_does_not_reset_corrupt_replica(
 
     assert services.cognitive_replica is not None
     assert _cache_snapshot(root) == before
+
+
+def test_default_repository_config_wires_runtime_limits_and_source_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+
+    services = _default_services()
+
+    assert services.fact_sync is not None
+    assert services.query_service is not None
+    assert services.m1a_proposal_service is not None
+    assert services.cognitive_replica is not None
+    assert services.fact_sync.source_config == SourceConfig()
+    assert services.fact_sync.digest_profile == DigestProfile()
+    assert services.lock_timeout_seconds == 10
+    with pytest.raises(ValueError, match="configured maximum"):
+        services.search_cognitive_graph("anything", limit=41)
+    with pytest.raises(ValueError, match="configured maximum"):
+        services.repository_facts("pkg", limit=81)
+    with pytest.raises(ValueError, match="max_nodes"):
+        services.cognitive_replica.context(
+            ContextRequest(node_ids=("responsibility.missing",), max_nodes=41)
+        )
+
+
+def test_custom_repository_config_controls_all_composed_runtime_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+    initial = _default_services()
+    initial.initialize_repository()
+    (root / "pkg" / "ignored.py").write_text("IGNORED = True\n", encoding="utf-8")
+    (root / "pkg" / "generated.py").write_text("GENERATED = True\n", encoding="utf-8")
+    (root / ".gitignore").write_text("pkg/ignored.py\n", encoding="utf-8")
+    (root / ".codecortex" / "config.toml").write_text(
+        """schema_version = 1
+
+[source]
+include = ["pkg/*.py"]
+exclude = ["pkg/generated.py"]
+respect_gitignore = false
+python_min = "3.9"
+python_max = "3.14"
+
+[query]
+default_depth = 1
+max_nodes = 2
+max_entities = 3
+max_evidence = 4
+
+[cache]
+lock_timeout_seconds = 0.025
+""",
+        encoding="utf-8",
+    )
+
+    services = _default_services()
+    synced = services.synchronize_facts("full")
+
+    assert services.fact_sync is not None
+    assert services.query_service is not None
+    assert services.initialization_service is not None
+    assert services.m1a_proposal_service is not None
+    assert services.preflight_service is not None
+    assert services.baseline_advance_service is not None
+    assert services.cognitive_replica is not None
+    assert services.fact_sync.source_config == SourceConfig(
+        include=("pkg/*.py",),
+        exclude=("pkg/generated.py",),
+        respect_gitignore=False,
+    )
+    assert set(services.fact_sync.database.source_file_digests()) == {
+        "pkg/__init__.py",
+        "pkg/core.py",
+        "pkg/ignored.py",
+    }
+    snapshot = services.m1a_proposal_service._source_probe()
+    assert set(snapshot.file_digests) == set(
+        services.fact_sync.database.source_file_digests()
+    )
+    assert snapshot.repository_source_digest == synced.repository_source_digest
+    assert services.lock_timeout_seconds == 0.025
+    assert services.query_default_depth == 1
+    assert services.query_max_nodes == 2
+    assert services.query_max_entities == 3
+    assert services.query_max_evidence == 4
+    assert services.fact_sync.lock_timeout_seconds == 0.025
+    assert services.query_service._lock_timeout_seconds == 0.025
+    assert services.initialization_service._lock_timeout_seconds == 0.025
+    assert services.m1a_proposal_service._lock_timeout_seconds == 0.025
+    assert services.preflight_service.lock_timeout_seconds == 0.025
+    assert services.baseline_advance_service.lock_timeout_seconds == 0.025
+    with pytest.raises(ValueError, match="configured maximum"):
+        services.search_cognitive_graph("anything", limit=3)
+    with pytest.raises(ValueError, match="configured maximum"):
+        services.repository_facts("pkg", limit=4)
+    with pytest.raises(ValueError, match="configured maximum"):
+        services.analysis_scope(diagnostics_limit=5)
+    with pytest.raises(ValueError, match="max_nodes"):
+        services.get_discussion_context(
+            ContextRequest(node_ids=("responsibility.missing",), max_nodes=3)
+        )
 
 
 @pytest.fixture

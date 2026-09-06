@@ -514,6 +514,10 @@ class GraphReplica:
         *,
         read_only: bool = False,
         repository_root: Path | None = None,
+        max_search_limit: int = 100,
+        max_context_nodes: int = 200,
+        max_context_entities: int = 500,
+        max_context_evidence: int = 500,
         entity_refs: Iterable[EntityRefRecord]
         | Callable[[], Iterable[EntityRefRecord]] = (),
         history_events: Iterable[HistoryEventRecord]
@@ -526,6 +530,16 @@ class GraphReplica:
         )
         if read_only and self._repository_root is None:
             raise ValueError("Read-only cognitive replica requires a repository root")
+        self.max_limit = _positive_bound(max_search_limit, "max_search_limit")
+        self.max_context_nodes = _positive_bound(
+            max_context_nodes, "max_context_nodes"
+        )
+        self.max_context_entities = _positive_bound(
+            max_context_entities, "max_context_entities"
+        )
+        self.max_context_evidence = _positive_bound(
+            max_context_evidence, "max_context_evidence"
+        )
         self._entity_refs = (
             entity_refs if callable(entity_refs) else lambda: entity_refs
         )
@@ -1610,6 +1624,12 @@ def _validated_anchors(values: Sequence[str], label: str) -> tuple[str, ...]:
     if any(not isinstance(value, str) or not value for value in materialized):
         raise ValueError(f"{label} list must contain non-empty strings")
     return materialized
+
+
+def _positive_bound(value: int, label: str) -> int:
+    if type(value) is not int or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
 
 
 def _bounded_int(value: int, minimum: int, maximum: int, label: str) -> int:

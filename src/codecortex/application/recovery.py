@@ -56,8 +56,8 @@ class RecoveryService:
         cognitive_replica: GraphReplica | None = None,
         lock_timeout_seconds: float = 10,
     ) -> None:
-        if type(lock_timeout_seconds) not in (int, float) or lock_timeout_seconds <= 0:
-            raise ValueError("Recovery lock timeout must be positive")
+        if type(lock_timeout_seconds) not in (int, float) or lock_timeout_seconds < 0:
+            raise ValueError("Recovery lock timeout must be non-negative")
         self.formal_store = formal_store
         self.fact_sync = fact_sync
         self.facts = facts

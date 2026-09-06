@@ -135,6 +135,10 @@ class ApplicationServices:
     baseline_advance_service: BaselineAdvanceService | None = None
     cognitive_replica: GraphReplica | None = None
     cognitive_graph_max_objects: int = 500
+    query_default_depth: int = 2
+    query_max_nodes: int = 40
+    query_max_entities: int = 80
+    query_max_evidence: int = 80
 
     def initialize_repository(self) -> RepositoryOverview:
         """Idempotently establish the revision-zero technical skeleton."""

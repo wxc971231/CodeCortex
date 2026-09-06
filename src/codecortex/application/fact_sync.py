@@ -92,6 +92,7 @@ class FactSyncService:
         source_config: SourceConfig | None = None,
         digest_profile: DigestProfile | None = None,
         managed_source_set_version: int = 1,
+        lock_timeout_seconds: float = 10,
         max_retries: int = 3,
         parse_file: Callable[[SourceFileDigest, Sequence[EntityIdentityHint]], ParsedFile] = parse_python_file,
     ) -> None:
@@ -99,6 +100,11 @@ class FactSyncService:
             raise ValueError("Managed source set version must be a positive integer")
         if type(max_retries) is not int or max_retries < 0:
             raise ValueError("Fact Sync max retries must be a non-negative integer")
+        if (
+            type(lock_timeout_seconds) not in (int, float)
+            or lock_timeout_seconds < 0
+        ):
+            raise ValueError("Fact Sync lock timeout must be non-negative")
         self.repository = repository
         self.database = database or FactsDatabase(
             repository.root / ".codecortex" / ".cache" / "facts.sqlite3"
@@ -108,6 +114,7 @@ class FactSyncService:
         self.source_config = SourceConfig() if source_config is None else source_config
         self.digest_profile = DigestProfile() if digest_profile is None else digest_profile
         self.managed_source_set_version = managed_source_set_version
+        self.lock_timeout_seconds = lock_timeout_seconds
         self.max_retries = max_retries
         self._parse_file = parse_file
 
@@ -137,7 +144,9 @@ class FactSyncService:
                 identity_hints=identity_hints,
             )
 
-            with self.repository_lock.acquire("exclusive", 10):
+            with self.repository_lock.acquire(
+                "exclusive", self.lock_timeout_seconds
+            ):
                 verified = self._source_snapshot()
                 if not self._same_snapshot(snapshot, verified):
                     if retry_count == self.max_retries:

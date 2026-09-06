@@ -125,6 +125,45 @@ async def test_sync_tool_handler_completes_without_worker_thread_deadlock(
 
 
 @pytest.mark.anyio
+async def test_query_tool_defaults_respect_repository_configured_caps(
+    services: MagicMock,
+) -> None:
+    services.query_default_depth = 1
+    services.query_max_nodes = 2
+    services.query_max_entities = 3
+    services.query_max_evidence = 4
+    services.run_analyzer_query_read.side_effect = (
+        lambda operation, **_kwargs: operation()
+    )
+    server = build_server("analyzer", services)
+
+    with patch("codecortex.interfaces.mcp.server.tools.repository_facts") as adapter:
+        await server._tool_manager._tools["repository_facts"].fn(scope="pkg")
+        assert adapter.call_args.args[3] == 3
+    with patch("codecortex.interfaces.mcp.server.tools.analysis_scope") as adapter:
+        await server._tool_manager._tools["analysis_scope"].fn()
+        assert adapter.call_args.args[3] == 3
+    with patch(
+        "codecortex.interfaces.mcp.server.tools.resolve_entity_context"
+    ) as adapter:
+        await server._tool_manager._tools["resolve_entity_context"].fn(path="pkg/a.py")
+        assert adapter.call_args.kwargs["limit"] == 3
+    with patch(
+        "codecortex.interfaces.mcp.server.tools.get_discussion_context"
+    ) as adapter:
+        await server._tool_manager._tools["get_discussion_context"].fn()
+        assert adapter.call_args.kwargs["depth"] == 1
+        assert adapter.call_args.kwargs["max_nodes"] == 2
+        assert adapter.call_args.kwargs["max_entities"] == 3
+        assert adapter.call_args.kwargs["max_evidence"] == 4
+    with patch(
+        "codecortex.interfaces.mcp.server.tools.search_cognitive_graph"
+    ) as adapter:
+        await server._tool_manager._tools["search_cognitive_graph"].fn(query="thing")
+        assert adapter.call_args.kwargs["limit"] == 2
+
+
+@pytest.mark.anyio
 async def test_domain_error_is_a_stable_structured_tool_error(
     services: MagicMock,
 ) -> None:

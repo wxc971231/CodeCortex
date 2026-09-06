@@ -7,10 +7,10 @@ import shutil
 import tempfile
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
 from codecortex.application.ports import RecoveryResult
 from codecortex.domain.cognition import (
@@ -28,7 +28,7 @@ from codecortex.domain.cognition import (
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
-from codecortex.domain.facts import DigestProfile
+from codecortex.domain.facts import DigestProfile, SourceConfig
 from codecortex.domain.ids import IdPrefix, validate_id
 from codecortex.domain.proposals import PatchOperation, canonical_patch_digest
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
@@ -53,6 +53,30 @@ max_evidence = 80
 [cache]
 lock_timeout_seconds = 10
 """
+
+
+@dataclass(frozen=True, slots=True)
+class QueryConfig:
+    """Validated repository query defaults and upper bounds."""
+
+    default_depth: int = 2
+    max_nodes: int = 40
+    max_entities: int = 80
+    max_evidence: int = 80
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryRuntimeConfig:
+    """Typed runtime values loaded from the formal repository config."""
+
+    source: SourceConfig = field(default_factory=SourceConfig)
+    query: QueryConfig = QueryConfig()
+    lock_timeout_seconds: float = 10
+    python_min: str = "3.9"
+    python_max: str = "3.14"
+
+
+DEFAULT_RUNTIME_CONFIG = RepositoryRuntimeConfig()
 
 PROJECT_TEMPLATE = b"# Project Context\n\nDescribe project goals and constraints here.\n"
 EMPTY_TREE_VIEW = b"# CodeCortex Cognitive Tree\n\nNo cognition has been initialized.\n"
@@ -234,6 +258,38 @@ class FormalStore:
         _write_bytes_atomic(self._root / "PROJECT.md", PROJECT_TEMPLATE)
         _write_bytes_atomic(self._root / "views/TREE.md", EMPTY_TREE_VIEW)
         return self.load()
+
+    def load_runtime_config(self) -> RepositoryRuntimeConfig:
+        """Load validated runtime settings, defaulting only before first init."""
+        path = self._root / "config.toml"
+        if not path.exists():
+            return DEFAULT_RUNTIME_CONFIG
+        config = self._validated_config_data(path)
+        source = cast(dict[str, object], config["source"])
+        query = cast(dict[str, object], config["query"])
+        cache = cast(dict[str, object], config["cache"])
+        try:
+            source_config = SourceConfig(
+                include=tuple(cast(list[str], source["include"])),
+                exclude=tuple(cast(list[str], source["exclude"])),
+                respect_gitignore=cast(bool, source["respect_gitignore"]),
+            )
+            return RepositoryRuntimeConfig(
+                source=source_config,
+                query=QueryConfig(
+                    default_depth=cast(int, query["default_depth"]),
+                    max_nodes=cast(int, query["max_nodes"]),
+                    max_entities=cast(int, query["max_entities"]),
+                    max_evidence=cast(int, query["max_evidence"]),
+                ),
+                lock_timeout_seconds=float(
+                    cast(int | float, cache["lock_timeout_seconds"])
+                ),
+                python_min=cast(str, source["python_min"]),
+                python_max=cast(str, source["python_max"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            self._raise_corrupt("config.toml runtime values are invalid", cause=error)
 
     def load(self) -> FormalState:
         """Load one complete, validated formal snapshot."""
@@ -844,7 +900,10 @@ class FormalStore:
             )
 
     def _validate_config(self) -> None:
-        path = self._root / "config.toml"
+        self.load_runtime_config()
+
+    def _validated_config_data(self, path: Path) -> dict[str, object]:
+        """Parse and validate the exact version-one repository configuration."""
         try:
             config = tomllib.loads(self._read_text(path))
         except tomllib.TOMLDecodeError as error:
@@ -898,6 +957,7 @@ class FormalStore:
             self._raise_corrupt(
                 "config.toml cache.lock_timeout_seconds must be non-negative"
             )
+        return config
 
     def _load_history_events(self) -> tuple[HistoryEventRef, ...]:
         event_directory = self._root / "history/events"

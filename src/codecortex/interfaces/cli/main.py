@@ -142,6 +142,11 @@ def _default_services(
     # declares a settable one; the composition only ever reads it.
     context = cast(RepositoryContextPort, repository)
     formal_store = FormalStore(repository)
+    runtime_config = formal_store.load_runtime_config()
+    source_config = runtime_config.source
+    digest_profile = DigestProfile()
+    query_config = runtime_config.query
+    lock_timeout_seconds = runtime_config.lock_timeout_seconds
     repository_lock = (
         RepositoryLock(repository.root)
         if profile == "main"
@@ -158,6 +163,9 @@ def _default_services(
         database=facts,
         repository_lock=repository_lock,
         formal_store=formal_store,
+        source_config=source_config,
+        digest_profile=digest_profile,
+        lock_timeout_seconds=lock_timeout_seconds,
     )
     replica_path = cache_directory / "cognitive.sqlite3"
     entity_refs = formal_entity_ref_provider(formal_store)
@@ -166,6 +174,10 @@ def _default_services(
         replica_path,
         read_only=(profile == "analyzer"),
         repository_root=repository.root,
+        max_search_limit=query_config.max_nodes,
+        max_context_nodes=query_config.max_nodes,
+        max_context_entities=query_config.max_entities,
+        max_context_evidence=query_config.max_evidence,
         entity_refs=entity_refs,
         history_events=history_events,
     )
@@ -175,9 +187,12 @@ def _default_services(
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
         fact_sync=fact_sync,
-        source_probe=lambda: _probe_sources(repository),
+        source_probe=lambda: _probe_sources(
+            repository, source_config, digest_profile
+        ),
         facts=facts,
         replica=replica,
+        lock_timeout_seconds=lock_timeout_seconds,
     )
     recovery = (
         RecoveryService(
@@ -187,6 +202,7 @@ def _default_services(
             freshness_store=FreshnessStore(cache_directory),
             repository_lock=repository_lock,
             cognitive_replica=replica,
+            lock_timeout_seconds=lock_timeout_seconds,
         )
         if profile == "main"
         else None
@@ -198,11 +214,13 @@ def _default_services(
         freshness_store=FreshnessStore(cache_directory),
         repository_lock=repository_lock,
         recovery_service=recovery,
+        lock_timeout_seconds=lock_timeout_seconds,
     )
     return ApplicationServices(
         repository=context,
         formal_store=formal_store,
         repository_lock=repository_lock,
+        lock_timeout_seconds=lock_timeout_seconds,
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
         fact_sync=fact_sync,
@@ -211,12 +229,17 @@ def _default_services(
             facts=facts,
             replica=replica,
             repository_lock=repository_lock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            max_node_limit=query_config.max_nodes,
+            max_entity_limit=query_config.max_entities,
+            max_evidence_limit=query_config.max_evidence,
         ),
         initialization_service=InitializationService(
             formal_store=formal_store,
             fact_sync=fact_sync,
             repository_lock=repository_lock,
             proposal_service=proposal_service,
+            lock_timeout_seconds=lock_timeout_seconds,
         ),
         m1a_proposal_service=proposal_service,
         preflight_service=preflight,
@@ -226,17 +249,26 @@ def _default_services(
             facts=facts,
             freshness_store=FreshnessStore(cache_directory),
             repository_lock=repository_lock,
+            lock_timeout_seconds=lock_timeout_seconds,
         ),
         cognitive_replica=replica,
+        query_default_depth=query_config.default_depth,
+        query_max_nodes=query_config.max_nodes,
+        query_max_entities=query_config.max_entities,
+        query_max_evidence=query_config.max_evidence,
     )
 
 
-def _probe_sources(repository: Repository) -> ManagedSourceSnapshot:
+def _probe_sources(
+    repository: Repository,
+    source_config: SourceConfig,
+    digest_profile: DigestProfile,
+) -> ManagedSourceSnapshot:
     """Return a fresh managed-source snapshot for M1a proposal preconditions."""
-    discovered = discover_python_source_set(repository, SourceConfig())
+    discovered = discover_python_source_set(repository, source_config)
     files = [digest_source_file(source) for source in discovered.sources]
     return ManagedSourceSnapshot(
-        repository_source_digest=repository_digest(files, DigestProfile()),
+        repository_source_digest=repository_digest(files, digest_profile),
         file_digests={
             item.source.relative_path: item.content_digest for item in files
         },

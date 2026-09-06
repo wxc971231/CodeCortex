@@ -352,6 +352,9 @@ class QueryService:
         repository_lock: RepositoryLockPort,
         lock_timeout_seconds: float = 10,
         max_limit: int = 100,
+        max_node_limit: int | None = None,
+        max_entity_limit: int | None = None,
+        max_evidence_limit: int | None = None,
     ) -> None:
         if type(max_limit) is not int or isinstance(max_limit, bool) or max_limit < 1:
             raise ValueError("Query maximum limit must be a positive integer")
@@ -364,6 +367,13 @@ class QueryService:
         self._repository_lock = repository_lock
         self._lock_timeout_seconds = lock_timeout_seconds
         self._max_limit = max_limit
+        self._max_node_limit = _configured_limit(max_node_limit, max_limit, "node")
+        self._max_entity_limit = _configured_limit(
+            max_entity_limit, max_limit, "entity"
+        )
+        self._max_evidence_limit = _configured_limit(
+            max_evidence_limit, max_limit, "evidence"
+        )
 
     def repository_facts(
         self,
@@ -376,7 +386,7 @@ class QueryService:
     ) -> RepositoryFactsPage:
         """Return one guarded, cursor-paginated page of module entities."""
         module = _required_text(scope, "repository_facts scope")
-        checked_limit = self._bounded_limit(limit)
+        checked_limit = self._bounded_limit(limit, self._max_entity_limit)
         checked_cursor = _optional_cursor(cursor)
         with self._guarded_read(
             expected_source_digest, expected_graph_revision
@@ -403,8 +413,10 @@ class QueryService:
     ) -> AnalysisScopeResult:
         """Return guarded package/module partitions, totals, and diagnostics."""
         module = _optional_text(scope, "analysis_scope scope")
-        checked_limit = self._bounded_limit(limit)
-        checked_diagnostics_limit = self._bounded_limit(diagnostics_limit)
+        checked_limit = self._bounded_limit(limit, self._max_entity_limit)
+        checked_diagnostics_limit = self._bounded_limit(
+            diagnostics_limit, self._max_evidence_limit
+        )
         checked_cursor = _optional_cursor(cursor)
         with self._guarded_read(
             expected_source_digest, expected_graph_revision
@@ -458,7 +470,7 @@ class QueryService:
             )
         anchor_kind, raw_anchor = anchors[0]
         anchor_value = _required_text(raw_anchor, f"{anchor_kind} anchor")
-        checked_limit = self._bounded_limit(limit)
+        checked_limit = self._bounded_limit(limit, self._max_entity_limit)
         checked_cursor = _optional_cursor(cursor)
         types = _relation_types(relation_types)
         with self._guarded_read(
@@ -532,7 +544,7 @@ class QueryService:
     ) -> SearchPage:
         """Return guarded, deterministic, bounded cognitive search hits."""
         text = _required_text(query, "search query")
-        checked_limit = self._bounded_limit(limit)
+        checked_limit = self._bounded_limit(limit, self._max_node_limit)
         kind_filter = _node_kinds(kinds)
         with self._guarded_read(
             expected_source_digest, expected_graph_revision
@@ -679,12 +691,19 @@ class QueryService:
             last_known_location=last_known,
         )
 
-    def _bounded_limit(self, limit: int) -> int:
+    def _bounded_limit(self, limit: int, configured_maximum: int) -> int:
         if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
             raise ValueError("Query limit must be a positive integer")
-        if limit > self._max_limit:
+        if limit > configured_maximum:
             raise ValueError("Query limit exceeds the configured maximum")
         return limit
+
+
+def _configured_limit(value: int | None, fallback: int, label: str) -> int:
+    configured = fallback if value is None else value
+    if type(configured) is not int or isinstance(configured, bool) or configured < 1:
+        raise ValueError(f"Query {label} maximum must be a positive integer")
+    return configured
 
 
 def _required_text(value: object, label: str) -> str:

@@ -52,8 +52,8 @@ class PreflightService:
         lock_timeout_seconds: float = 10,
         max_retries: int = 2,
     ) -> None:
-        if type(lock_timeout_seconds) not in (int, float) or lock_timeout_seconds <= 0:
-            raise ValueError("Preflight lock timeout must be positive")
+        if type(lock_timeout_seconds) not in (int, float) or lock_timeout_seconds < 0:
+            raise ValueError("Preflight lock timeout must be non-negative")
         if type(max_retries) is not int or max_retries < 0:
             raise ValueError("Preflight retry count must be non-negative")
         self.formal_store = formal_store

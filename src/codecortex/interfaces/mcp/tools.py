@@ -569,6 +569,7 @@ def analysis_scope(
         scope,
         cursor,
         limit,
+        diagnostics_limit=min(limit, services.query_max_evidence),
         expected_source_digest=expected_source_digest,
         expected_graph_revision=expected_graph_revision,
     )

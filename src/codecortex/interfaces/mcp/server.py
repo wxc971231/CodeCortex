@@ -95,6 +95,21 @@ def _analyzer_guarded_read[QueryResult](
     )
 
 
+def _configured_query_value(
+    services: ApplicationServices, attribute: str, fallback: int
+) -> int:
+    configured = getattr(services, attribute, fallback)
+    if type(configured) is not int or configured < 1:
+        return fallback
+    return configured
+
+
+def _configured_query_default(
+    services: ApplicationServices, attribute: str, fallback: int
+) -> int:
+    return min(_configured_query_value(services, attribute, fallback), fallback)
+
+
 def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:
     """Build one fresh server with its static, profile-specific tool set."""
     if profile not in ("main", "analyzer"):
@@ -196,7 +211,7 @@ def _register_read_tools(
     async def repository_facts(
         scope: str,
         cursor: str | None = None,
-        limit: int = 50,
+        limit: int | None = None,
         expected_graph_revision: int | None = None,
         expected_source_digest: str | None = None,
     ) -> tools.RepositoryFactsOutput:
@@ -208,7 +223,11 @@ def _register_read_tools(
                     services,
                     scope,
                     cursor,
-                    limit,
+                    _configured_query_default(
+                        services, "query_max_entities", 50
+                    )
+                    if limit is None
+                    else limit,
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
@@ -223,7 +242,7 @@ def _register_read_tools(
     async def analysis_scope(
         scope: str | None = None,
         cursor: str | None = None,
-        limit: int = 50,
+        limit: int | None = None,
         expected_graph_revision: int | None = None,
         expected_source_digest: str | None = None,
     ) -> tools.AnalysisScopeOutput:
@@ -235,7 +254,11 @@ def _register_read_tools(
                     services,
                     scope,
                     cursor,
-                    limit,
+                    _configured_query_default(
+                        services, "query_max_entities", 50
+                    )
+                    if limit is None
+                    else limit,
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
@@ -253,7 +276,7 @@ def _register_read_tools(
         address: str | None = None,
         relation_types: list[str] | None = None,
         cursor: str | None = None,
-        limit: int = 50,
+        limit: int | None = None,
         expected_graph_revision: int | None = None,
         expected_source_digest: str | None = None,
     ) -> tools.EntityContextOutput:
@@ -268,7 +291,13 @@ def _register_read_tools(
                     address=address,
                     relation_types=relation_types or (),
                     cursor=cursor,
-                    limit=limit,
+                    limit=(
+                        _configured_query_default(
+                            services, "query_max_entities", 50
+                        )
+                        if limit is None
+                        else limit
+                    ),
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
@@ -282,10 +311,10 @@ def _register_read_tools(
     async def get_discussion_context(
         node_ids: list[str] | None = None,
         entity_ids: list[str] | None = None,
-        depth: int = 2,
-        max_nodes: int = 40,
-        max_entities: int = 80,
-        max_evidence: int = 80,
+        depth: int | None = None,
+        max_nodes: int | None = None,
+        max_entities: int | None = None,
+        max_evidence: int | None = None,
         expected_graph_revision: int | None = None,
         expected_source_digest: str | None = None,
     ) -> tools.DiscussionContextOutput:
@@ -297,10 +326,34 @@ def _register_read_tools(
                     services,
                     node_ids=node_ids or (),
                     entity_ids=entity_ids or (),
-                    depth=depth,
-                    max_nodes=max_nodes,
-                    max_entities=max_entities,
-                    max_evidence=max_evidence,
+                    depth=(
+                        _configured_query_value(
+                            services, "query_default_depth", 2
+                        )
+                        if depth is None
+                        else depth
+                    ),
+                    max_nodes=(
+                        _configured_query_default(
+                            services, "query_max_nodes", 40
+                        )
+                        if max_nodes is None
+                        else max_nodes
+                    ),
+                    max_entities=(
+                        _configured_query_default(
+                            services, "query_max_entities", 80
+                        )
+                        if max_entities is None
+                        else max_entities
+                    ),
+                    max_evidence=(
+                        _configured_query_default(
+                            services, "query_max_evidence", 80
+                        )
+                        if max_evidence is None
+                        else max_evidence
+                    ),
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
@@ -314,7 +367,7 @@ def _register_read_tools(
     async def search_cognitive_graph(
         query: str,
         kinds: list[str] | None = None,
-        limit: int = 20,
+        limit: int | None = None,
         expected_graph_revision: int | None = None,
         expected_source_digest: str | None = None,
     ) -> tools.SearchGraphOutput:
@@ -326,7 +379,13 @@ def _register_read_tools(
                     services,
                     query,
                     kinds=kinds or (),
-                    limit=limit,
+                    limit=(
+                        _configured_query_default(
+                            services, "query_max_nodes", 20
+                        )
+                        if limit is None
+                        else limit
+                    ),
                     expected_graph_revision=expected_graph_revision,
                     expected_source_digest=expected_source_digest,
                 ),
