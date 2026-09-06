@@ -42,7 +42,11 @@ from codecortex.domain.graph import (
     Evidence,
     validate_cognitive_graph,
 )
-from codecortex.infrastructure.persistence.sqlite_safety import read_only_sqlite_uri
+from codecortex.infrastructure.persistence.sqlite_safety import (
+    read_only_sqlite_uri,
+    read_write_sqlite_uri,
+    remove_sqlite_coordinate,
+)
 
 _REPLICA_SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 10_000
@@ -550,16 +554,22 @@ class GraphReplica:
             raise sqlite3.OperationalError(
                 "Read-only cognitive replica cannot be reset"
             )
-        for path in (
-            self.path,
-            self.path.with_name(f"{self.path.name}-wal"),
-            self.path.with_name(f"{self.path.name}-shm"),
-        ):
-            path.unlink(missing_ok=True)
+        if self._repository_root is None:
+            for path in (
+                self.path,
+                self.path.with_name(f"{self.path.name}-wal"),
+                self.path.with_name(f"{self.path.name}-shm"),
+            ):
+                path.unlink(missing_ok=True)
+        else:
+            remove_sqlite_coordinate(
+                self.path, self._repository_root, label="cognitive replica"
+            )
         self._create_schema()
 
     def _create_schema(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._repository_root is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.open_write() as connection:
             connection.executescript(_DDL)
 
@@ -578,7 +588,15 @@ class GraphReplica:
             raise sqlite3.OperationalError(
                 "Read-only cognitive replica cannot be modified"
             )
-        connection = sqlite3.connect(self.path)
+        if self._repository_root is None:
+            connection = sqlite3.connect(self.path)
+        else:
+            connection = sqlite3.connect(
+                read_write_sqlite_uri(
+                    self.path, self._repository_root, label="cognitive replica"
+                ),
+                uri=True,
+            )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
@@ -586,13 +604,11 @@ class GraphReplica:
         return connection
 
     def _read_uri(self) -> str:
-        uri = f"{self.path.resolve().as_uri()}?mode=ro"
-        if not self._read_only:
-            return uri
-        assert self._repository_root is not None
-        return read_only_sqlite_uri(
-            self.path, self._repository_root, label="cognitive replica"
-        )
+        if self._repository_root is not None:
+            return read_only_sqlite_uri(
+                self.path, self._repository_root, label="cognitive replica"
+            )
+        return f"{self.path.resolve().as_uri()}?mode=ro"
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:
@@ -664,6 +680,7 @@ class GraphReplica:
         entity_refs = self._validated_entity_refs(graph)
         history_events = self._validated_history_events()
 
+        self._create_schema()
         with self.open_write() as connection:
             connection.execute("BEGIN IMMEDIATE")
             for table in _DELETE_ORDER:

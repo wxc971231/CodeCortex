@@ -14,6 +14,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -96,6 +97,43 @@ def _initialize_cognition(services: ApplicationServices) -> None:
             mappings=[],
         ),
     )
+
+
+def test_main_service_composition_is_cache_write_free_under_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent Main construction must not create/reset a replica outside a lock."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        services = tuple(executor.map(lambda _index: _default_services(), range(2)))
+
+    assert len(services) == 2
+    assert all(item.cognitive_replica is not None for item in services)
+    assert not (root / ".codecortex" / ".cache").exists()
+
+
+def test_main_service_composition_does_not_reset_corrupt_replica(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery, not the unlocked factory, owns replacement of corrupt cache."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    cache = root / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    replica = cache / "cognitive.sqlite3"
+    replica.write_bytes(b"corrupt-replica-sentinel")
+    before = _cache_snapshot(root)
+    monkeypatch.chdir(root)
+
+    services = _default_services()
+
+    assert services.cognitive_replica is not None
+    assert _cache_snapshot(root) == before
 
 
 @pytest.fixture

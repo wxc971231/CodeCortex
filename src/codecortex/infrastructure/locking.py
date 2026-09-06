@@ -1,5 +1,6 @@
 """POSIX advisory locking for repository-wide coordination."""
 
+import errno
 import fcntl
 import os
 import stat
@@ -23,9 +24,12 @@ class RepositoryLock:
         self, mode: LockMode, timeout_seconds: float
     ) -> Generator[None]:
         """Hold a repository lock, releasing its descriptor on every exit path."""
-        lock_path = self._repository_root / ".codecortex" / ".cache" / "repository.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            descriptor = _open_or_create_lock(self._repository_root)
+        except OSError as error:
+            if error.errno in _UNSAFE_PATH_ERRNOS:
+                raise _unsafe_main_lock_error() from error
+            raise
 
         try:
             os.fchmod(descriptor, 0o600)
@@ -140,6 +144,67 @@ def _open_read_only_lock(repository_root: Path) -> int:
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_LOCK_FLAGS = (
+    os.O_CREAT
+    | os.O_RDWR
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_UNSAFE_PATH_ERRNOS = {
+    errno.EINVAL,
+    errno.EISDIR,
+    errno.ELOOP,
+    errno.ENOTDIR,
+}
+
+
+def _open_or_create_lock(repository_root: Path) -> int:
+    """Open Main's lock through anchored no-follow directory descriptors."""
+    descriptors: list[int] = []
+    lock_descriptor: int | None = None
+    try:
+        descriptors.append(os.open(repository_root, _DIRECTORY_FLAGS))
+        for component in (".codecortex", ".cache"):
+            parent = descriptors[-1]
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=parent)
+                except FileExistsError:
+                    pass
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent)
+            descriptors.append(child)
+        lock_descriptor = os.open(
+            "repository.lock", _LOCK_FLAGS, 0o600, dir_fd=descriptors[-1]
+        )
+        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+            raise OSError(errno.EINVAL, "Repository lock is not a regular file")
+        return lock_descriptor
+    except BaseException:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        raise
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _unsafe_main_lock_error() -> CodeCortexError:
+    return CodeCortexError(
+        ErrorCode.PATH_OUTSIDE_REPOSITORY,
+        "Repository cache lock path is unsafe",
+        suggested_action="Replace repository cache symlinks with local directories",
+    )
 
 
 def _read_only_lock_error(message: str) -> CodeCortexError:

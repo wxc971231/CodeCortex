@@ -162,20 +162,12 @@ def _default_services(
     replica_path = cache_directory / "cognitive.sqlite3"
     entity_refs = formal_entity_ref_provider(formal_store)
     history_events = formal_history_event_provider(formal_store)
-    replica = (
-        GraphReplica.create_new(
-            replica_path,
-            entity_refs=entity_refs,
-            history_events=history_events,
-        )
-        if profile == "main"
-        else GraphReplica(
-            replica_path,
-            read_only=True,
-            repository_root=repository.root,
-            entity_refs=entity_refs,
-            history_events=history_events,
-        )
+    replica = GraphReplica(
+        replica_path,
+        read_only=(profile == "analyzer"),
+        repository_root=repository.root,
+        entity_refs=entity_refs,
+        history_events=history_events,
     )
     proposal_service = ProposalService(
         formal_store=formal_store,
