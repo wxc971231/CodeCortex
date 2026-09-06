@@ -376,6 +376,201 @@ def test_approved_initialization_advances_all_formal_state(
     )
 
 
+def test_analysis_backed_reinitialize_updates_existing_graph_objects(
+    harness: M1aHarness,
+) -> None:
+    initial = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+    harness.service.apply_cognitive_proposal(initial.proposal_id, approval_for(initial))
+    sync = harness.fact_sync.sync()
+    uid = _answer_uid(harness)
+    report_payload = analysis_report_dict(
+        base_graph_revision=1,
+        analyzed_source_digest=sync.repository_source_digest,
+        candidate_nodes=[
+            {
+                "id": "behavior.answer-question",
+                "kind": "behavior",
+                "title": "Answer repository questions",
+            }
+        ],
+        candidate_edges=[
+            {
+                "id": EDGE_USES,
+                "type": "uses",
+                "source_id": "behavior.answer-question",
+                "target_id": "capability.text-transform",
+                "evidence": [
+                    {
+                        "id": analysis_ulid("evid", 20),
+                        "kind": "code_entity",
+                        "entity_uid": uid,
+                        "relative_path": "pkg/a.py",
+                        "start_line": 1,
+                        "end_line": 2,
+                    }
+                ],
+            }
+        ],
+        candidate_flows=[
+            {
+                "behavior_id": "behavior.answer-question",
+                "materialization_status": "unmaterialized",
+            }
+        ],
+        candidate_mappings=[
+            {
+                "id": MAP_ID,
+                "subject_kind": "node",
+                "subject_id": "behavior.answer-question",
+                "entity_uid": uid,
+                "role": "supporting",
+                "resolution_status": "resolved",
+            }
+        ],
+        change_operations=[
+            {
+                "kind": "update_node",
+                "target_id": "behavior.answer-question",
+                "before_revision": 1,
+                "change_kind": "update",
+                "change_group": "refresh-behavior",
+            },
+            {
+                "kind": "update_edge",
+                "target_id": EDGE_USES,
+                "before_revision": 1,
+                "change_kind": "move",
+                "change_group": "move-implementation",
+            },
+            {
+                "kind": "set_logical_flow",
+                "target_id": "behavior.answer-question",
+                "before_revision": 1,
+                "change_kind": "update",
+                "change_group": "refresh-behavior",
+            },
+            {
+                "kind": "update_mapping",
+                "target_id": MAP_ID,
+                "before_revision": 1,
+                "change_kind": "move",
+                "change_group": "move-implementation",
+            },
+        ],
+    )
+    report = validate_analysis_report(
+        analysis_report_bytes(report_payload), 1, sync.repository_source_digest
+    )
+
+    proposal = harness.service.create_proposal_from_analysis(
+        report, "reinitialize understanding"
+    )
+    assert [operation.kind.value for operation in proposal.operations] == [
+        "update_node",
+        "update_edge",
+        "set_logical_flow",
+        "update_mapping",
+    ]
+    assert [operation.expected_revision for operation in proposal.operations] == [
+        1,
+        1,
+        1,
+        1,
+    ]
+    assert harness.pending.load(proposal.proposal_id).operations == proposal.operations
+    result = harness.service.apply_cognitive_proposal(
+        proposal.proposal_id, approval_for(proposal)
+    )
+
+    assert result.graph_revision == 2
+    graph = harness.formal_store.load().graph
+    behavior = next(
+        node for node in graph.nodes if node["id"] == "behavior.answer-question"
+    )
+    assert behavior["title"] == "Answer repository questions"
+    assert graph.logical_flows[0]["materialization_status"] == "unmaterialized"
+    assert graph.implementation_mappings[0]["role"] == "supporting"
+
+
+def test_invalid_analysis_change_fails_before_pending_proposal_write(
+    harness: M1aHarness,
+) -> None:
+    initial = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+    harness.service.apply_cognitive_proposal(initial.proposal_id, approval_for(initial))
+    sync = harness.fact_sync.sync()
+    payload = analysis_report_dict(
+        base_graph_revision=1,
+        analyzed_source_digest=sync.repository_source_digest,
+        change_operations=[
+            {
+                "kind": "remove_node",
+                "target_id": "behavior.answer-question",
+                "before_revision": 1,
+                "change_kind": "remove",
+                "change_group": "remove-behavior",
+            }
+        ],
+    )
+    report = validate_analysis_report(
+        analysis_report_bytes(payload), 1, sync.repository_source_digest
+    )
+    pending = harness.repo_root / ".codecortex/.cache/pending_proposals"
+    before = set(pending.iterdir()) if pending.exists() else set()
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        harness.service.create_proposal_from_analysis(
+            report, "invalid implicit cascade"
+        )
+
+    assert excinfo.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+    assert (set(pending.iterdir()) if pending.exists() else set()) == before
+
+
+def test_stale_analysis_target_precondition_fails_before_pending_write(
+    harness: M1aHarness,
+) -> None:
+    initial = harness.service.create_proposal_from_analysis(
+        _full_report(harness), "initialize understanding"
+    )
+    harness.service.apply_cognitive_proposal(initial.proposal_id, approval_for(initial))
+    sync = harness.fact_sync.sync()
+    payload = analysis_report_dict(
+        base_graph_revision=1,
+        analyzed_source_digest=sync.repository_source_digest,
+        candidate_nodes=[
+            {
+                "id": "behavior.answer-question",
+                "kind": "behavior",
+                "title": "Stale update",
+            }
+        ],
+        change_operations=[
+            {
+                "kind": "update_node",
+                "target_id": "behavior.answer-question",
+                "before_revision": 99,
+                "change_kind": "update",
+                "change_group": "stale-update",
+            }
+        ],
+    )
+    report = validate_analysis_report(
+        analysis_report_bytes(payload), 1, sync.repository_source_digest
+    )
+    pending = harness.repo_root / ".codecortex/.cache/pending_proposals"
+    before = set(pending.iterdir()) if pending.exists() else set()
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        harness.service.create_proposal_from_analysis(report, "stale target")
+
+    assert excinfo.value.code is ErrorCode.ANALYSIS_REPORT_INVALID
+    assert (set(pending.iterdir()) if pending.exists() else set()) == before
+
+
 def test_m1a_view_manifest_rejects_hand_edited_managed_view(
     harness: M1aHarness, repo_root: Path
 ) -> None:

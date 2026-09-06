@@ -39,6 +39,7 @@ _PROPOSAL_FIELDS = {
     "created_at",
 }
 _OPERATION_FIELDS = {"kind", "target_id", "value"}
+_OPERATION_FIELDS_WITH_PRECONDITION = _OPERATION_FIELDS | {"expected_revision"}
 _REVISION_FIELDS = {
     "revision_number",
     "reason",
@@ -299,7 +300,11 @@ def _operation_to_json(operation: PatchOperation) -> dict[str, object]:
 
 
 def _operation_from_json(data: Mapping[str, object]) -> PatchOperation:
-    if set(data) != _OPERATION_FIELDS:
+    operation_fields = frozenset(data)
+    if operation_fields not in {
+        frozenset(_OPERATION_FIELDS),
+        frozenset(_OPERATION_FIELDS_WITH_PRECONDITION),
+    }:
         raise ValueError("patch operation fields are invalid")
     value = data["value"]
     if value is not None and not isinstance(value, dict):
@@ -308,7 +313,15 @@ def _operation_from_json(data: Mapping[str, object]) -> PatchOperation:
         kind=_string(data, "kind"),
         target_id=_string(data, "target_id"),
         value=value,
+        expected_revision=_expected_revision(data),
     )
+
+
+def _expected_revision(data: Mapping[str, object]) -> int | str | None:
+    value = data.get("expected_revision")
+    if value is None or isinstance(value, str) or type(value) is int:
+        return value
+    raise TypeError("patch operation expected_revision is invalid")
 
 
 def _revision_to_json(revision: ProposalRevision) -> dict[str, object]:

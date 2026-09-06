@@ -153,6 +153,200 @@ def test_full_report_with_every_candidate_kind_passes() -> None:
     assert report.diagnostics == ("pkg/b.py: 解析跳过",)
 
 
+def test_explicit_change_operations_are_typed_and_bound_to_candidates() -> None:
+    report = _validate(
+        _valid_report(
+            candidate_edges=[_edge()],
+            change_operations=[
+                {
+                    "kind": "update_edge",
+                    "target_id": analysis_ulid("edge", 1),
+                    "before_revision": 2,
+                    "change_kind": "move",
+                    "change_group": "relocate-retrieval",
+                }
+            ],
+        )
+    )
+
+    assert report.change_operations is not None
+    operation = report.change_operations[0]
+    assert operation.kind == "update_edge"
+    assert operation.before_revision == 2
+    assert operation.change_kind == "move"
+    assert operation.change_group == "relocate-retrieval"
+
+
+@pytest.mark.parametrize(
+    "change_operations",
+    [
+        [
+            {
+                "kind": "update_node",
+                "target_id": "capability.source-retrieval",
+                "before_revision": None,
+                "change_kind": "update",
+                "change_group": "update-retrieval",
+            }
+        ],
+        [
+            {
+                "kind": "remove_node",
+                "target_id": "capability.source-retrieval",
+                "before_revision": 1,
+                "change_kind": "remove",
+                "change_group": "remove-retrieval",
+            },
+            {
+                "kind": "remove_node",
+                "target_id": "capability.source-retrieval",
+                "before_revision": 1,
+                "change_kind": "remove",
+                "change_group": "remove-retrieval-again",
+            },
+        ],
+        [
+            {
+                "kind": "add_node",
+                "target_id": "capability.source-retrieval",
+                "before_revision": None,
+                "change_kind": "merge",
+                "change_group": "merge-retrieval",
+            }
+        ],
+        [
+            {
+                "kind": "add_node",
+                "target_id": "capability.source-retrieval",
+                "before_revision": None,
+                "change_kind": "remove",
+                "change_group": "contradictory-label",
+            }
+        ],
+    ],
+)
+def test_explicit_change_operations_reject_incomplete_preconditions_and_groups(
+    change_operations: list[dict[str, object]],
+) -> None:
+    error = _invalid(
+        _valid_report(
+            candidate_nodes=[_node()],
+            change_operations=change_operations,
+        )
+    )
+
+    assert error.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
+def test_structural_change_groups_expand_only_to_explicit_primitives() -> None:
+    edge_id = analysis_ulid("edge", 30)
+    mapping_id = analysis_ulid("map", 30)
+    report = _validate(
+        _valid_report(
+            candidate_nodes=[
+                _node("capability.merge-target"),
+                _node("capability.split-source"),
+                _node("capability.split-result"),
+            ],
+            candidate_edges=[_edge(edge_id)],
+            candidate_mappings=[_mapping(mapping_id)],
+            change_operations=[
+                {
+                    "kind": "update_node",
+                    "target_id": "capability.merge-target",
+                    "before_revision": 1,
+                    "change_kind": "merge",
+                    "change_group": "merge-capabilities",
+                },
+                {
+                    "kind": "remove_node",
+                    "target_id": "capability.merge-source",
+                    "before_revision": 1,
+                    "change_kind": "merge",
+                    "change_group": "merge-capabilities",
+                },
+                {
+                    "kind": "update_node",
+                    "target_id": "capability.split-source",
+                    "before_revision": 1,
+                    "change_kind": "split",
+                    "change_group": "split-capability",
+                },
+                {
+                    "kind": "add_node",
+                    "target_id": "capability.split-result",
+                    "before_revision": None,
+                    "change_kind": "split",
+                    "change_group": "split-capability",
+                },
+                {
+                    "kind": "update_edge",
+                    "target_id": edge_id,
+                    "before_revision": 1,
+                    "change_kind": "move",
+                    "change_group": "move-behavior",
+                },
+                {
+                    "kind": "update_mapping",
+                    "target_id": mapping_id,
+                    "before_revision": 1,
+                    "change_kind": "conflict",
+                    "change_group": "resolve-user-intent",
+                },
+            ],
+        )
+    )
+
+    assert {operation.change_kind.value for operation in report.change_operations or ()} == {
+        "move",
+        "merge",
+        "split",
+        "conflict",
+    }
+
+
+def test_explicit_flow_removal_requires_no_candidate_value() -> None:
+    report = _validate(
+        _valid_report(
+            change_operations=[
+                {
+                    "kind": "remove_logical_flow",
+                    "target_id": "behavior.repository-qa",
+                    "before_revision": 2,
+                    "change_kind": "remove",
+                    "change_group": "remove-obsolete-flow",
+                }
+            ]
+        )
+    )
+
+    assert report.candidate_flows == ()
+    assert report.change_operations is not None
+    assert report.change_operations[0].kind == "remove_logical_flow"
+
+
+def test_explicit_report_rejects_unreferenced_or_missing_candidate_values() -> None:
+    unreferenced = _invalid(
+        _valid_report(candidate_nodes=[_node()], change_operations=[])
+    )
+    missing = _invalid(
+        _valid_report(
+            change_operations=[
+                {
+                    "kind": "update_node",
+                    "target_id": "capability.source-retrieval",
+                    "before_revision": 1,
+                    "change_kind": "update",
+                    "change_group": "update-retrieval",
+                }
+            ]
+        )
+    )
+
+    assert unreferenced.code is ErrorCode.ANALYSIS_REPORT_INVALID
+    assert missing.code is ErrorCode.ANALYSIS_REPORT_INVALID
+
+
 def test_default_limits_match_design_cap() -> None:
     limits = AnalysisLimits()
 

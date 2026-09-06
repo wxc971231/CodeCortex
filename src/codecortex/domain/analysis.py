@@ -78,6 +78,7 @@ _REPORT_KEYS = frozenset(
         "diagnostics",
     }
 )
+_REPORT_KEYS_WITH_CHANGES = _REPORT_KEYS | {"change_operations"}
 _SCOPE_KEYS = frozenset({"mode", "files", "modules"})
 _COVERAGE_KEYS = frozenset({"analyzed_partitions", "unexamined_partitions"})
 _NODE_KEYS = frozenset(
@@ -125,6 +126,48 @@ _EVIDENCE_KEYS = frozenset(
     {"id", "kind", "entity_uid", "relative_path", "start_line", "end_line", "observation"}
 )
 _EVIDENCE_REQUIRED = frozenset({"id", "kind"})
+_CHANGE_OPERATION_KEYS = frozenset(
+    {"kind", "target_id", "before_revision", "change_kind", "change_group"}
+)
+
+
+class AnalysisOperationKind(StrEnum):
+    """Executable stable-ID primitives an Analyzer may request."""
+
+    ADD_NODE = "add_node"
+    UPDATE_NODE = "update_node"
+    REMOVE_NODE = "remove_node"
+    ADD_EDGE = "add_edge"
+    UPDATE_EDGE = "update_edge"
+    REMOVE_EDGE = "remove_edge"
+    SET_LOGICAL_FLOW = "set_logical_flow"
+    REMOVE_LOGICAL_FLOW = "remove_logical_flow"
+    ADD_MAPPING = "add_mapping"
+    UPDATE_MAPPING = "update_mapping"
+    REMOVE_MAPPING = "remove_mapping"
+
+
+class AnalysisChangeKind(StrEnum):
+    """Audit classification for one deterministic primitive group."""
+
+    ADD = "add"
+    UPDATE = "update"
+    REMOVE = "remove"
+    MOVE = "move"
+    MERGE = "merge"
+    SPLIT = "split"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisChangeOperation:
+    """One explicit report operation with an expected target revision."""
+
+    kind: AnalysisOperationKind
+    target_id: str
+    before_revision: int | None
+    change_kind: AnalysisChangeKind
+    change_group: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +219,7 @@ class AnalysisReport:
     uncertainties: tuple[str, ...]
     unmapped_regions: tuple[str, ...]
     diagnostics: tuple[str, ...]
+    change_operations: tuple[AnalysisChangeOperation, ...] | None = None
 
 
 class _ReportState:
@@ -225,7 +269,8 @@ def validate_analysis_report(
         raise _invalid("Analysis report is not valid JSON") from error
     if not isinstance(data, dict):
         raise _invalid("Analysis report must be a JSON object")
-    if set(data) != _REPORT_KEYS:
+    report_keys = frozenset(data)
+    if report_keys not in {_REPORT_KEYS, _REPORT_KEYS_WITH_CHANGES}:
         raise _invalid(
             "Analysis report top-level fields do not match the schema",
             actual=sorted(str(key) for key in data),
@@ -256,6 +301,13 @@ def validate_analysis_report(
     flows = _parse_flows(data["candidate_flows"], limits, state)
     mappings = _parse_mappings(data["candidate_mappings"], limits, state)
     evidence = _parse_evidence_list(data["evidence"], "evidence", limits, state)
+    change_operations = (
+        None
+        if "change_operations" not in data
+        else _parse_change_operations(
+            data["change_operations"], nodes, edges, flows, mappings
+        )
+    )
     return AnalysisReport(
         schema_version=1,
         base_graph_revision=base_graph_revision,
@@ -274,7 +326,190 @@ def validate_analysis_report(
             data["unmapped_regions"], "unmapped_regions", limits
         ),
         diagnostics=_parse_text_list(data["diagnostics"], "diagnostics", limits),
+        change_operations=change_operations,
     )
+
+
+def _parse_change_operations(
+    raw: object,
+    nodes: tuple[SemanticNode, ...],
+    edges: tuple[CognitiveEdge, ...],
+    flows: tuple[LogicalFlow, ...],
+    mappings: tuple[ImplementationMapping, ...],
+) -> tuple[AnalysisChangeOperation, ...]:
+    items = _as_list(raw, "change_operations")
+    candidates = {
+        **{("node", node.id): node for node in nodes},
+        **{("edge", edge.id): edge for edge in edges},
+        **{("flow", flow.behavior_id): flow for flow in flows},
+        **{("mapping", mapping.id): mapping for mapping in mappings},
+    }
+    consumed: set[tuple[str, str]] = set()
+    targeted: set[tuple[str, str]] = set()
+    operations: list[AnalysisChangeOperation] = []
+    groups: dict[str, list[AnalysisChangeOperation]] = {}
+    for index, item in enumerate(items):
+        location = f"change_operations[{index}]"
+        mapping = _as_mapping(
+            item, location, _CHANGE_OPERATION_KEYS, _CHANGE_OPERATION_KEYS
+        )
+        kind = _enum(mapping["kind"], AnalysisOperationKind, f"{location}.kind")
+        change_kind = _enum(
+            mapping["change_kind"], AnalysisChangeKind, f"{location}.change_kind"
+        )
+        target_value = mapping["target_id"]
+        object_kind = _operation_object_kind(kind)
+        _validate_operation_target(
+            object_kind, target_value, f"{location}.target_id"
+        )
+        target_id = str(target_value)
+        target = (object_kind, target_id)
+        if target in targeted:
+            raise _invalid("Duplicate change operation target", field=location)
+        targeted.add(target)
+        before_revision = mapping["before_revision"]
+        if before_revision is not None and (
+            type(before_revision) is not int or before_revision < 1
+        ):
+            raise _invalid(
+                "before_revision must be null or a positive integer",
+                field=f"{location}.before_revision",
+            )
+        if kind.value.startswith("add_") and before_revision is not None:
+            raise _invalid(
+                "Add operations require a null before_revision",
+                field=f"{location}.before_revision",
+            )
+        if (
+            kind.value.startswith(("update_", "remove_"))
+            and kind is not AnalysisOperationKind.REMOVE_LOGICAL_FLOW
+            and before_revision is None
+        ) or (
+            kind is AnalysisOperationKind.REMOVE_LOGICAL_FLOW
+            and before_revision is None
+        ):
+            raise _invalid(
+                "Update and remove operations require a before_revision",
+                field=f"{location}.before_revision",
+            )
+        requires_candidate = not kind.value.startswith("remove_")
+        if requires_candidate:
+            if target not in candidates:
+                raise _invalid(
+                    "Change operation has no matching candidate value", field=location
+                )
+            consumed.add(target)
+        group = mapping["change_group"]
+        if not isinstance(group, str) or _SLUG.fullmatch(group) is None:
+            raise _invalid(
+                "change_group must be a lowercase slug",
+                field=f"{location}.change_group",
+            )
+        operation = AnalysisChangeOperation(
+            kind=kind,
+            target_id=target_id,
+            before_revision=before_revision,
+            change_kind=change_kind,
+            change_group=group,
+        )
+        operations.append(operation)
+        groups.setdefault(group, []).append(operation)
+    unused = set(candidates) - consumed
+    if unused:
+        raise _invalid(
+            "Explicit change report contains candidate values without operations",
+            actual=sorted(f"{kind}:{identifier}" for kind, identifier in unused),
+        )
+    _validate_change_groups(groups)
+    return tuple(operations)
+
+
+def _operation_object_kind(kind: AnalysisOperationKind) -> str:
+    if kind.value.endswith("_node"):
+        return "node"
+    if kind.value.endswith("_edge"):
+        return "edge"
+    if kind.value.endswith("_mapping"):
+        return "mapping"
+    return "flow"
+
+
+def _validate_operation_target(object_kind: str, target: object, field: str) -> None:
+    valid = False
+    if object_kind == "node":
+        valid = isinstance(target, str) and _NODE_ID.fullmatch(target) is not None
+    elif object_kind == "edge":
+        valid = _valid_ulid_id(target, "edge")
+    elif object_kind == "mapping":
+        valid = _valid_ulid_id(target, "map")
+    else:
+        valid = (
+            isinstance(target, str)
+            and target.startswith("behavior.")
+            and _NODE_ID.fullmatch(target) is not None
+        )
+    if not valid:
+        raise _invalid("Change operation target ID is malformed", field=field)
+
+
+def _validate_change_groups(
+    groups: dict[str, list[AnalysisChangeOperation]],
+) -> None:
+    for group, operations in groups.items():
+        kinds = {operation.change_kind for operation in operations}
+        if len(kinds) != 1:
+            raise _invalid(
+                "All operations in a change_group require one change_kind",
+                field=group,
+            )
+        change_kind = next(iter(kinds))
+        primitive_kinds = {operation.kind for operation in operations}
+        if change_kind in {
+            AnalysisChangeKind.ADD,
+            AnalysisChangeKind.UPDATE,
+            AnalysisChangeKind.REMOVE,
+        } and any(
+            not _primitive_matches_basic_change(change_kind, operation)
+            for operation in operations
+        ):
+            raise _invalid(
+                "Change kind contradicts its executable primitive",
+                field=group,
+            )
+        if change_kind is AnalysisChangeKind.MERGE and not (
+            len(operations) >= 2
+            and AnalysisOperationKind.REMOVE_NODE in primitive_kinds
+            and any(kind is not AnalysisOperationKind.REMOVE_NODE for kind in primitive_kinds)
+        ):
+            raise _invalid(
+                "A merge group requires an explicit node removal and survivor/reference operation",
+                field=group,
+            )
+        if change_kind is AnalysisChangeKind.SPLIT and not (
+            len(operations) >= 2
+            and AnalysisOperationKind.ADD_NODE in primitive_kinds
+            and any(kind is not AnalysisOperationKind.ADD_NODE for kind in primitive_kinds)
+        ):
+            raise _invalid(
+                "A split group requires an explicit node addition and reference operation",
+                field=group,
+            )
+
+
+def _primitive_matches_basic_change(
+    change_kind: AnalysisChangeKind, operation: AnalysisChangeOperation
+) -> bool:
+    if change_kind is AnalysisChangeKind.ADD:
+        return operation.kind.value.startswith("add_") or (
+            operation.kind is AnalysisOperationKind.SET_LOGICAL_FLOW
+            and operation.before_revision is None
+        )
+    if change_kind is AnalysisChangeKind.UPDATE:
+        return operation.kind.value.startswith("update_") or (
+            operation.kind is AnalysisOperationKind.SET_LOGICAL_FLOW
+            and operation.before_revision is not None
+        )
+    return operation.kind.value.startswith("remove_")
 
 
 def _header_revision(value: object) -> int:

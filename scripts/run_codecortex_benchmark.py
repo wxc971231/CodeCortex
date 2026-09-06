@@ -514,25 +514,14 @@ class BenchmarkHarness:
         lock = RepositoryLock(root)
         sync = FactSyncService(repository, repository_lock=lock)
         first = sync.sync("full")
-        baseline = SourceBaseline(
-            1,
-            1,
-            1,
-            first.repository_source_digest,
-            tuple(
-                {"relative_path": path, "content_digest": digest}
-                for path, digest in sync.database.source_file_digests().items()
-            ),
-        )
         FormalStore(repository).initialize(
             FormalState(
-                manifest=Manifest(1, 0, True, first.repository_source_digest),
+                manifest=Manifest(1, 0, False, None),
                 graph=CognitiveGraph.empty(),
                 entity_refs=EntityRefs.empty(),
-                source_baseline=baseline,
+                source_baseline=SourceBaseline.empty(),
             )
         )
-        sync.database.replace_baseline_entity_snapshots(first.repository_source_digest)
         self._apply_formal_graph_fixture(repository, lock, sync, first.repository_source_digest)
         (root / ".gitignore").write_text(".codecortex/.cache/\n", encoding="utf-8")
 
@@ -574,6 +563,28 @@ class BenchmarkHarness:
                 )
             mapping["entity_uid"] = uid
             mappings.append(mapping)
+        change_operations = [
+            {
+                "kind": kind,
+                "target_id": str(candidate[id_field]),
+                "before_revision": None,
+                "change_kind": "add",
+                "change_group": f"seed-{object_kind}-{index:04d}",
+            }
+            for object_kind, kind, id_field, candidates in (
+                ("node", "add_node", "id", template["candidate_nodes"]),
+                ("edge", "add_edge", "id", template["candidate_edges"]),
+                (
+                    "flow",
+                    "set_logical_flow",
+                    "behavior_id",
+                    template["candidate_flows"],
+                ),
+                ("mapping", "add_mapping", "id", mappings),
+            )
+            for index, candidate in enumerate(candidates, start=1)
+            if isinstance(candidate, dict)
+        ]
         report_payload = json.dumps(
             {
                 "schema_version": 1,
@@ -592,6 +603,7 @@ class BenchmarkHarness:
                 "candidate_edges": template["candidate_edges"],
                 "candidate_flows": template["candidate_flows"],
                 "candidate_mappings": mappings,
+                "change_operations": change_operations,
                 "evidence": [],
                 "uncertainties": [],
                 "unmapped_regions": ["src/forge/cli.py"],

@@ -581,6 +581,10 @@ Core 才更新正式图
 
 已有正式 `intent`、用户确认或用户修正的内容不会被静默覆盖。代码与用户确认意图冲突时，Proposal 必须明确展示冲突和对应审批历史。
 
+reinitialize 的 AnalysisReport 必须通过显式 stable-ID 操作表达 add/update/remove；
+每个 update/remove 绑定目标当前 revision，move/merge/split/conflict 只是对完整
+原语组的审计分类。报告未列出的已有对象保持不变；任何删除都必须有独立显式原语。
+
 真正清空认知图属于单独的破坏性操作，不进入普通 `reinitialize`，也不属于 MVP 的必要功能。
 
 ## 11. Proposal 与审批

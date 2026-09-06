@@ -163,6 +163,7 @@ _CHANGE_SET_SUMMARY_REQUIRED_FIELDS = {
     "unmapped_changes",
 }
 _OPERATION_FIELDS = {"kind", "target_id", "value"}
+_OPERATION_FIELDS_WITH_PRECONDITION = _OPERATION_FIELDS | {"expected_revision"}
 _DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SEMANTIC_NODE_ID_PATTERN = re.compile(
     r"(?:responsibility|behavior|capability)\.[a-z0-9]+(?:-[a-z0-9]+)*\Z"
@@ -1089,10 +1090,12 @@ class FormalStore:
                     _string(operation, "kind"),
                     _string(operation, "target_id"),
                     operation.get("value"),
+                    expected_revision=operation.get("expected_revision"),
                 )
                 for operation in operations
                 if isinstance(operation, Mapping)
-                and set(operation) == _OPERATION_FIELDS
+                and set(operation)
+                in (_OPERATION_FIELDS, _OPERATION_FIELDS_WITH_PRECONDITION)
             )
         except (CodeCortexError, KeyError, TypeError) as error:
             self._raise_corrupt("History event proposal operations are invalid", cause=error)

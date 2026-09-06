@@ -38,9 +38,15 @@ class PatchOperationInput(_Dto):
     kind: PatchOperationKind
     target_id: str = Field(min_length=1, max_length=256)
     value: dict[str, Any] | None = None
+    expected_revision: int | Literal["absent"] | None = None
 
     def to_domain(self) -> PatchOperation:
-        return PatchOperation(self.kind, self.target_id, self.value)
+        return PatchOperation(
+            self.kind,
+            self.target_id,
+            self.value,
+            expected_revision=self.expected_revision,
+        )
 
 
 class ProposalInput(_Dto):

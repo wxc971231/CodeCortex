@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from codecortex.application.proposals import (
@@ -10,7 +12,10 @@ from codecortex.application.proposals import (
     operations_from_report,
 )
 from codecortex.domain.analysis import (
+    AnalysisChangeKind,
+    AnalysisChangeOperation,
     AnalysisCoverage,
+    AnalysisOperationKind,
     AnalysisReport,
     AnalysisScope,
 )
@@ -249,8 +254,274 @@ def test_operations_from_report_emits_stable_id_operations_in_order() -> None:
     assert mapping.target_id == MAP_ID
 
 
+def test_explicit_report_updates_existing_objects_without_add_conflicts() -> None:
+    report = _report()
+    report = replace(
+        report,
+        change_operations=(
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.UPDATE_NODE,
+                    "behavior.answer-question",
+                    1,
+                    AnalysisChangeKind.UPDATE,
+                    "refresh-existing",
+                ),
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.UPDATE_EDGE,
+                    EDGE_ID,
+                    1,
+                    AnalysisChangeKind.MOVE,
+                    "move-behavior",
+                ),
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.SET_LOGICAL_FLOW,
+                    "behavior.answer-question",
+                    1,
+                    AnalysisChangeKind.UPDATE,
+                    "refresh-existing",
+                ),
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.UPDATE_MAPPING,
+                    MAP_ID,
+                    1,
+                    AnalysisChangeKind.MOVE,
+                    "move-behavior",
+                ),
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.ADD_NODE,
+                    "responsibility.answering",
+                    None,
+                    AnalysisChangeKind.ADD,
+                    "add-parent",
+                ),
+        ),
+    )
+    current = _graph(
+        nodes=(
+            {
+                "id": "behavior.answer-question",
+                "kind": "behavior",
+                "title": "Old title",
+                "node_revision": 1,
+            },
+        ),
+        edges=(
+            {
+                "id": EDGE_ID,
+                "type": "contains",
+                "source_id": "responsibility.old",
+                "target_id": "behavior.answer-question",
+                "edge_revision": 1,
+            },
+        ),
+        flows=({**FLOW_VALUE, "flow_revision": 1},),
+        mappings=({**MAPPING_VALUE, "mapping_revision": 1},),
+    )
+
+    operations = operations_from_report(
+        report, current, cognition_initialized=True
+    )
+
+    assert [operation.kind for operation in operations] == [
+        PatchOperationKind.UPDATE_NODE,
+        PatchOperationKind.UPDATE_EDGE,
+        PatchOperationKind.SET_LOGICAL_FLOW,
+        PatchOperationKind.UPDATE_MAPPING,
+        PatchOperationKind.ADD_NODE,
+    ]
+
+
+def test_explicit_report_removals_are_never_inferred_from_missing_candidates() -> None:
+    report = replace(
+        _report(),
+        candidate_nodes=(),
+        candidate_edges=(),
+        candidate_flows=(),
+        candidate_mappings=(),
+        change_operations=(
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.REMOVE_MAPPING,
+                    MAP_ID,
+                    1,
+                    AnalysisChangeKind.REMOVE,
+                    "remove-obsolete",
+                ),
+        ),
+    )
+    current = _graph(
+        nodes=(
+            {
+                "id": "capability.keep-me",
+                "kind": "capability",
+                "title": "Keep me",
+                "node_revision": 1,
+            },
+        ),
+        mappings=({**MAPPING_VALUE, "mapping_revision": 1},),
+    )
+
+    operations = operations_from_report(
+        report, current, cognition_initialized=True
+    )
+    applied = apply_operations_to_graph(current, operations, EVENT_ID, 2)
+
+    assert [node["id"] for node in applied.nodes] == ["capability.keep-me"]
+    assert applied.implementation_mappings == ()
+
+
+def test_explicit_report_rejects_a_stale_target_revision() -> None:
+    report = replace(
+        _report(),
+        candidate_edges=(),
+        candidate_flows=(),
+        candidate_mappings=(),
+        change_operations=(
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.UPDATE_NODE,
+                    "behavior.answer-question",
+                    1,
+                    AnalysisChangeKind.UPDATE,
+                    "refresh-existing",
+                ),
+                AnalysisChangeOperation(
+                    AnalysisOperationKind.ADD_NODE,
+                    "responsibility.answering",
+                    None,
+                    AnalysisChangeKind.ADD,
+                    "add-parent",
+                ),
+        ),
+    )
+    current = _graph(
+        nodes=(
+            {
+                "id": "behavior.answer-question",
+                "kind": "behavior",
+                "title": "Current",
+                "node_revision": 2,
+            },
+        ),
+        revision=2,
+    )
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        operations_from_report(report, current, cognition_initialized=True)
+
+    _invalid(excinfo)
+    assert "before_revision" in str(excinfo.value)
+
+
+def test_legacy_add_only_report_is_rejected_after_initialization() -> None:
+    with pytest.raises(CodeCortexError) as excinfo:
+        operations_from_report(_report(), _graph(), cognition_initialized=True)
+
+    _invalid(excinfo)
+
+
+def test_explicit_flow_removal_maps_to_the_existing_null_set_primitive() -> None:
+    report = replace(
+        _report(),
+        candidate_nodes=(),
+        candidate_edges=(),
+        candidate_flows=(),
+        candidate_mappings=(),
+        change_operations=(
+            AnalysisChangeOperation(
+                AnalysisOperationKind.REMOVE_LOGICAL_FLOW,
+                "behavior.answer-question",
+                1,
+                AnalysisChangeKind.REMOVE,
+                "remove-obsolete-flow",
+            ),
+        ),
+    )
+    graph = _graph(flows=({**FLOW_VALUE, "flow_revision": 1},))
+
+    operations = operations_from_report(
+        report, graph, cognition_initialized=True
+    )
+
+    assert len(operations) == 1
+    assert operations[0].kind is PatchOperationKind.SET_LOGICAL_FLOW
+    assert operations[0].value is None
+    assert operations[0].expected_revision == 1
+
+
+def test_apply_rechecks_an_analysis_target_revision_precondition() -> None:
+    operation = PatchOperation(
+        "update_node",
+        "behavior.answer-question",
+        {
+            "id": "behavior.answer-question",
+            "kind": "behavior",
+            "title": "New title",
+        },
+        expected_revision=1,
+    )
+    graph = _graph(
+        nodes=(
+            {
+                "id": "behavior.answer-question",
+                "kind": "behavior",
+                "title": "Current title",
+                "node_revision": 2,
+            },
+        ),
+        revision=2,
+    )
+
+    with pytest.raises(CodeCortexError) as excinfo:
+        apply_operations_to_graph(graph, (operation,), EVENT_ID, 3)
+
+    _invalid(excinfo)
+    assert "expected revision" in str(excinfo.value)
+
+
 def test_affected_nodes_from_report_collects_semantic_subjects() -> None:
     assert affected_nodes_from_report(_report()) == (
+        "behavior.answer-question",
+        "responsibility.answering",
+    )
+
+
+def test_affected_nodes_include_existing_objects_touched_by_explicit_removals() -> None:
+    report = replace(
+        _report(),
+        candidate_nodes=(),
+        candidate_edges=(),
+        candidate_flows=(),
+        candidate_mappings=(),
+        change_operations=(
+            AnalysisChangeOperation(
+                AnalysisOperationKind.REMOVE_EDGE,
+                EDGE_ID,
+                1,
+                AnalysisChangeKind.MOVE,
+                "move-behavior",
+            ),
+            AnalysisChangeOperation(
+                AnalysisOperationKind.REMOVE_MAPPING,
+                MAP_ID,
+                1,
+                AnalysisChangeKind.REMOVE,
+                "remove-mapping",
+            ),
+        ),
+    )
+    graph = _graph(
+        edges=(
+            {
+                "id": EDGE_ID,
+                "type": "contains",
+                "source_id": "responsibility.answering",
+                "target_id": "behavior.answer-question",
+                "edge_revision": 1,
+            },
+        ),
+        mappings=({**MAPPING_VALUE, "mapping_revision": 1},),
+    )
+
+    assert affected_nodes_from_report(report, graph) == (
         "behavior.answer-question",
         "responsibility.answering",
     )

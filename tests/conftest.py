@@ -291,11 +291,12 @@ def analysis_report_dict(
     uncertainties=(),
     unmapped_regions=(),
     diagnostics=(),
+    change_operations=None,
     analyzed_partitions=("src/codecortex",),
     unexamined_partitions=(),
 ) -> dict:
     """Return a minimally valid M1a AnalysisReport payload as a dict."""
-    return {
+    report = {
         "schema_version": 1,
         "base_graph_revision": base_graph_revision,
         "analyzed_source_digest": analyzed_source_digest,
@@ -313,6 +314,9 @@ def analysis_report_dict(
         "unmapped_regions": list(unmapped_regions),
         "diagnostics": list(diagnostics),
     }
+    if change_operations is not None:
+        report["change_operations"] = list(change_operations)
+    return report
 
 
 def analysis_report_bytes(report: dict) -> bytes:

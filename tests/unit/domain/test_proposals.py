@@ -179,6 +179,19 @@ def test_patch_digest_ignores_json_key_order() -> None:
     assert len(canonical_patch_digest((first,))) == 71
 
 
+def test_analysis_precondition_is_covered_by_the_patch_digest() -> None:
+    unbound = PatchOperation("add_node", "behavior.answer-question", node_payload())
+    bound = PatchOperation(
+        "add_node",
+        "behavior.answer-question",
+        node_payload(),
+        expected_revision="absent",
+    )
+
+    assert canonical_patch_digest((unbound,)) != canonical_patch_digest((bound,))
+    assert bound.to_canonical_value()["expected_revision"] == "absent"
+
+
 def test_patch_digest_changes_when_operation_order_changes() -> None:
     """Treating an ordered patch as a set could approve a different resulting graph."""
     add = add_node_operation()

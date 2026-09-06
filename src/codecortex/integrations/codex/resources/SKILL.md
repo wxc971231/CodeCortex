@@ -86,6 +86,28 @@ user-confirmed intent: conflicts remain explicit Proposal operations for the
 user to discuss and approve. "No deletion proposed" is an explicit outcome,
 not permission to erase unmentioned nodes.
 
+The reinitialize AnalysisReport must include `change_operations`; candidate
+collections alone are not a diff. Each operation has exactly
+`kind`, `target_id`, `before_revision`, `change_kind`, and `change_group`.
+Use the existing stable-ID primitives (`add/update/remove_node`,
+`add/update/remove_edge`, `set_logical_flow`, `remove_logical_flow`, and
+`add/update/remove_mapping`). A non-remove operation references its after
+value by the same stable ID in exactly one candidate collection. Use null
+`before_revision` only when the target must be absent; update/remove requires
+the exact positive object revision from the existing graph. Never infer a
+remove from an omitted candidate.
+
+`change_kind` is one of add/update/remove/move/merge/split/conflict and
+`change_group` is a lowercase slug shared by all primitives for that change.
+These are audit labels, not magic operations: spell out every edge, flow, and
+mapping rewire. A merge group needs an explicit `remove_node` plus a retained
+or rewired primitive; a split group needs an explicit `add_node` plus an
+updated or rewired primitive. Mark a concrete proposed conflict resolution
+with `conflict`; if no deterministic primitive resolution is ready, report it
+under `uncertainties` and do not invent an operation. Initial analysis may
+omit `change_operations` only while `cognition_initialized=false`, in which
+case Core retains the legacy add-only interpretation.
+
 The user approving analysis or an Analyzer dispatch is not Proposal approval.
 Apply only if the user explicitly approves the exact, currently displayed
 `proposal_id` and `patch_digest`; a changed/revised/stale patch needs fresh
