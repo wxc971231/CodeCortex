@@ -153,6 +153,9 @@ def _default_services(
         else ReadOnlyRepositoryLock(repository.root)
     )
     cache_directory = repository.root / ".codecortex" / ".cache"
+    freshness_store = FreshnessStore(
+        cache_directory, repository_root=repository.root
+    )
     facts = FactsDatabase(
         cache_directory / "facts.sqlite3",
         read_only=(profile == "analyzer"),
@@ -199,7 +202,7 @@ def _default_services(
             formal_store=formal_store,
             fact_sync=fact_sync,
             facts=facts,
-            freshness_store=FreshnessStore(cache_directory),
+            freshness_store=freshness_store,
             repository_lock=repository_lock,
             cognitive_replica=replica,
             lock_timeout_seconds=lock_timeout_seconds,
@@ -211,7 +214,7 @@ def _default_services(
         formal_store=formal_store,
         fact_sync=fact_sync,
         facts=facts,
-        freshness_store=FreshnessStore(cache_directory),
+        freshness_store=freshness_store,
         repository_lock=repository_lock,
         recovery_service=recovery,
         lock_timeout_seconds=lock_timeout_seconds,
@@ -247,7 +250,7 @@ def _default_services(
             formal_store=formal_store,
             fact_sync=fact_sync,
             facts=facts,
-            freshness_store=FreshnessStore(cache_directory),
+            freshness_store=freshness_store,
             repository_lock=repository_lock,
             lock_timeout_seconds=lock_timeout_seconds,
         ),

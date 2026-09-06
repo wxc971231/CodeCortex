@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -21,8 +23,15 @@ from codecortex.infrastructure.jsonio import write_json_atomic
 class FreshnessStore:
     """Persist an effective ChangeSet without treating the cache as formal truth."""
 
-    def __init__(self, cache_root: Path) -> None:
+    def __init__(
+        self, cache_root: Path, *, repository_root: Path | None = None
+    ) -> None:
         self.cache_root = Path(cache_root)
+        self._repository_root = (
+            self.cache_root.parent.parent
+            if repository_root is None
+            else Path(repository_root)
+        )
         self.freshness_path = self.cache_root / "freshness.json"
         self.change_sets_path = self.cache_root / "change_sets"
 
@@ -61,19 +70,25 @@ class FreshnessStore:
             return None
         path = self.change_set_path(change_set_id)
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            raw = json.loads(_read_text_no_follow(path, self._repository_root))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError("Effective ChangeSet cache payload is unreadable") from error
         if not isinstance(raw, Mapping):
             raise TypeError("Effective ChangeSet cache payload must be an object")
         return _from_json(raw)
 
     def _effective_id_or_none(self) -> str | None:
-        if not self.freshness_path.exists():
-            return None
         try:
-            raw = json.loads(self.freshness_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            encoded = _read_text_no_follow(
+                self.freshness_path, self._repository_root
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError) as error:
+            raise ValueError("Freshness cache pointer is unreadable") from error
+        try:
+            raw = json.loads(encoded)
+        except json.JSONDecodeError as error:
             raise ValueError("Freshness cache pointer is unreadable") from error
         if not isinstance(raw, Mapping) or set(raw) != {
             "schema_version",
@@ -85,6 +100,56 @@ class FreshnessStore:
         ):
             raise ValueError("Freshness cache pointer is unsupported")
         return raw["effective_change_set_id"]
+
+
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _read_text_no_follow(path: Path, repository_root: Path) -> str:
+    """Read one regular repository file through an anchored descriptor chain."""
+    if ".." in path.parts:
+        raise OSError("Freshness cache path contains parent traversal")
+    root = Path(os.path.abspath(repository_root))
+    target = Path(os.path.abspath(path))
+    try:
+        relative = target.relative_to(root)
+    except ValueError as error:
+        raise OSError("Freshness cache path escapes the repository") from error
+    if not relative.parts:
+        raise OSError("Freshness cache path does not name a file")
+
+    directories: list[int] = []
+    descriptor: int | None = None
+    try:
+        directories.append(os.open(root, _DIRECTORY_FLAGS))
+        for component in relative.parts[:-1]:
+            directories.append(
+                os.open(component, _DIRECTORY_FLAGS, dir_fd=directories[-1])
+            )
+        descriptor = os.open(
+            relative.parts[-1], _READ_FLAGS, dir_fd=directories[-1]
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("Freshness cache target is not a regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = None
+            return stream.read()
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        for directory in reversed(directories):
+            os.close(directory)
 
 
 def _to_json(change_set: ChangeSet) -> dict[str, object]:

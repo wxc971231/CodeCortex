@@ -92,3 +92,45 @@ def test_corrupt_pointer_cannot_escape_change_set_directory(tmp_path) -> None:
 
     assert raised.value.code is ErrorCode.INVALID_ID
     assert outside.read_text(encoding="utf-8") == "must not be read or removed"
+
+
+def test_freshness_pointer_read_rejects_symlink_escape(tmp_path) -> None:
+    root = tmp_path / "repository"
+    store = FreshnessStore(
+        root / ".codecortex" / ".cache", repository_root=root
+    )
+    change_set = _change_set(
+        "chg_01J00000000000000000000001", "sha256:" + "b" * 64
+    )
+    store.replace_effective(change_set)
+    outside = tmp_path / "outside-freshness.json"
+    outside.write_bytes(store.freshness_path.read_bytes())
+    store.freshness_path.unlink()
+    store.freshness_path.symlink_to(outside)
+    before = outside.read_bytes()
+
+    with pytest.raises(ValueError, match="pointer is unreadable"):
+        store.load_effective()
+
+    assert outside.read_bytes() == before
+
+
+def test_change_set_payload_read_rejects_symlink_escape(tmp_path) -> None:
+    root = tmp_path / "repository"
+    store = FreshnessStore(
+        root / ".codecortex" / ".cache", repository_root=root
+    )
+    change_set = _change_set(
+        "chg_01J00000000000000000000001", "sha256:" + "b" * 64
+    )
+    store.replace_effective(change_set)
+    payload = store.change_set_path(change_set.change_set_id)
+    outside = tmp_path / "outside-change-set.json"
+    payload.replace(outside)
+    payload.symlink_to(outside)
+    before = outside.read_bytes()
+
+    with pytest.raises(ValueError, match="payload is unreadable"):
+        store.load_effective()
+
+    assert outside.read_bytes() == before
