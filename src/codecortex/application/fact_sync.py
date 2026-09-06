@@ -190,7 +190,12 @@ class FactSyncService:
                     metadata = self._metadata(
                         verified, graph_revision, cache, facts_changed=not self._same_fact_input(cache, verified)
                     )
-                    self._replace_with_full_snapshot(parsed, metadata, verified.diagnostics)
+                    self._replace_with_full_snapshot(
+                        parsed,
+                        metadata,
+                        verified.diagnostics,
+                        checkpoint_existing=cache is not None,
+                    )
                 else:
                     # The first parse set was derived from the verified snapshot;
                     # it is safe only because the digest check above succeeded.
@@ -398,6 +403,8 @@ class FactSyncService:
         parsed: Sequence[ParsedFile],
         metadata: CacheMetadata,
         diagnostics: Sequence[SourceDiagnostic],
+        *,
+        checkpoint_existing: bool,
     ) -> None:
         path = self.database.path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -412,18 +419,27 @@ class FactSyncService:
             )
             if not staging.integrity_ok() or staging.cache_metadata() != metadata:
                 raise FactSyncError("Full fact-cache replacement failed validation")
-            with staging.open_write() as connection:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(f"{path}{suffix}")
-                if sidecar.exists():
-                    sidecar.unlink()
+            self._checkpoint_cache(staging, "Staging")
+            if checkpoint_existing:
+                self._checkpoint_cache(self.database, "Existing")
             os.replace(staging_path, path)
+            for suffix in ("-wal", "-shm"):
+                Path(f"{path}{suffix}").unlink(missing_ok=True)
             _fsync_directory(path.parent)
         finally:
             for candidate in (staging_path, Path(f"{staging_path}-wal"), Path(f"{staging_path}-shm")):
                 if candidate.exists():
                     candidate.unlink()
+
+    @staticmethod
+    def _checkpoint_cache(database: FactsDatabase, label: str) -> None:
+        """Merge and close one healthy WAL coordinate before replacement."""
+        with database.open_write() as connection:
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+        if checkpoint is None or checkpoint[0] != 0:
+            raise FactSyncError(f"{label} fact-cache checkpoint remained busy")
 
     def _graph_revision(self) -> int:
         if self.formal_store is None:
