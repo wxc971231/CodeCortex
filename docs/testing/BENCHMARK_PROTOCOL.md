@@ -53,6 +53,8 @@ The complete per-pair workspace is created outside the artifact directory and
 removed after the pair (or after preparation failure). Persisted artifacts are
 restricted to the sanitized traces and report; temporary `.git/config`, copied
 authentication, and machine-absolute workspace paths must not survive cleanup.
+Workspace cleanup is a checked benchmark step: any removal error makes the
+execution/report fail instead of being silently ignored.
 
 Every raw JSONL trace is sanitized before persistence: redact authentication
 tokens and machine-absolute paths, then retain MCP tool names, source/command
@@ -60,7 +62,10 @@ access, final answer, token counts and elapsed time. Approval/resume testing
 is a separate non-ephemeral mode; it must not be folded into ordinary
 single-turn results.
 
-Tool events retain trace order and duplicates. Materialization prompt counts
+Tool events retain trace order and duplicates. Because JSONL traces expose MCP
+tool events rather than Analyzer process-start events, the metric is explicitly
+the number of `codecortex-analyzer`/`codecortex_analyzer` tool calls, including
+duplicates. Materialization prompt counts
 come only from actual assistant messages, never MCP payload text, while route
 and anchor validation remains bound to matching MCP call/result records. The
 preselected A case must show analysis-backed Proposal creation without apply;
@@ -74,7 +79,7 @@ the B case rejects every Proposal or baseline-mutation tool action.
 - forbidden/stale claim count;
 - required uncertainty disclosure;
 - route, Analyzer, materialization prompt, MCP-call and mutation compliance;
-- input/output tokens, latency, Analyzer count and prompt count.
+- input/output tokens, latency, Analyzer tool-call count and prompt count.
 
 The scorer uses frozen phrase markers and source ranges, so it is repeatable
 but intentionally **not** a semantic judge. A scorecard always requires

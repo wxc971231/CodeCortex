@@ -42,6 +42,7 @@ from codecortex.domain.graph import (
     Evidence,
     validate_cognitive_graph,
 )
+from codecortex.infrastructure.persistence.sqlite_safety import read_only_sqlite_uri
 
 _REPLICA_SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 10_000
@@ -508,6 +509,7 @@ class GraphReplica:
         path: Path,
         *,
         read_only: bool = False,
+        repository_root: Path | None = None,
         entity_refs: Iterable[EntityRefRecord]
         | Callable[[], Iterable[EntityRefRecord]] = (),
         history_events: Iterable[HistoryEventRecord]
@@ -515,6 +517,11 @@ class GraphReplica:
     ) -> None:
         self.path = Path(path)
         self._read_only = read_only
+        self._repository_root = (
+            None if repository_root is None else Path(repository_root)
+        )
+        if read_only and self._repository_root is None:
+            raise ValueError("Read-only cognitive replica requires a repository root")
         self._entity_refs = (
             entity_refs if callable(entity_refs) else lambda: entity_refs
         )
@@ -582,13 +589,10 @@ class GraphReplica:
         uri = f"{self.path.resolve().as_uri()}?mode=ro"
         if not self._read_only:
             return uri
-        wal_exists = Path(f"{self.path}-wal").exists()
-        shm_exists = Path(f"{self.path}-shm").exists()
-        if shm_exists and not wal_exists:
-            raise sqlite3.OperationalError(
-                "Read-only cognitive replica has an incomplete WAL coordinate"
-            )
-        return uri if wal_exists else f"{uri}&immutable=1"
+        assert self._repository_root is not None
+        return read_only_sqlite_uri(
+            self.path, self._repository_root, label="cognitive replica"
+        )
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:

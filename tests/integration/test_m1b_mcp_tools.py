@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -149,6 +150,29 @@ async def test_analyzer_rejects_prepared_freshness_after_live_source_changes(
         )
 
     assert '"code": "CACHE_REBUILD_REQUIRED"' in str(raised.value)
+
+
+@pytest.mark.anyio
+async def test_analyzer_freshness_routes_map_sqlite_failures_to_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    services, _ = _services(tmp_path)
+    assert services.preflight_service is not None
+    monkeypatch.setattr(
+        services.preflight_service.facts,
+        "cache_metadata",
+        lambda: (_ for _ in ()).throw(sqlite3.DatabaseError("malformed page")),
+    )
+    analyzer = build_server("analyzer", services)
+
+    for tool_name, arguments in (
+        ("cognitive_freshness", {}),
+        ("pending_changes", {}),
+        ("effective_query_freshness", {}),
+    ):
+        with pytest.raises(ToolError) as raised:
+            await analyzer.call_tool(tool_name, arguments)
+        assert '"code": "CACHE_REBUILD_REQUIRED"' in str(raised.value)
 
 
 @pytest.mark.anyio

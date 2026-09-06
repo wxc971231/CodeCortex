@@ -58,17 +58,10 @@ async def test_stdio_server_handles_sequential_requests_and_logs_to_stderr(
 
     assert overview.is_error is False
     assert overview.structured_content["schema_version"] == 1
-    assert validation.is_error is False
-    assert validation.structured_content == {
-        "schema_version": 1,
-        "valid": True,
-        "issues": [],
-    }
-    assert graph.is_error is False
-    assert graph.structured_content["nodes"] == []
-    assert missing_node.is_error is True
-    error_text = missing_node.content[0].text
-    error_payload = json.loads(error_text[error_text.index("{") :])
-    assert error_payload["schema_version"] == 1
-    assert error_payload["error"]["code"] == "ANALYSIS_REPORT_INVALID"
+    for result in (validation, graph, missing_node):
+        assert result.is_error is True
+        error_text = result.content[0].text
+        error_payload = json.loads(error_text[error_text.index("{") :])
+        assert error_payload["schema_version"] == 1
+        assert error_payload["error"]["code"] == "NOT_INITIALIZED"
     assert "CodeCortex MCP server started" in stderr_path.read_text(encoding="utf-8")

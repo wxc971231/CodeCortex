@@ -180,7 +180,7 @@ class Trace:
     cognitive_anchor_ids: tuple[str, ...] = ()
     source_references: tuple[SourceReference, ...] = ()
     mcp_tool_names: tuple[str, ...] = ()
-    analyzer_count: int = 0
+    analyzer_tool_call_count: int = 0
     materialization_prompt_count: int = 0
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -198,7 +198,7 @@ class Trace:
         if any(not isinstance(name, str) or not name for name in self.mcp_tool_names):
             raise ValueError("Trace MCP tool names must be non-empty strings")
         for value, name in (
-            (self.analyzer_count, "analyzer count"),
+            (self.analyzer_tool_call_count, "Analyzer tool-call count"),
             (self.materialization_prompt_count, "materialization prompt count"),
         ):
             if type(value) is not int or value < 0:
@@ -219,7 +219,7 @@ class ScoreCard:
     stale_claim_count: int
     uncertainty_disclosed: bool
     route_compliant: bool
-    analyzer_count: int
+    analyzer_tool_call_count: int
     materialization_prompt_count: int
     input_tokens: int | None
     output_tokens: int | None
@@ -281,7 +281,7 @@ def score_answer(case: BenchmarkCase, answer: str, trace: Trace) -> ScoreCard:
         stale_claim_count=stale_claim_count,
         uncertainty_disclosed=uncertainty_disclosed,
         route_compliant=route_compliant,
-        analyzer_count=trace.analyzer_count,
+        analyzer_tool_call_count=trace.analyzer_tool_call_count,
         materialization_prompt_count=trace.materialization_prompt_count,
         input_tokens=trace.input_tokens,
         output_tokens=trace.output_tokens,
@@ -501,7 +501,7 @@ def _route_compliant(case: BenchmarkCase, trace: Trace) -> bool:
         )
     ):
         return False
-    if not case.analyzer_permitted and trace.analyzer_count:
+    if not case.analyzer_permitted and trace.analyzer_tool_call_count:
         return False
     if not case.materialization_prompt_permitted and trace.materialization_prompt_count:
         return False

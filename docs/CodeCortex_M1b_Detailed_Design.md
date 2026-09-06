@@ -313,7 +313,7 @@ cache 缺失或不匹配时：
 
 恢复 cache 是确定性操作；此时未被正式引用的历史实体可能无法恢复，因此 ChangeSet 明确标记 `entity_diff_completeness=partial`。判断源码变化是否改变认知是之后按需执行的独立语义任务。
 
-若 revision-0 正式骨架已经存在但 cache 缺失，Main 在显式 full Fact Sync 后只重建 bootstrap replica，不重复 initialize。恢复返回前必须再次探测 live Managed Source digest；发生竞争变化时 fail closed。Analyzer 只使用不创建、不修复的只读 handles，拒绝不安全 lock 路径、损坏数据库和孤立 `-shm` sidecar；有效的 live `-wal` 可只读消费而不得被 checkpoint、删除或改写。
+若 revision-0 正式骨架已经存在但 cache 缺失，Main 在显式 full Fact Sync 后只重建 bootstrap replica，不重复 initialize。恢复返回前必须再次探测 live Managed Source digest；发生竞争变化时 fail closed。Analyzer 只使用不创建、不修复的只读 handles，并在打开数据库和 sidecar 前逐级拒绝符号链接、越界路径和非普通文件。`-wal` 与 `-shm` 必须成对存在；WAL-only、孤立 `-shm` 或损坏数据库都返回 `CACHE_REBUILD_REQUIRED`，由 Main 恢复，Analyzer 不得创建 SHM、checkpoint、删除或改写文件。
 
 ## 16. M1b MCP 增量
 
@@ -392,7 +392,7 @@ JSONL trace 保存：MCP calls、源码/命令访问、最终回答、turn resul
 - 回答可理解性；
 - 输入/输出 token；
 - 首次回答延迟；
-- Analyzer 启动次数；
+- Analyzer MCP tool-call 次数（trace 没有进程启动事件时不得表述为启动次数）；
 - 不必要审批/展开提示次数。
 
 Native 与 CodeCortex 进行盲化人工抽查。产品约束是固定 Benchmark 上图外问题不出现系统性或统计显著退化，不承诺逐题必胜。

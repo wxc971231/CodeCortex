@@ -370,7 +370,7 @@ class BenchmarkHarness:
             self._clone(seed, native)
             self._clone(seed, augmented)
             if case.fixture_state == "cache-deleted":
-                shutil.rmtree(augmented / ".codecortex" / ".cache", ignore_errors=True)
+                shutil.rmtree(augmented / ".codecortex" / ".cache")
             native_home = workspace / "native-codex-home"
             augmented_home = workspace / "codecortex-codex-home"
             native_home.mkdir()
@@ -392,8 +392,11 @@ class BenchmarkHarness:
                 codecortex_codex_home=augmented_home,
                 workspace=workspace,
             )
-        except BaseException:
-            shutil.rmtree(workspace, ignore_errors=True)
+        except BaseException as preparation_error:
+            try:
+                self._remove_workspace(workspace)
+            except BenchmarkExecutionError as cleanup_error:
+                raise cleanup_error from preparation_error
             raise
 
     def run_case(self, prepared: PreparedCase) -> BenchmarkCaseResult:
@@ -484,7 +487,20 @@ class BenchmarkHarness:
 
     def cleanup(self, prepared: PreparedCase) -> None:
         """Remove the whole temporary workspace, including copied auth and Git data."""
-        shutil.rmtree(prepared.workspace, ignore_errors=True)
+        self._remove_workspace(prepared.workspace)
+
+    @staticmethod
+    def _remove_workspace(workspace: Path) -> None:
+        try:
+            shutil.rmtree(workspace)
+        except OSError as error:
+            raise BenchmarkExecutionError(
+                f"Benchmark workspace cleanup failed for {workspace.name}"
+            ) from error
+        if workspace.exists():
+            raise BenchmarkExecutionError(
+                f"Benchmark workspace cleanup failed for {workspace.name}"
+            )
 
     def _workspace_parent(self) -> str:
         return tempfile.gettempdir()
@@ -840,8 +856,17 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
                 repetitions=config.repetitions,
                 error=str(error),
             )
-        finally:
+        try:
             harness.cleanup(prepared)
+        except BenchmarkExecutionError as error:
+            report = BenchmarkReport(
+                status="failed",
+                execution_status="failed",
+                corpus_id=corpus_identifier(config.corpus),
+                corpus_digest=corpus_file_digest(config.corpus),
+                repetitions=config.repetitions,
+                error=str(error),
+            )
         write_benchmark_report(config.artifact_dir, report)
         return report
     results: list[BenchmarkCaseResult] = []

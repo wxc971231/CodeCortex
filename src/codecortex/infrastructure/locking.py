@@ -128,7 +128,12 @@ def _open_read_only_lock(repository_root: Path) -> int:
             os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
             dir_fd=current,
         )
-        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+        try:
+            is_regular = stat.S_ISREG(os.fstat(lock_descriptor).st_mode)
+        except OSError:
+            os.close(lock_descriptor)
+            raise
+        if not is_regular:
             os.close(lock_descriptor)
             raise OSError("Repository cache lock is not a regular file")
         return lock_descriptor

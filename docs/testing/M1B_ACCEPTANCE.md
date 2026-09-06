@@ -54,7 +54,8 @@ model, reasoning effort, sandbox, prompt, per-turn timeout, fixture source
 tree, and temporary Git commit.  Browser auth is copied only to temporary
 homes. The entire per-pair temporary workspace (both Git copies, the seed, and
 both homes) lives outside the artifact directory and is deleted after each pair,
-including preparation failures.
+including preparation failures. Cleanup is part of execution validity: a
+removal failure produces a failed report and can never be accepted as a pass.
 
 Artifacts retain only sanitized JSONL under `traces/` plus
 `benchmark_report.json`: source/command access, MCP names, final answer,

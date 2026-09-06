@@ -3,6 +3,7 @@
 import hashlib
 import os
 import re
+import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -221,6 +222,18 @@ class ApplicationServices:
                 )
             return operation()
 
+    def run_analyzer_query_read[QueryResult](
+        self, operation: Callable[[], QueryResult]
+    ) -> QueryResult:
+        """Execute an Analyzer query only against initialized cognition."""
+        with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+            if not self.formal_store.load().manifest.cognition_initialized:
+                raise CodeCortexError(
+                    ErrorCode.NOT_INITIALIZED,
+                    "Analyzer cognition queries require initialized repository cognition",
+                )
+            return operation()
+
     def plan_discussion(
         self,
         question_scope: QuestionScope,
@@ -337,7 +350,7 @@ class ApplicationServices:
                 )
         except CodeCortexError:
             raise
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
             raise _freshness_cache_error("Prepared freshness cache is unreadable") from error
 
     def repository_facts(

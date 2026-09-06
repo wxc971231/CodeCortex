@@ -68,7 +68,17 @@ def _main_query[QueryResult](
             if not allow_m1a_bootstrap or error.code is not ErrorCode.NOT_INITIALIZED:
                 raise
             return services.run_m1a_bootstrap_read(operation)
-    return operation()
+        return operation()
+    return _analyzer_guarded_read(services, preflight, operation)
+
+
+def _analyzer_guarded_read[QueryResult](
+    services: ApplicationServices,
+    main_profile: bool,
+    operation: Callable[[], QueryResult],
+) -> QueryResult:
+    """Require initialized cognition for Analyzer-only read composition."""
+    return operation() if main_profile else services.run_analyzer_query_read(operation)
 
 
 def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:
@@ -149,7 +159,9 @@ def _register_read_tools(
     @server.tool(name="history_event")
     async def history_event(event_id: str) -> tools.HistoryEventOutput:
         try:
-            return tools.history_event(services, event_id)
+            return _analyzer_guarded_read(
+                services, preflight, lambda: tools.history_event(services, event_id)
+            )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:
@@ -158,7 +170,9 @@ def _register_read_tools(
     @server.tool(name="validate_graph")
     async def validate_graph() -> tools.ValidationOutput:
         try:
-            return tools.validate_graph(services)
+            return _analyzer_guarded_read(
+                services, preflight, lambda: tools.validate_graph(services)
+            )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:
@@ -311,7 +325,11 @@ def _register_read_tools(
     @server.tool(name="cognitive_freshness")
     async def cognitive_freshness() -> tools.CognitiveFreshnessOutput:
         try:
-            return tools.cognitive_freshness(services, preflight=preflight)
+            return _analyzer_guarded_read(
+                services,
+                preflight,
+                lambda: tools.cognitive_freshness(services, preflight=preflight),
+            )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except (TypeError, ValueError) as error:
@@ -323,8 +341,12 @@ def _register_read_tools(
         limit: int = 50,
     ) -> tools.PendingChangesOutput:
         try:
-            return tools.pending_changes(
-                services, cursor=cursor, limit=limit, preflight=preflight
+            return _analyzer_guarded_read(
+                services,
+                preflight,
+                lambda: tools.pending_changes(
+                    services, cursor=cursor, limit=limit, preflight=preflight
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
@@ -338,12 +360,16 @@ def _register_read_tools(
         max_unmapped_changes: int = 50,
     ) -> tools.EffectiveQueryFreshnessOutput:
         try:
-            return tools.effective_query_freshness(
+            return _analyzer_guarded_read(
                 services,
-                node_ids=node_ids or (),
-                entity_ids=entity_ids or (),
-                max_unmapped_changes=max_unmapped_changes,
-                preflight=preflight,
+                preflight,
+                lambda: tools.effective_query_freshness(
+                    services,
+                    node_ids=node_ids or (),
+                    entity_ids=entity_ids or (),
+                    max_unmapped_changes=max_unmapped_changes,
+                    preflight=preflight,
+                ),
             )
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error

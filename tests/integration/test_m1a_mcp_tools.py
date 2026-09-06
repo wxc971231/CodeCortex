@@ -130,7 +130,10 @@ def _write_sources(root: Path) -> None:
 
 @pytest.fixture
 def m1a_repo(
-    tmp_path: Path, replica_entity_refs, replica_history_events
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replica_entity_refs,
+    replica_history_events,
 ) -> ApplicationServices:
     root = tmp_path / "repo"
     root.mkdir()
@@ -146,6 +149,12 @@ def m1a_repo(
         history_events=replica_history_events,
     )
     replica.rebuild(build_discussion_graph(graph_revision=1), 1)
+    # This module isolates M1a query projection. The production Analyzer
+    # initialization gate is exercised with real formal state in the M1b MCP
+    # integration suite.
+    monkeypatch.setattr(
+        app, "run_analyzer_query_read", lambda operation: operation()
+    )
     return app
 
 
@@ -212,9 +221,12 @@ async def test_inspect_node_tool_uses_m1a_query_projection(m1a_repo) -> None:
         ),
         evidence=(),
     )
-    overview = SimpleNamespace(cognition_initialized=True)
     with (
-        patch.object(m1a_repo, "repository_overview", return_value=overview),
+        patch.object(
+            m1a_repo,
+            "repository_overview",
+            return_value=SimpleNamespace(cognition_initialized=True),
+        ),
         patch.object(m1a_repo, "inspect_node", return_value=inspection),
     ):
         server = build_server("analyzer", m1a_repo)
@@ -449,13 +461,18 @@ async def test_sync_repository_facts_main_only(m1a_repo) -> None:
 
 
 @pytest.fixture
-def zero_cap_repo(tmp_path: Path) -> ApplicationServices:
+def zero_cap_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> ApplicationServices:
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     app = _compose(root, max_graph_objects=0)
     app.initialize_repository()
     _apply_node(app, "behavior.answer-question")
+    monkeypatch.setattr(
+        app, "run_analyzer_query_read", lambda operation: operation()
+    )
     return app
 
 

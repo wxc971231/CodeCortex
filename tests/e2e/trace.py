@@ -94,7 +94,10 @@ def parse_sanitized_trace(raw: str, *, elapsed_ms: int | None = None) -> ParsedT
         values, tool_names, anchors, materialization_count
     )
     input_tokens, output_tokens = _token_counts(values)
-    analyzer_count = sum("codecortex-analyzer" in name for name in tool_names)
+    analyzer_tool_call_count = sum(
+        re.search(r"codecortex[-_]analyzer", name, re.IGNORECASE) is not None
+        for name in tool_names
+    )
     return ParsedTrace(
         answer=assistant_messages[-1] if assistant_messages else "",
         trace=Trace(
@@ -102,7 +105,7 @@ def parse_sanitized_trace(raw: str, *, elapsed_ms: int | None = None) -> ParsedT
             cognitive_anchor_ids=anchors,
             source_references=references,
             mcp_tool_names=tool_names,
-            analyzer_count=analyzer_count,
+            analyzer_tool_call_count=analyzer_tool_call_count,
             materialization_prompt_count=materialization_count,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -323,11 +326,36 @@ def _assistant_messages_in(value: object, *, top_level: bool) -> Iterable[str]:
 
 def _is_materialization_prompt(message: str) -> bool:
     lowered = message.casefold()
+    standard_expand = re.search(
+        r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:(?:option|choice)\s+)?a"
+        r"(?:\*\*)?\s*(?:[.):]|[-—])\s*(?:\*\*)?[^\n]*\bexpand\b",
+        lowered,
+        re.MULTILINE,
+    )
+    standard_transient = re.search(
+        r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:(?:option|choice)\s+)?b"
+        r"(?:\*\*)?\s*(?:[.):]|[-—])\s*(?:\*\*)?[^\n]*\bkeep\b"
+        r"[^\n]*\btransient\b",
+        lowered,
+        re.MULTILINE,
+    )
+    if standard_expand is not None and standard_transient is not None:
+        return True
+    choice_a = re.search(
+        r"(?:\b(?:option|choice)\s*a\b|^\s*a\s*[.):])",
+        lowered,
+        re.MULTILINE,
+    )
+    choice_b = re.search(
+        r"(?:\b(?:option|choice)\s*b\b|^\s*b\s*[.):])",
+        lowered,
+        re.MULTILINE,
+    )
     return (
         "?" in message
         and re.search(r"\bmaterializ(?:e|ation)\b", lowered) is not None
-        and re.search(r"\b(?:option|choice)\s*a\b", lowered) is not None
-        and re.search(r"\b(?:option|choice)\s*b\b", lowered) is not None
+        and choice_a is not None
+        and choice_b is not None
     )
 
 

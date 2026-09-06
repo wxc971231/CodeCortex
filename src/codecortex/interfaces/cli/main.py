@@ -149,7 +149,9 @@ def _default_services(
     )
     cache_directory = repository.root / ".codecortex" / ".cache"
     facts = FactsDatabase(
-        cache_directory / "facts.sqlite3", read_only=(profile == "analyzer")
+        cache_directory / "facts.sqlite3",
+        read_only=(profile == "analyzer"),
+        repository_root=repository.root,
     )
     fact_sync = FactSyncService(
         repository,
@@ -170,6 +172,7 @@ def _default_services(
         else GraphReplica(
             replica_path,
             read_only=True,
+            repository_root=repository.root,
             entity_refs=entity_refs,
             history_events=history_events,
         )

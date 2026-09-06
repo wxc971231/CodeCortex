@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from codecortex.infrastructure.persistence.sqlite_safety import read_only_sqlite_uri
 from codecortex.infrastructure.python.parser import (
     EntityIdentityHint,
     ParsedFile,
@@ -209,9 +210,20 @@ class FactsDatabase:
     max_relation_entity_uids = 200
     schema_version = _CACHE_SCHEMA_VERSION
 
-    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        read_only: bool = False,
+        repository_root: Path | None = None,
+    ) -> None:
         self.path = Path(path)
         self._read_only = read_only
+        self._repository_root = (
+            None if repository_root is None else Path(repository_root)
+        )
+        if read_only and self._repository_root is None:
+            raise ValueError("Read-only fact cache requires a repository root")
 
     @classmethod
     def create_new(cls, path: Path) -> FactsDatabase:
@@ -260,13 +272,10 @@ class FactsDatabase:
         uri = f"{self.path.resolve().as_uri()}?mode=ro"
         if not self._read_only:
             return uri
-        wal_exists = Path(f"{self.path}-wal").exists()
-        shm_exists = Path(f"{self.path}-shm").exists()
-        if shm_exists and not wal_exists:
-            raise sqlite3.OperationalError(
-                "Read-only fact cache has an incomplete WAL coordinate"
-            )
-        return uri if wal_exists else f"{uri}&immutable=1"
+        assert self._repository_root is not None
+        return read_only_sqlite_uri(
+            self.path, self._repository_root, label="fact cache"
+        )
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:

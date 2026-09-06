@@ -243,3 +243,40 @@ def test_read_only_lock_maps_open_oserror_to_rebuild_required(
         pass
 
     assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+
+
+def test_read_only_lock_closes_every_descriptor_when_fstat_fails(
+    repo_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with RepositoryLock(repo_path).acquire("shared", 0.05):
+        pass
+    opened: list[int] = []
+    closed: list[int] = []
+    open_descriptor = locking.os.open
+    close_descriptor = locking.os.close
+
+    def record_open(*args: object, **kwargs: object) -> int:
+        descriptor = open_descriptor(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        close_descriptor(descriptor)
+
+    monkeypatch.setattr(locking.os, "open", record_open)
+    monkeypatch.setattr(locking.os, "close", record_close)
+    monkeypatch.setattr(
+        locking.os,
+        "fstat",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("fstat failed")),
+    )
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+    assert sorted(opened) == sorted(closed)
