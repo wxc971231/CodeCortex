@@ -146,14 +146,32 @@ def test_cleanup_failure_is_an_explicit_benchmark_failure(
 ) -> None:
     harness = BenchmarkHarness(_config(tmp_path))
     prepared = harness.prepare_case("graph-outside-cli-coding", repetition=1)
-    monkeypatch.setattr(
-        "scripts.run_codecortex_benchmark.shutil.rmtree",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            PermissionError("workspace cannot be removed")
-        ),
-    )
+    try:
+        with monkeypatch.context() as cleanup_failure:
+            cleanup_failure.setattr(
+                "scripts.run_codecortex_benchmark.shutil.rmtree",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    PermissionError("workspace cannot be removed")
+                ),
+            )
 
-    with pytest.raises(BenchmarkExecutionError, match="cleanup failed"):
+            with pytest.raises(BenchmarkExecutionError, match="cleanup failed"):
+                harness.cleanup(prepared)
+            assert prepared.workspace.exists()
+    finally:
+        harness.cleanup(prepared)
+    assert not prepared.workspace.exists()
+
+
+def test_cache_deleted_case_prepares_when_ignored_cache_is_already_absent(
+    tmp_path: Path,
+) -> None:
+    harness = BenchmarkHarness(_config(tmp_path))
+    prepared = harness.prepare_case("cache-deleted-first-query", repetition=1)
+    try:
+        assert not (prepared.codecortex_repo / ".codecortex" / ".cache").exists()
+        assert prepared.native_commit == prepared.codecortex_commit
+    finally:
         harness.cleanup(prepared)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import stat
 from pathlib import Path
@@ -11,8 +12,12 @@ def read_only_sqlite_uri(
     database_path: Path, repository_root: Path, *, label: str
 ) -> str:
     """Return a fail-closed URI for one repository-contained SQLite coordinate."""
-    root = repository_root.absolute()
-    database = database_path.absolute()
+    if ".." in database_path.parts:
+        raise sqlite3.OperationalError(
+            f"Read-only {label} path is unsafe: parent traversal"
+        )
+    root = Path(os.path.abspath(repository_root))
+    database = Path(os.path.abspath(database_path))
     _require_regular_path(database, root, allow_missing=False, label=label)
     wal = database.with_name(f"{database.name}-wal")
     shm = database.with_name(f"{database.name}-shm")

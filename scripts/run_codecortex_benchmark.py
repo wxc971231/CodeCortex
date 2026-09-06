@@ -370,7 +370,9 @@ class BenchmarkHarness:
             self._clone(seed, native)
             self._clone(seed, augmented)
             if case.fixture_state == "cache-deleted":
-                shutil.rmtree(augmented / ".codecortex" / ".cache")
+                cache = augmented / ".codecortex" / ".cache"
+                if cache.exists():
+                    shutil.rmtree(cache)
             native_home = workspace / "native-codex-home"
             augmented_home = workspace / "codecortex-codex-home"
             native_home.mkdir()
