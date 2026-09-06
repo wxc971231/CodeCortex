@@ -153,7 +153,9 @@ def m1a_repo(
     # initialization gate is exercised with real formal state in the M1b MCP
     # integration suite.
     monkeypatch.setattr(
-        app, "run_analyzer_query_read", lambda operation: operation()
+        app,
+        "run_analyzer_query_read",
+        lambda operation, **_kwargs: operation(),
     )
     return app
 
@@ -471,7 +473,9 @@ def zero_cap_repo(
     app.initialize_repository()
     _apply_node(app, "behavior.answer-question")
     monkeypatch.setattr(
-        app, "run_analyzer_query_read", lambda operation: operation()
+        app,
+        "run_analyzer_query_read",
+        lambda operation, **_kwargs: operation(),
     )
     return app
 

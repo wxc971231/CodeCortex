@@ -223,11 +223,17 @@ class ApplicationServices:
             return operation()
 
     def run_analyzer_query_read[QueryResult](
-        self, operation: Callable[[], QueryResult]
+        self,
+        operation: Callable[[], QueryResult],
+        *,
+        allow_m1a_bootstrap: bool = False,
     ) -> QueryResult:
-        """Execute an Analyzer query only against initialized cognition."""
+        """Execute one Analyzer read against an atomic formal-state snapshot."""
         with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
-            if not self.formal_store.load().manifest.cognition_initialized:
+            if (
+                not self.formal_store.load().manifest.cognition_initialized
+                and not allow_m1a_bootstrap
+            ):
                 raise CodeCortexError(
                     ErrorCode.NOT_INITIALIZED,
                     "Analyzer cognition queries require initialized repository cognition",

@@ -52,11 +52,12 @@ def _main_query[QueryResult](
     *,
     allow_m1a_bootstrap: bool = False,
 ) -> QueryResult:
-    """Run Main preflight, except for guarded M1a bootstrap fact reads.
+    """Run the profile-safe gate, including guarded M1a bootstrap fact reads.
 
     The M1a initialization sequence needs ``repository_facts`` and
     ``analysis_scope`` while formal cognition is still uninitialized. Those
-    two callers may continue only after preflight reports that exact state;
+    two tools may continue in either profile only under an atomic formal-state
+    guard;
     their QueryService CacheGuard still requires a synchronized fact cache and
     revision-matched cognitive replica. Every initialized/M1b query retains
     the mandatory preflight path.
@@ -69,16 +70,29 @@ def _main_query[QueryResult](
                 raise
             return services.run_m1a_bootstrap_read(operation)
         return operation()
-    return _analyzer_guarded_read(services, preflight, operation)
+    return _analyzer_guarded_read(
+        services,
+        preflight,
+        operation,
+        allow_m1a_bootstrap=allow_m1a_bootstrap,
+    )
 
 
 def _analyzer_guarded_read[QueryResult](
     services: ApplicationServices,
     main_profile: bool,
     operation: Callable[[], QueryResult],
+    *,
+    allow_m1a_bootstrap: bool = False,
 ) -> QueryResult:
-    """Require initialized cognition for Analyzer-only read composition."""
-    return operation() if main_profile else services.run_analyzer_query_read(operation)
+    """Apply Analyzer's atomic cognition/bootstrap read boundary."""
+    return (
+        operation()
+        if main_profile
+        else services.run_analyzer_query_read(
+            operation, allow_m1a_bootstrap=allow_m1a_bootstrap
+        )
+    )
 
 
 def build_server(profile: Profile, services: ApplicationServices) -> MCPServer:

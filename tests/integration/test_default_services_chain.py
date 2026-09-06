@@ -178,8 +178,6 @@ async def test_analyzer_query_routes_reject_uninitialized_bootstrap_state(
     calls = {
         "cognitive_graph": {},
         "inspect_node": {"node_id": "behavior.missing"},
-        "repository_facts": {"scope": "pkg"},
-        "analysis_scope": {},
         "resolve_entity_context": {"path": "pkg/a.py"},
         "get_discussion_context": {"node_ids": ["behavior.missing"]},
         "search_cognitive_graph": {"query": "missing"},
@@ -194,6 +192,35 @@ async def test_analyzer_query_routes_reject_uninitialized_bootstrap_state(
         with pytest.raises(ToolError) as raised:
             await analyzer.call_tool(tool_name, arguments)
         assert _tool_error_code(raised.value) == "NOT_INITIALIZED"
+
+
+@pytest.mark.anyio
+async def test_analyzer_bootstrap_fact_routes_read_full_synced_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_test_repository(root)
+    monkeypatch.chdir(root)
+    main = _default_services()
+    initialized = main.initialize_repository()
+    synced = main.synchronize_facts("full")
+    analyzer = build_server("analyzer", _default_services("analyzer"))
+
+    facts = await analyzer.call_tool("repository_facts", {"scope": "pkg"})
+    scope = await analyzer.call_tool("analysis_scope", {})
+
+    assert initialized.cognition_initialized is False
+    assert facts.is_error is False
+    assert facts.structured_content["graph_revision"] == 0
+    assert facts.structured_content["repository_source_digest"] == (
+        synced.repository_source_digest
+    )
+    assert scope.is_error is False
+    assert scope.structured_content["graph_revision"] == 0
+    assert scope.structured_content["repository_source_digest"] == (
+        synced.repository_source_digest
+    )
 
 
 @pytest.mark.anyio
