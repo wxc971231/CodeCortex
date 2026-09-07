@@ -32,6 +32,16 @@ class AffectedScopeCalculator:
         statuses = {item.relative_path: item for item in self._facts.source_file_statuses()}
         changed_paths = _changed_paths(change_set)
         changed_uids = _changed_entity_uids(change_set)
+        dependency_uids = set(changed_uids)
+        if change_set.entity_diff_completeness == "partial":
+            # A recovered cache cannot enumerate exact historical changes.
+            # Seed one-hop propagation with all known
+            # entities in changed files, including path-evidence-owned files.
+            dependency_uids.update(
+                uid
+                for uid, entity in (*current.items(), *baseline.items())
+                if entity.relative_path in changed_paths
+            )
         diagnostic_codes = self._facts.diagnostic_codes_for_paths(
             tuple(sorted(path for path in changed_paths if path in statuses))
         ) if changed_paths & set(statuses) else {}
@@ -43,7 +53,7 @@ class AffectedScopeCalculator:
 
         nodes: set[str] = set()
         flows: set[str] = set()
-        entities: set[str] = set(changed_uids)
+        entities: set[str] = set(dependency_uids)
         unmapped: set[UnmappedChange] = set()
         diagnostics: set[str] = set()
         directly_owned: set[str] = set()
@@ -142,10 +152,10 @@ class AffectedScopeCalculator:
 
         # Stage 7: exactly one resolved local dependency hop from directly
         # changed entities.  Never inspect relations for newly reached peers.
-        if changed_uids:
+        if dependency_uids:
             try:
                 relations = self._facts.relations_touching_entity_uids(
-                    tuple(sorted(changed_uids))
+                    tuple(sorted(dependency_uids))
                 )
             except ValueError:
                 diagnostics.add("changed entity set exceeds one-hop relation query bound")
@@ -159,10 +169,10 @@ class AffectedScopeCalculator:
                     continue
                 neighbor = (
                     relation.target_uid
-                    if relation.source_uid in changed_uids
+                    if relation.source_uid in dependency_uids
                     else relation.source_uid
                 )
-                if neighbor is None or neighbor in changed_uids:
+                if neighbor is None or neighbor in dependency_uids:
                     continue
                 entities.add(neighbor)
                 neighbor_path = (

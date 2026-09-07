@@ -1,6 +1,7 @@
 """End-to-end current-fact synchronization over real temporary Git repositories."""
 
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 from codecortex.application.fact_sync import FactSyncService
@@ -26,6 +27,50 @@ def _write(root: Path, relative_path: str, text: str) -> None:
 
 def _service(repository: Repository, **kwargs: object) -> FactSyncService:
     return FactSyncService(repository, **kwargs)
+
+
+def test_incremental_rechecks_parse_coverage_after_concurrent_cache_change(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    original = "def original():\n    return 1\n"
+    _write(repository.root, "app.py", original)
+    peer = _service(repository)
+    initial = peer.sync()
+    expected = peer.database.current_entity_snapshots()
+    lock = RepositoryLock(repository.root)
+
+    class InterleavingLock:
+        fired = False
+
+        @contextmanager
+        def acquire(self, mode, timeout_seconds):
+            if not self.fired:
+                self.fired = True
+                _write(repository.root, "app.py", "def interim():\n    return 2\n")
+                peer.sync()
+                _write(repository.root, "app.py", original)
+            with lock.acquire(mode, timeout_seconds):
+                yield
+
+    service = _service(repository, repository_lock=InterleavingLock())
+    result = service.sync()
+    assert result.repository_source_digest == initial.repository_source_digest
+    assert service.database.source_file_digests() == service._source_snapshot().digests_by_path
+    assert {(item.address, item.fingerprint) for item in service.database.current_entity_snapshots()} == {
+        (item.address, item.fingerprint) for item in expected
+    }
+
+
+def test_full_sync_preserves_historical_baseline_entities(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _write(repository.root, "app.py", "def removed():\n    return 1\n")
+    service = _service(repository)
+    initial = service.sync()
+    service.database.replace_baseline_entity_snapshots(initial.repository_source_digest)
+    expected = service.database.baseline_entity_snapshots()
+    _write(repository.root, "app.py", "value = 2\n")
+    service.sync("full")
+    assert service.database.baseline_entity_snapshots() == expected
+    assert service.database.cache_metadata().baseline_entity_snapshot_completeness == "complete"
 
 
 def test_unchanged_auto_sync_does_not_advance_generation(tmp_path: Path) -> None:

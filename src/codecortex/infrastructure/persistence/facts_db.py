@@ -428,6 +428,25 @@ class FactsDatabase:
             ).fetchall()
         return tuple(_code_relation_from_row(row) for row in rows)
 
+    def copy_baseline_entity_snapshots_from(self, previous: FactsDatabase) -> None:
+        """Preserve historical rows when replacing a healthy cache under its lock."""
+        with previous.open_read() as connection:
+            rows = connection.execute(
+                "SELECT uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature "
+                "FROM baseline_entity_snapshots ORDER BY uid"
+            ).fetchall()
+        with self.open_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM baseline_entity_snapshots")
+            connection.executemany(
+                "INSERT INTO baseline_entity_snapshots "
+                "(uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(tuple(row) for row in rows),
+            )
+
     def replace_baseline_entity_snapshots(self, baseline_source_digest: str) -> None:
         """Copy every current entity into the baseline snapshot table.
 

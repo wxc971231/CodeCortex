@@ -198,8 +198,10 @@ class BaselineAdvanceService:
                 )
             event = _baseline_event(event_id, advanced, current, reason, decision_record, approval_record)
             self.formal_store.commit_baseline_advance(advanced, event)
-
-        warnings = self._refresh_caches(current.current_source_digest)
+            # Keep the accepted fact coordinate stable until its baseline copy
+            # and effective ChangeSet reset are complete. Failures still warn
+            # after the durable formal commit and recover on next preflight.
+            warnings = self._refresh_caches(current.current_source_digest)
         return BaselineAdvanceResult(
             event_id=event_id,
             graph_revision=advanced.manifest.graph_revision,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -112,6 +113,37 @@ def test_baseline_advance_writes_self_contained_event_without_graph_revision_cha
     assert result.event["event_type"] == "cognition_baseline_advanced"
     assert result.event["change_set_summary"]["before_source_digest"] != result.event["change_set_summary"]["after_source_digest"]
     assert service.freshness_store.load_effective() is None
+
+
+def test_baseline_snapshots_are_copied_before_releasing_formal_lock(tmp_path: Path) -> None:
+    service, repository, formal_store = _service(tmp_path)
+    _write(repository.root, "def answer() -> int:\n    return 2\n")
+    ready = service.preflight()
+    assert ready.change_set is not None
+    accepted_digest = ready.change_set.current_source_digest
+    expected = {(item.address, item.fingerprint) for item in service.facts.current_entity_snapshots()}
+    lock = RepositoryLock(repository.root)
+
+    class InterleavingLock:
+        fired = False
+
+        @contextmanager
+        def acquire(self, mode, timeout_seconds):
+            with lock.acquire(mode, timeout_seconds):
+                yield
+            if not self.fired and formal_store.load().manifest.cognition_baseline == accepted_digest:
+                self.fired = True
+                _write(repository.root, "def answer() -> int:\n    return 3\n")
+                service.fact_sync.sync()
+
+    service.repository_lock = InterleavingLock()
+    service.advance(
+        ready.change_set.change_set_id, "no_semantic_change",
+        DecisionRecord("analyzer", "No semantic change.", "2026-09-04T08:00:00Z"), None,
+    )
+    snapshots = service.facts.baseline_entity_snapshots()
+    assert {(item.address, item.fingerprint) for item in snapshots} == expected
+    assert {item.baseline_source_digest for item in snapshots} == {accepted_digest}
 
 
 def test_stale_change_set_does_not_change_formal_baseline(tmp_path: Path) -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from codecortex.application.affected_scope import AffectedScopeCalculator
 from codecortex.application.change_detection import ChangeDetector
 from codecortex.application.fact_sync import FactSyncService
@@ -128,7 +130,8 @@ def test_unmapped_new_file_forces_partial(tmp_path: Path) -> None:
     assert result.unmapped_changes[0].relative_path == "src/new_feature.py"
 
 
-def test_only_one_resolved_dependency_hop_is_propagated(tmp_path: Path) -> None:
+@pytest.mark.parametrize("partial", [False, True])
+def test_only_one_resolved_dependency_hop_is_propagated(tmp_path: Path, partial: bool) -> None:
     repository = _repository(tmp_path)
     _write(repository.root, "a.py", "def source() -> int:\n    return 1\n")
     _write(
@@ -175,9 +178,15 @@ def test_only_one_resolved_dependency_hop_is_propagated(tmp_path: Path) -> None:
     )
     _write(repository.root, "a.py", "def source() -> int:\n    return 2\n")
 
-    result = AffectedScopeCalculator(formal, sync.database).calculate(
-        _change_set(formal, sync)
-    )
+    change_set = _change_set(formal, sync)
+    if partial:
+        sync.database.seed_partial_baseline_entity_snapshots(
+            formal.manifest.cognition_baseline or "", ()
+        )
+        change_set = ChangeDetector().detect(formal, sync.database)
+        assert change_set is not None
+        assert change_set.entity_diff_completeness == "partial"
+    result = AffectedScopeCalculator(formal, sync.database).calculate(change_set)
 
     assert {"behavior.source", "behavior.middle"} <= set(result.affected_nodes)
     assert "behavior.outer" not in result.affected_nodes

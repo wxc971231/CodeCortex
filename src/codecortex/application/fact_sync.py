@@ -171,6 +171,14 @@ class FactSyncService:
                 changed_paths, deleted_paths, counts = self._changes(
                     verified, current_digests, full_rebuild=full_rebuild
                 )
+                parsed_paths = {item.source.source.relative_path for item in parsed}
+                if not set(changed_paths) <= parsed_paths:
+                    # Another writer may have changed facts even if live source
+                    # returned to our original snapshot (A -> B -> A). Every
+                    # newly required path must be parsed before publishing A.
+                    if retry_count == self.max_retries:
+                        raise FactSyncError("Fact cache changed repeatedly during incremental sync")
+                    continue
                 if not full_rebuild and not changed_paths and not deleted_paths:
                     assert cache is not None
                     return FactSyncResult(
@@ -197,8 +205,8 @@ class FactSyncService:
                         checkpoint_existing=cache is not None,
                     )
                 else:
-                    # The first parse set was derived from the verified snapshot;
-                    # it is safe only because the digest check above succeeded.
+                    # Both the source snapshot and required parse coverage were
+                    # verified against the cache coordinate under this lock.
                     selected = tuple(
                         item
                         for item in parsed
@@ -417,6 +425,8 @@ class FactSyncService:
                 metadata=metadata,
                 global_diagnostics=_global_diagnostics(diagnostics),
             )
+            if checkpoint_existing:
+                staging.copy_baseline_entity_snapshots_from(self.database)
             if not staging.integrity_ok() or staging.cache_metadata() != metadata:
                 raise FactSyncError("Full fact-cache replacement failed validation")
             self._checkpoint_cache(staging, "Staging")
