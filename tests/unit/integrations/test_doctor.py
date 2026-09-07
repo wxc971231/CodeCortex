@@ -1,6 +1,7 @@
 """Unit coverage for CodeCortex's read-only installation diagnostics."""
 
 from pathlib import Path
+import subprocess
 
 import pytest
 import tomlkit
@@ -91,7 +92,7 @@ def test_doctor_marks_missing_installed_skill_as_error(
 def test_doctor_validates_repository_formal_state(
     tmp_path: Path, codecortex_executable: Path
 ) -> None:
-    (tmp_path / ".git").mkdir()
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     repository = Repository(tmp_path)
     ApplicationServices(
         repository=repository,
