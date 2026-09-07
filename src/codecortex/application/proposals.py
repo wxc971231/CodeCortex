@@ -73,6 +73,7 @@ from codecortex.infrastructure.persistence.entity_refs import recompute_entity_r
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.views import render_legacy_views
+from codecortex.telemetry import traced
 
 SourceProbe = Callable[[], "ManagedSourceSnapshot"]
 
@@ -470,6 +471,7 @@ class ProposalService:
         self._replica = replica
         self._lock_timeout_seconds = lock_timeout_seconds
 
+    @traced("proposal.create")
     def create_proposal_from_analysis(
         self,
         report: AnalysisReport,
@@ -565,6 +567,7 @@ class ProposalService:
             self._pending.create(proposal)
             return proposal
 
+    @traced("proposal.apply", result=lambda value: {"graph_revision": value.graph_revision, "cache_warning_count": len(value.cache_warnings)})
     def apply_cognitive_proposal(
         self, proposal_id: str, approval: ApprovalRecord
     ) -> GraphApplyResult:
@@ -683,6 +686,7 @@ class ProposalService:
         with self._repository_lock.acquire("exclusive", self._lock_timeout_seconds):
             self._formal_store.recover()
 
+    @traced("proposal.cache_refresh", level="DEBUG", result=lambda value: {"cache_warning_count": len(value)})
     def _refresh_caches(
         self, applied: FormalState, *, baseline_digest: str | None
     ) -> tuple[str, ...]:

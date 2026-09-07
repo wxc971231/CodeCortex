@@ -32,3 +32,6 @@ python -m build
 
 The installer accepts an explicit home directory internally for tests. Do not
 run installation tests against a real user Codex home.
+
+See [Core runtime logging](RUNTIME_LOGGING.md) for DEBUG timings, private rotating
+JSONL files, Conda/MCP configuration, and Analyzer's stderr-only contract.

@@ -27,6 +27,7 @@ from codecortex.infrastructure.persistence.entity_refs import recompute_entity_r
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.python.digest import repository_digest_from_file_digests
+from codecortex.telemetry import traced
 
 BaselineAdvanceReason = Literal["no_semantic_change", "user_accepted"]
 
@@ -150,6 +151,10 @@ class BaselineAdvanceService:
                 "Baseline approval does not match the current ChangeSet digest",
             )
 
+    @traced("baseline.advance", result=lambda value: {
+        "graph_revision": value.graph_revision, "cache_warning_count": len(value.cache_warnings),
+        "current_source_digest": value.current_source_digest,
+    })
     def advance(
         self,
         change_set_id: str,

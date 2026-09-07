@@ -17,6 +17,7 @@ from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.freshness import ChangeSet
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
+from codecortex.telemetry import span, traced
 
 if TYPE_CHECKING:
     from codecortex.application.recovery import RecoveryService
@@ -65,6 +66,11 @@ class PreflightService:
         self.lock_timeout_seconds = lock_timeout_seconds
         self.max_retries = max_retries
 
+    @traced("preflight", result=lambda value: {
+        "repository_source_digest": value.fact_sync.repository_source_digest,
+        "graph_revision": value.fact_sync.graph_revision,
+        "scope_confidence": value.change_set.scope_confidence if value.change_set else "complete",
+    })
     def run(self) -> PreflightResult:
         """Return current facts plus the one baseline-to-current effective ChangeSet."""
         if self.recovery_service is not None and self.recovery_service.requires_recovery():
@@ -76,6 +82,9 @@ class PreflightService:
             )
         self._recover_and_require_initialized()
         for attempt in range(self.max_retries + 1):
+            if attempt:
+                with span("preflight.retry", level="DEBUG") as metrics:
+                    metrics["retry_count"] = attempt
             synced = self.fact_sync.sync("auto")
             with self.repository_lock.acquire("exclusive", self.lock_timeout_seconds):
                 state = self.formal_store.load()

@@ -34,6 +34,7 @@ from codecortex.domain.proposals import PatchOperation, canonical_patch_digest
 from codecortex.infrastructure.jsonio import canonical_json_bytes, write_json_atomic
 from codecortex.infrastructure.python.digest import repository_digest_from_file_digests
 from codecortex.infrastructure.repository import Repository
+from codecortex.telemetry import traced
 
 DEFAULT_CONFIG = b"""schema_version = 1
 
@@ -377,6 +378,7 @@ class FormalStore:
             self._raise_corrupt("History event identity does not match its filename")
         return data
 
+    @traced("formal.commit", level="DEBUG")
     def commit(
         self,
         state: FormalState,
@@ -517,6 +519,7 @@ class FormalStore:
         shutil.rmtree(transaction_directory)
         _fsync_directory(transaction_root)
 
+    @traced("formal.baseline_commit", level="DEBUG")
     def commit_baseline_advance(
         self, state: FormalState, event: Mapping[str, object]
     ) -> None:

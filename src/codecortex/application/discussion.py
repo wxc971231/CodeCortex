@@ -14,6 +14,7 @@ from typing import Literal
 
 from codecortex.application.freshness import FreshnessService, QueryFreshnessResult
 from codecortex.infrastructure.persistence.graph_replica import ContextRequest, GraphHit
+from codecortex.telemetry import traced
 
 DiscussionRoute = Literal[
     "graph_current",
@@ -215,6 +216,7 @@ class DiscussionPlanner:
     def __init__(self, freshness: FreshnessService) -> None:
         self._freshness = freshness
 
+    @traced("discussion.route", result=lambda value: {"route": value.route})
     def plan(
         self,
         question_scope: QuestionScope,
@@ -244,6 +246,7 @@ class DiscussionPlanner:
         invocation.set_anchors(question_scope.confirmed_node_ids)
         return self._plan(question_scope, candidate_ids, invocation)
 
+    @traced("discussion.follow_up", result=lambda value: {"route": value.route})
     def plan_follow_up(self, question: str, invocation: InvocationState) -> DiscussionPlan:
         """Reuse live anchors only; no full transcript is serialized or persisted."""
         if not isinstance(invocation, InvocationState):

@@ -38,6 +38,7 @@ from codecortex.infrastructure.python.parser import (
     parse_python_file,
 )
 from codecortex.infrastructure.repository import Repository
+from codecortex.telemetry import span, traced
 
 SyncMode = Literal["auto", "full"]
 
@@ -118,6 +119,14 @@ class FactSyncService:
         self.max_retries = max_retries
         self._parse_file = parse_file
 
+    @traced("fact_sync", result=lambda value: {
+        "repository_source_digest": value.repository_source_digest,
+        "graph_revision": value.graph_revision, "index_generation": value.index_generation,
+        "parsed_files": value.parsed_files, "added_files": value.added_files,
+        "changed_files": value.changed_files, "deleted_files": value.deleted_files,
+        "retry_count": value.retry_count, "rebuilt": value.rebuilt,
+        "diagnostic_count": len(value.diagnostics),
+    })
     def sync(
         self,
         mode: SyncMode = "auto",
@@ -131,6 +140,9 @@ class FactSyncService:
             raise TypeError("Fact Sync identity hints must be EntityIdentityHint records")
 
         for retry_count in range(self.max_retries + 1):
+            if retry_count:
+                with span("fact_sync.retry", level="DEBUG") as metrics:
+                    metrics["retry_count"] = retry_count
             snapshot = self._source_snapshot()
             cache = self._cache_metadata_or_none()
             current_digests = self._cache_digests_or_empty(cache)
@@ -239,6 +251,9 @@ class FactSyncService:
         """Hash the live managed source set without reading or writing cache state."""
         return self._source_snapshot().repository_source_digest
 
+    @traced("fact_sync.snapshot", level="DEBUG", result=lambda value: {
+        "file_count": len(value.files), "repository_source_digest": value.repository_source_digest,
+    })
     def _source_snapshot(self) -> _SourceSnapshot:
         discovered = discover_python_source_set(self.repository, self.source_config)
         files: list[SourceFileDigest] = []
@@ -264,6 +279,7 @@ class FactSyncService:
             diagnostics=tuple(diagnostics),
         )
 
+    @traced("fact_sync.parse", level="DEBUG", result=lambda value: {"parsed_files": len(value[0])})
     def _parse_required_files(
         self,
         snapshot: _SourceSnapshot,
@@ -406,6 +422,7 @@ class FactSyncService:
             built_at=_utc_now(),
         )
 
+    @traced("fact_sync.replace", level="DEBUG")
     def _replace_with_full_snapshot(
         self,
         parsed: Sequence[ParsedFile],

@@ -10,6 +10,7 @@ from mcp.server import MCPServer
 from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.interfaces.mcp import tools
+from codecortex.telemetry import configure, span, traced
 
 Profile = Literal["main", "analyzer"]
 READ_TOOL_NAMES = frozenset(
@@ -129,10 +130,12 @@ def run_stdio(
     if profile not in ("main", "analyzer"):
         raise ValueError(f"Unsupported MCP profile: {profile}")
     checked_profile = cast(Profile, profile)
+    configure(checked_profile)
     _configure_stderr_logging()
-    services = services_factory()
-    _recover_main_formal_state(checked_profile, services)
-    server = build_server(checked_profile, services)
+    with span("mcp.startup", profile=checked_profile):
+        services = services_factory()
+        _recover_main_formal_state(checked_profile, services)
+        server = build_server(checked_profile, services)
     LOGGER.info("CodeCortex MCP server started with %s profile", checked_profile)
     server.run(transport="stdio")
     return 0
@@ -155,6 +158,7 @@ def _register_read_tools(
     server: MCPServer, services: ApplicationServices, *, preflight: bool
 ) -> None:
     @server.tool(name="repository_overview")
+    @traced("mcp.repository_overview", profile="main" if preflight else "analyzer", root=True)
     async def repository_overview() -> tools.RepositoryOverviewOutput:
         try:
             return tools.repository_overview(services)
@@ -164,6 +168,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_graph")
+    @traced("mcp.cognitive_graph", profile="main" if preflight else "analyzer", root=True)
     async def cognitive_graph() -> tools.CognitiveGraphOutput:
         try:
             return _main_query(
@@ -175,6 +180,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="inspect_node")
+    @traced("mcp.inspect_node", profile="main" if preflight else "analyzer", root=True)
     async def inspect_node(node_id: str) -> tools.InspectNodeOutput:
         try:
             return _main_query(
@@ -186,6 +192,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="history_event")
+    @traced("mcp.history_event", profile="main" if preflight else "analyzer", root=True)
     async def history_event(event_id: str) -> tools.HistoryEventOutput:
         try:
             return _analyzer_guarded_read(
@@ -197,6 +204,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="validate_graph")
+    @traced("mcp.validate_graph", profile="main" if preflight else "analyzer", root=True)
     async def validate_graph() -> tools.ValidationOutput:
         try:
             return _analyzer_guarded_read(
@@ -208,6 +216,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="repository_facts")
+    @traced("mcp.repository_facts", profile="main" if preflight else "analyzer", root=True)
     async def repository_facts(
         scope: str,
         cursor: str | None = None,
@@ -239,6 +248,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="analysis_scope")
+    @traced("mcp.analysis_scope", profile="main" if preflight else "analyzer", root=True)
     async def analysis_scope(
         scope: str | None = None,
         cursor: str | None = None,
@@ -270,6 +280,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="resolve_entity_context")
+    @traced("mcp.resolve_entity_context", profile="main" if preflight else "analyzer", root=True)
     async def resolve_entity_context(
         entity_uid: str | None = None,
         path: str | None = None,
@@ -308,6 +319,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="get_discussion_context")
+    @traced("mcp.get_discussion_context", profile="main" if preflight else "analyzer", root=True)
     async def get_discussion_context(
         node_ids: list[str] | None = None,
         entity_ids: list[str] | None = None,
@@ -366,6 +378,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="search_cognitive_graph")
+    @traced("mcp.search_cognitive_graph", profile="main" if preflight else "analyzer", root=True)
     async def search_cognitive_graph(
         query: str,
         kinds: list[str] | None = None,
@@ -398,6 +411,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_freshness")
+    @traced("mcp.cognitive_freshness", profile="main" if preflight else "analyzer", root=True)
     async def cognitive_freshness() -> tools.CognitiveFreshnessOutput:
         try:
             return _analyzer_guarded_read(
@@ -411,6 +425,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="pending_changes")
+    @traced("mcp.pending_changes", profile="main" if preflight else "analyzer", root=True)
     async def pending_changes(
         cursor: str | None = None,
         limit: int = 50,
@@ -429,6 +444,7 @@ def _register_read_tools(
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="effective_query_freshness")
+    @traced("mcp.effective_query_freshness", profile="main" if preflight else "analyzer", root=True)
     async def effective_query_freshness(
         node_ids: list[str] | None = None,
         entity_ids: list[str] | None = None,
@@ -454,6 +470,7 @@ def _register_read_tools(
 
 def _register_main_tools(server: MCPServer, services: ApplicationServices) -> None:
     @server.tool(name="initialize_repository")
+    @traced("mcp.initialize_repository", profile="main", root=True)
     async def initialize_repository() -> tools.RepositoryOverviewOutput:
         try:
             return tools.initialize_repository(services)
@@ -463,6 +480,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="sync_repository_facts")
+    @traced("mcp.sync_repository_facts", profile="main", root=True)
     async def sync_repository_facts(
         mode: Literal["auto", "full"] = "auto",
     ) -> tools.SyncFactsOutput:
@@ -474,6 +492,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="create_cognitive_proposal")
+    @traced("mcp.create_cognitive_proposal", profile="main", root=True)
     async def create_cognitive_proposal(
         proposal: tools.ProposalInput,
     ) -> tools.ProposalOutput:
@@ -485,6 +504,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="create_cognitive_proposal_from_analysis")
+    @traced("mcp.create_cognitive_proposal_from_analysis", profile="main", root=True)
     async def create_cognitive_proposal_from_analysis(
         proposal: tools.AnalysisProposalInput,
     ) -> tools.ProposalOutput:
@@ -496,6 +516,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="revise_cognitive_proposal")
+    @traced("mcp.revise_cognitive_proposal", profile="main", root=True)
     async def revise_cognitive_proposal(
         proposal_id: str,
         revision: tools.ProposalRevisionInput,
@@ -508,6 +529,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="cognitive_proposal")
+    @traced("mcp.cognitive_proposal", profile="main", root=True)
     async def cognitive_proposal(proposal_id: str) -> tools.ProposalOutput:
         try:
             return tools.cognitive_proposal(services, proposal_id)
@@ -517,6 +539,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="apply_cognitive_proposal")
+    @traced("mcp.apply_cognitive_proposal", profile="main", root=True)
     async def apply_cognitive_proposal(
         proposal_id: str,
         approval_record: tools.ApprovalRecordInput,
@@ -529,6 +552,7 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
             raise tools.as_tool_error(tools.invalid_argument(error)) from error
 
     @server.tool(name="advance_cognition_baseline")
+    @traced("mcp.advance_cognition_baseline", profile="main", root=True)
     async def advance_cognition_baseline(
         change_set_id: str,
         reason: Literal["no_semantic_change", "user_accepted"],

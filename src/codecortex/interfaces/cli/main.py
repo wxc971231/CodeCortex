@@ -45,6 +45,7 @@ from codecortex.infrastructure.python.digest import (
 from codecortex.infrastructure.python.discovery import discover_python_source_set
 from codecortex.infrastructure.repository import Repository, find_repository
 from codecortex.infrastructure.views import render_views
+from codecortex.telemetry import configure, span
 
 ERROR_EXIT = {
     ErrorCode.NOT_INITIALIZED: 3,
@@ -357,6 +358,23 @@ def main(
     """Run the CLI contract, translating domain errors into exit codes."""
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    profile = arguments.profile if arguments.command == "mcp" else "main"
+    configure(profile)
+    with span("cli.command", profile=profile, level="DEBUG") as metrics:
+        code = _execute(arguments, parser, services_factory, install_codex, doctor, mcp, metrics)
+        metrics["exit_code"] = code
+        return code
+
+
+def _execute(
+    arguments: Namespace,
+    parser: ArgumentParser,
+    services_factory: Callable[[], ApplicationServices] | None,
+    install_codex: InstallCodexCommand | None,
+    doctor: DoctorCommand | None,
+    mcp: McpCommand | None,
+    metrics: dict[str, object],
+) -> int:
     as_json = bool(getattr(arguments, "json", False))
     try:
         if arguments.version:
@@ -380,9 +398,11 @@ def main(
         parser.print_help(sys.stderr)
         return USAGE_ERROR_EXIT
     except CodeCortexError as error:
+        metrics.update(error_code=error.code.value, error_class=type(error).__name__)
         _report_error(error, as_json=as_json)
         return ERROR_EXIT.get(error.code, UNEXPECTED_ERROR_EXIT)
-    except Exception:  # noqa: BLE001 - the contract maps any unexpected failure to 10
+    except Exception as error:  # noqa: BLE001 - the contract maps any unexpected failure to 10
+        metrics["error_class"] = type(error).__name__
         traceback.print_exc()
         return UNEXPECTED_ERROR_EXIT
 

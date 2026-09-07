@@ -22,6 +22,7 @@ from codecortex.infrastructure.persistence.facts_db import CodeEntity, FactsData
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.python.parser import EntityIdentityHint, EntityKind
+from codecortex.telemetry import traced
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class RecoveryService:
         self.cognitive_replica = cognitive_replica
         self.lock_timeout_seconds = lock_timeout_seconds
 
+    @traced("recovery.requires_recovery", level="DEBUG")
     def requires_recovery(self) -> bool:
         """Return whether local facts/replica/pointer cannot serve formal state."""
         try:
@@ -109,6 +111,7 @@ class RecoveryService:
         ):
             return True
 
+    @traced("recovery.ensure_cache", level="DEBUG")
     def ensure_cache(self) -> CacheRecoveryResult:
         """Run the fixed eight-step recovery sequence once, without Agents."""
         with self.repository_lock.acquire("exclusive", self.lock_timeout_seconds):
@@ -161,6 +164,7 @@ class RecoveryService:
                 rebuilt_replica=rebuilt_replica,
             )
 
+    @traced("recovery.ensure_bootstrap_cache", level="DEBUG")
     def ensure_bootstrap_cache(self) -> None:
         """Repair only the revision-zero query replica after explicit Fact Sync.
 
@@ -250,6 +254,7 @@ class RecoveryService:
                 "M1b cache recovery requires initialized repository cognition",
             )
 
+    @traced("recovery.rebuild_replica", level="DEBUG")
     def _rebuild_replica(self, formal: FormalState) -> bool:
         if self.cognitive_replica is None:
             return False

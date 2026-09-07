@@ -22,6 +22,7 @@ from codecortex.infrastructure.python.parser import (
     ParsedFile,
     SyntacticRelation,
 )
+from codecortex.telemetry import traced
 
 if TYPE_CHECKING:
     from codecortex.infrastructure.python.resolver import ResolvedRelation, SymbolIndex
@@ -871,6 +872,7 @@ class FactsDatabase:
                 connection, parsed, deleted_paths=deleted_paths
             )
 
+    @traced("fact_sync.commit", level="DEBUG")
     def synchronize(
         self,
         parsed: Sequence[ParsedFile],

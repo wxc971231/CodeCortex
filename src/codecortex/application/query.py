@@ -61,6 +61,7 @@ from codecortex.infrastructure.persistence.graph_replica import (
     ReplicaMetadata,
     context_continuation_hints,
 )
+from codecortex.telemetry import traced
 
 DEFAULT_PAGE_LIMIT = 50
 DEFAULT_SEARCH_LIMIT = 20
@@ -379,6 +380,7 @@ class QueryService:
             max_evidence_limit, max_limit, "evidence"
         )
 
+    @traced("query.repository_facts", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated})
     def repository_facts(
         self,
         scope: str,
@@ -405,6 +407,7 @@ class QueryService:
             truncated=page.truncated,
         )
 
+    @traced("query.analysis_scope", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated or value.diagnostics_truncated})
     def analysis_scope(
         self,
         scope: str | None = None,
@@ -445,6 +448,7 @@ class QueryService:
             diagnostics_truncated=diagnostics.truncated,
         )
 
+    @traced("query.resolve_entity_context", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated or value.mappings_truncated or value.relations_truncated})
     def resolve_entity_context(
         self,
         *,
@@ -524,6 +528,11 @@ class QueryService:
             relations_truncated=relations.truncated,
         )
 
+    @traced("query.discussion_context", result=lambda value: {
+        "graph_revision": value.graph_revision, "truncated": value.truncated,
+        "node_count": len(value.nodes), "entity_count": len(value.entities),
+        "evidence_count": len(value.evidence), "truncation_count": len(value.truncation_reasons),
+    })
     def get_discussion_context(self, request: ContextRequest) -> DiscussionContext:
         """Return one guarded, bounded discussion-context neighborhood."""
         if not isinstance(request, ContextRequest):
@@ -537,6 +546,7 @@ class QueryService:
                 replace(request, expected_graph_revision=coordinate.graph_revision)
             )
 
+    @traced("query.search_cognitive_graph", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated})
     def search_cognitive_graph(
         self,
         query: str,
@@ -562,6 +572,7 @@ class QueryService:
             truncated=len(hits) >= checked_limit,
         )
 
+    @traced("query.inspect_node", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated})
     def inspect_node(
         self,
         node_id: str,

@@ -37,7 +37,9 @@ async def test_stdio_server_handles_sequential_requests_and_logs_to_stderr(
     """Protocol frames remain clean when the real server emits diagnostics."""
     _initialize_repository(tmp_path)
     source_root = Path(__file__).parents[2] / "src"
-    environment = {**os.environ, "PYTHONPATH": str(source_root)}
+    log_directory = tmp_path / "analyzer-must-not-create-logs"
+    environment = {**os.environ, "PYTHONPATH": str(source_root),
+                   "CODECORTEX_LOG_LEVEL": "DEBUG", "CODECORTEX_LOG_DIR": str(log_directory)}
     parameters = StdioServerParameters(
         command=sys.executable,
         args=["-m", "codecortex", "mcp", "--profile", "analyzer"],
@@ -65,3 +67,10 @@ async def test_stdio_server_handles_sequential_requests_and_logs_to_stderr(
         assert error_payload["schema_version"] == 1
         assert error_payload["error"]["code"] == "NOT_INITIALIZED"
     assert "CodeCortex MCP server started" in stderr_path.read_text(encoding="utf-8")
+    assert not log_directory.exists()
+    rows = [json.loads(line) for line in stderr_path.read_text().splitlines() if line.startswith("{")]
+    requests = [row for row in rows if row["name"].startswith("mcp.") and row["name"] != "mcp.startup" and row["event"] == "start"]
+    assert len(requests) == 4
+    assert len({row["operation_id"] for row in requests}) == 4
+    assert all(row["profile"] == "analyzer" and row["parent_id"] is None for row in requests)
+    assert any(row["event"] == "error" and row["metrics"].get("error_code") == "NOT_INITIALIZED" for row in rows)
