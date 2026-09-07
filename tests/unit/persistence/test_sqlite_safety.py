@@ -41,3 +41,21 @@ def test_fact_cache_write_rejects_symlink_without_touching_target(
         FactsDatabase(cache_path, repository_root=repository).open_write()
 
     assert outside.read_bytes() == before
+
+
+def test_main_fact_cache_read_rejects_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    cache = repository / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    outside = tmp_path / "outside.sqlite3"
+    FactsDatabase.create_new(outside)
+    before = outside.read_bytes()
+    cache_path = cache / "facts.sqlite3"
+    cache_path.symlink_to(outside)
+
+    with pytest.raises(sqlite3.OperationalError, match="unsafe"):
+        FactsDatabase(cache_path, repository_root=repository).open_read()
+
+    assert outside.read_bytes() == before

@@ -281,13 +281,11 @@ class FactsDatabase:
         return connection
 
     def _read_uri(self) -> str:
-        uri = f"{self.path.resolve().as_uri()}?mode=ro"
-        if not self._read_only:
-            return uri
-        assert self._repository_root is not None
-        return read_only_sqlite_uri(
-            self.path, self._repository_root, label="fact cache"
-        )
+        if self._repository_root is not None:
+            return read_only_sqlite_uri(
+                self.path, self._repository_root, label="fact cache"
+            )
+        return f"{self.path.resolve().as_uri()}?mode=ro"
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:
