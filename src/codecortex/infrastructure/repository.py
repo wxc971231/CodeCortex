@@ -7,6 +7,7 @@ from pathlib import Path
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 
 _VALID_GIT_MARKERS: tuple[str, ...] = ("HEAD", "objects", "refs")
+_GIT_METADATA_ERRORS = (OSError, UnicodeDecodeError, ValueError)
 
 
 def _outside_repository(root: Path, path: Path) -> CodeCortexError:
@@ -18,15 +19,18 @@ def _outside_repository(root: Path, path: Path) -> CodeCortexError:
 
 
 def _is_valid_git_dir(path: Path) -> bool:
-    if not path.is_dir() or not (path / "HEAD").is_file():
+    try:
+        if not path.is_dir() or not (path / "HEAD").is_file():
+            return False
+        if all((path / marker).exists() for marker in _VALID_GIT_MARKERS[1:]):
+            return True
+        common_dir_file = path / "commondir"
+        if not common_dir_file.is_file():
+            return False
+        common_dir = (path / common_dir_file.read_text(encoding="utf-8").strip()).resolve()
+        return all((common_dir / marker).exists() for marker in _VALID_GIT_MARKERS[1:])
+    except _GIT_METADATA_ERRORS:
         return False
-    if all((path / marker).exists() for marker in _VALID_GIT_MARKERS[1:]):
-        return True
-    common_dir_file = path / "commondir"
-    if not common_dir_file.is_file():
-        return False
-    common_dir = (path / common_dir_file.read_text(encoding="utf-8").strip()).resolve()
-    return all((common_dir / marker).exists() for marker in _VALID_GIT_MARKERS[1:])
 
 
 @dataclass(frozen=True)
@@ -70,11 +74,14 @@ def find_repository(start: Path) -> Repository:
         if not git_dir_candidate.exists():
             continue
         if git_dir_candidate.is_file():
-            raw = git_dir_candidate.read_text(encoding="utf-8").strip()
-            if not raw.startswith("gitdir:"):
+            try:
+                raw = git_dir_candidate.read_text(encoding="utf-8").strip()
+                if not raw.startswith("gitdir:"):
+                    continue
+                resolved_gitdir = raw.removeprefix("gitdir:").strip()
+                git_dir = (candidate / resolved_gitdir).resolve()
+            except _GIT_METADATA_ERRORS:
                 continue
-            resolved_gitdir = raw.removeprefix("gitdir:").strip()
-            git_dir = (candidate / resolved_gitdir).resolve()
             if _is_valid_git_dir(git_dir):
                 return Repository(candidate)
             continue

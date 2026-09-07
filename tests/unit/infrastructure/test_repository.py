@@ -73,6 +73,35 @@ def test_finds_linked_git_worktree_as_its_own_root(tmp_path: Path) -> None:
     assert find_repository(linked / "README.md").root == linked.resolve()
 
 
+def test_skips_non_utf8_git_indirection_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "invalid-gitdir"
+    root.mkdir()
+    (root / ".git").write_bytes(b"gitdir: \xff\n")
+
+    with pytest.raises(CodeCortexError) as exc:
+        find_repository(root)
+
+    assert exc.value.code is ErrorCode.NOT_INITIALIZED
+
+
+@pytest.mark.parametrize("contents", (b"\xff\n", b"\x00\n"))
+def test_skips_invalid_linked_worktree_common_dir_metadata(
+    tmp_path: Path, contents: bytes
+) -> None:
+    root = tmp_path / "invalid-commondir"
+    root.mkdir()
+    git_dir = tmp_path / "metadata"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "commondir").write_bytes(contents)
+    (root / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+    with pytest.raises(CodeCortexError) as exc:
+        find_repository(root)
+
+    assert exc.value.code is ErrorCode.NOT_INITIALIZED
+
+
 def test_rejects_parent_escape(repository):
     with pytest.raises(CodeCortexError) as exc:
         repository.resolve_relative("../outside.py")
