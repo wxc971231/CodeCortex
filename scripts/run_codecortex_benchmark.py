@@ -711,6 +711,36 @@ class BenchmarkHarness:
         before_formal = _tree_fingerprint(repository / ".codecortex", _FORMAL_FILES)
         before_cache = _tree_fingerprint(repository / ".codecortex" / ".cache")
         command = self._command(prepared.case, side)
+        initial: ParsedTrace | None = None
+        initial_sanitized = ""
+        initial_elapsed_ms = 0
+        if prepared.case.initial_prompt is not None:
+            first_command = self._command(
+                replace(prepared.case, prompt=prepared.case.initial_prompt), side
+            )
+            first_command.remove("--ephemeral")
+            started = time.perf_counter()
+            first = self._execute(first_command, repository, home)
+            initial_elapsed_ms = round((time.perf_counter() - started) * 1000)
+            initial_sanitized = sanitize_trace(
+                first.stdout + ("\n" if first.stdout and first.stderr else "") + first.stderr
+            )
+            # Retain the first turn even when continuity cannot be established.
+            path = self._trace_path(prepared, side)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(initial_sanitized, encoding="utf-8")
+            if first.returncode != 0 or not _turn_completed(first.stdout):
+                raise BenchmarkExecutionError("Follow-up first turn failed")
+            session_id = _session_id(first.stdout)
+            if session_id is None:
+                raise BenchmarkExecutionError("Follow-up first turn did not expose a resumable Child Codex session ID")
+            initial = parse_sanitized_trace(initial_sanitized)
+            if not initial.answer.strip():
+                raise BenchmarkExecutionError("Follow-up first turn did not produce an answer")
+            command = self.approval_resume_command(session_id, command[-1])
+            command[3:3] = ["-c", f'sandbox_mode="{self.config.sandbox}"']
+            if side == "native":
+                command.insert(3, "--ignore-user-config")
         started = time.perf_counter()
         completed = self._execute(command, repository, home)
         elapsed_ms = round((time.perf_counter() - started) * 1000)
@@ -718,8 +748,19 @@ class BenchmarkHarness:
         sanitized = sanitize_trace(raw)
         trace_path = self._trace_path(prepared, side)
         trace_path.parent.mkdir(parents=True, exist_ok=True)
-        trace_path.write_text(sanitized, encoding="utf-8")
-        parsed = parse_sanitized_trace(sanitized, elapsed_ms=elapsed_ms)
+        trace_path.write_text(initial_sanitized + sanitized, encoding="utf-8")
+        parsed = parse_sanitized_trace(sanitized, elapsed_ms=initial_elapsed_ms + elapsed_ms)
+        if initial is not None:
+            # Route, anchors, source references and answer belong to the final
+            # turn. Costs and forbidden behavior cover the entire discussion.
+            parsed = replace(parsed, trace=replace(
+                parsed.trace,
+                input_tokens=_sum_usage(initial.trace.input_tokens, parsed.trace.input_tokens),
+                output_tokens=_sum_usage(initial.trace.output_tokens, parsed.trace.output_tokens),
+                mcp_tool_names=initial.trace.mcp_tool_names + parsed.trace.mcp_tool_names,
+                analyzer_tool_call_count=initial.trace.analyzer_tool_call_count + parsed.trace.analyzer_tool_call_count,
+                materialization_prompt_count=initial.trace.materialization_prompt_count + parsed.trace.materialization_prompt_count,
+            ))
         parsed = ParsedTrace(
             answer=parsed.answer,
             trace=replace(
@@ -803,6 +844,10 @@ class BenchmarkHarness:
 
     def _trace_path(self, prepared: PreparedCase, side: str) -> Path:
         return self.config.artifact_dir / "traces" / prepared.case.id / str(prepared.repetition) / f"{side}.jsonl"
+
+
+def _sum_usage(first: int | None, second: int | None) -> int | None:
+    return first + second if first is not None and second is not None else None
 
 
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
@@ -1025,15 +1070,35 @@ def _graph_outside_results(results: Iterable[BenchmarkCaseResult]) -> dict[str, 
 
 def _session_id(raw: str) -> str | None:
     """Find the documented JSONL session/thread field without persisting raw output."""
+    session_ids: set[str] = set()
     for line in raw.splitlines():
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        for key, item in _walk_json(value):
-            if key in {"session_id", "thread_id"} and isinstance(item, str) and item:
-                return item
-    return None
+        if not isinstance(value, dict):
+            continue
+        event_type = value.get("type")
+        if not isinstance(event_type, str):
+            continue
+        key = {"thread.started": "thread_id", "session.started": "session_id"}.get(event_type)
+        if key is not None:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip() and not any(char.isspace() for char in item):
+                session_ids.add(item)
+    return next(iter(session_ids)) if len(session_ids) == 1 else None
+
+
+def _turn_completed(raw: str) -> bool:
+    terminal: str | None = None
+    for line in raw.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("type") in ("turn.completed", "turn.failed", "error"):
+            terminal = value["type"]
+    return terminal == "turn.completed"
 
 
 def _walk_json(value: object) -> Iterable[tuple[str, object]]:

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _SCHEMA_VERSION = 1
+_CORPUS_SCHEMA_VERSION = 2
 _DIGEST_PREFIX = "sha256:"
 _DIGEST_LENGTH = len(_DIGEST_PREFIX) + 64
 _ROUTES = frozenset(
@@ -128,6 +129,7 @@ class BenchmarkCase:
     expected_codecortex_mcp_calls: int | None
     forbid_formal_mutation: bool
     forbid_cache_mutation: bool
+    initial_prompt: str | None = None
 
     def __post_init__(self) -> None:
         if not _identifier(self.id):
@@ -142,6 +144,11 @@ class BenchmarkCase:
             raise ValueError("Benchmark expected route is invalid")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             raise ValueError("Benchmark prompt must be non-empty")
+        if self.category == "same_topic_followup":
+            if not isinstance(self.initial_prompt, str) or not self.initial_prompt.strip():
+                raise ValueError("Follow-up case requires a frozen initial prompt")
+        elif self.initial_prompt is not None:
+            raise ValueError("Only follow-up cases may declare an initial prompt")
         _non_empty_texts(self.required_facts, "required facts")
         _non_empty_texts(self.forbidden_claims, "forbidden claims")
         if not self.allowed_evidence:
@@ -333,7 +340,7 @@ def load_corpus(path: Path) -> tuple[BenchmarkCase, ...]:
         raise ValueError("Benchmark corpus must be JSON-compatible YAML") from error
     if not isinstance(raw, Mapping) or set(raw) != {"schema_version", "cases"}:
         raise ValueError("Benchmark corpus has an invalid top-level shape")
-    if raw["schema_version"] != _SCHEMA_VERSION or not isinstance(raw["cases"], list):
+    if raw["schema_version"] != _CORPUS_SCHEMA_VERSION or not isinstance(raw["cases"], list):
         raise ValueError("Benchmark corpus schema is unsupported")
     cases = tuple(_case_from_mapping(item) for item in raw["cases"])
     ids = tuple(case.id for case in cases)
@@ -405,7 +412,10 @@ def corpus_tree_digest(fixture_root: Path, state: str) -> str:
 
 
 def _case_from_mapping(value: object) -> BenchmarkCase:
-    if not isinstance(value, Mapping) or set(value) != _CASE_FIELDS:
+    if not isinstance(value, Mapping):
+        raise TypeError("Benchmark case must be a mapping")
+    fields = _CASE_FIELDS | {"initial_prompt"} if value.get("category") == "same_topic_followup" else _CASE_FIELDS
+    if set(value) != fields:
         raise ValueError("Benchmark case has missing, extra, or post-hoc fields")
     evidence_raw = value["allowed_evidence"]
     if not isinstance(evidence_raw, list):
@@ -417,6 +427,10 @@ def _case_from_mapping(value: object) -> BenchmarkCase:
         repository_tree_digest=_text(value["repository_tree_digest"], "repository_tree_digest"),
         category=_text(value["category"], "category"),
         prompt=_text(value["prompt"], "prompt"),
+        initial_prompt=(
+            _text(value["initial_prompt"], "initial_prompt")
+            if "initial_prompt" in value else None
+        ),
         expected_route=_text(value["expected_route"], "expected_route"),
         required_facts=_texts(value["required_facts"], "required_facts"),
         forbidden_claims=_texts(value["forbidden_claims"], "forbidden_claims"),

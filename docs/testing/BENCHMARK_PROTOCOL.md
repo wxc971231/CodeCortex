@@ -19,6 +19,16 @@ case IDs, no per-case thresholds, and every case pins:
 - CodeCortex side-effect constraints, including the ordinary coding case's
   exact zero MCP calls and zero formal/cache mutation requirement.
 
+Corpus schema version 2 adds a required `initial_prompt` exclusively to the
+same-topic follow-up case. This explicitly replaces the prior one-shot fiction
+with a real persistent first turn and same-session resumed second turn for
+both arms. The fixed follow-up prompt, scoring criteria, fixture source digests
+and repetition policy are unchanged. The corpus byte digest changes from
+`sha256:f5b24e479789629fe5d1dfe0bcc9c73349caf2b2cd43ad9dadd2a6a2c16812fd`
+to `sha256:3dd5a4322ae92812fee99e424d80a15ba6b0cec4459d025f43f20a6093e3b693`;
+old reviews cannot accept new runs. Both sanitized turn streams live in the
+existing arm trace, whose entire bytes are bound to `run_digest` and human review.
+
 `tests/fixtures/m1b_repo/base/` is the small mutable Python repository. Its
 `states.json` applies a deterministic, path-safe set of replacements/deletes
 to form `fresh`, `training-changed`, `unknown-dynamic`,

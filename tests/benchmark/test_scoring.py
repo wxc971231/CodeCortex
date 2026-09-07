@@ -24,6 +24,24 @@ FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "m1b_repo"
 CORPUS_PATH = Path(__file__).with_name("questions.yaml")
 
 
+@pytest.mark.parametrize("mutation", ["missing", "empty", "wrong_case", "old_schema"])
+def test_followup_corpus_requires_explicit_initial_prompt(tmp_path: Path, mutation: str) -> None:
+    payload = json.loads(CORPUS_PATH.read_text())
+    followup = next(case for case in payload["cases"] if case["id"] == "same-topic-followup")
+    if mutation == "missing":
+        del followup["initial_prompt"]
+    elif mutation == "empty":
+        followup["initial_prompt"] = " "
+    elif mutation == "wrong_case":
+        payload["cases"][0]["initial_prompt"] = "Unexpected setup discussion"
+    else:
+        payload["schema_version"] = 1
+    path = tmp_path / "corpus.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        load_corpus(path)
+
+
 def _case(**overrides: object) -> BenchmarkCase:
     values: dict[str, object] = {
         "id": "score-case",

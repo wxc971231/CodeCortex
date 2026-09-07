@@ -106,7 +106,16 @@ a validated accepting review for these exact artifacts produces
 ## Approval/resume mode and VS Code smoke test
 
 The automated ordinary cases are one-shot `codex exec --ephemeral --json`
-processes.  The separate M1b approval/resume run remains a manual acceptance
+processes, except `same-topic-followup`: each arm first asks the frozen
+checkpoint-persistence question in a persistent session, then resumes that
+exact session with the frozen read-path follow-up. Both turns retain the same
+repository, isolated home, model, effort, sandbox and per-turn timeout. Missing
+session-start evidence, failed/incomplete first turns, or an empty first answer
+fail closed without starting the second turn. Both sanitized turn streams are
+retained in the arm's digest-bound trace artifact. Usage and latency include
+both turns; final-answer quality, route and evidence are scored from the second
+turn, while prohibited tools and state mutations cover the whole discussion.
+The separate M1b approval/resume run remains a manual acceptance
 step: use a temporary test home with host MCP approval only for the throwaway
 run, first confirm that an unapproved Proposal leaves graph revision unchanged,
 then resume the same session with the exact current proposal digest and verify

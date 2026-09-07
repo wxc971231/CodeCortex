@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "cases": [
     {
       "id": "affected-source-first",
@@ -159,6 +159,7 @@
       "fixture_state": "fresh",
       "repository_tree_digest": "sha256:958a3b6e919edf72f9ba7f50a6d3f80dd24b266883fd171f72342f4117931a63",
       "category": "same_topic_followup",
+      "initial_prompt": "$codecortex How is a training checkpoint persisted? Cite the implementation.",
       "prompt": "$codecortex Follow-up: after discussing checkpoint persistence, where is its read path?",
       "expected_route": "graph_current",
       "required_facts": ["read the latest atomically written checkpoint"],
