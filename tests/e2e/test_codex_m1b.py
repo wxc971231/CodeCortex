@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -30,13 +31,16 @@ CORPUS = Path(__file__).parents[1] / "benchmark" / "questions.yaml"
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "m1b_repo"
 
 
-def _config(tmp_path: Path, *, execute: bool = False) -> BenchmarkConfig:
+def _config(
+    tmp_path: Path, *, execute: bool = False, copy_auth: bool = False
+) -> BenchmarkConfig:
     return BenchmarkConfig(
         corpus=CORPUS,
         fixture_root=FIXTURE_ROOT,
         artifact_dir=tmp_path / "artifacts",
         repetitions=3,
         execute=execute,
+        copy_auth=copy_auth,
     )
 
 
@@ -124,6 +128,30 @@ def test_native_and_codecortex_runs_use_distinct_clean_copies(tmp_path: Path) ->
     assert not (run.native_codex_home / ".codex").exists()
     assert not (run.codecortex_codex_home / ".codex").exists()
     harness.cleanup(run)
+
+
+def test_authorized_auth_reaches_both_isolated_homes_without_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native arm needs the same browser session as the augmented arm."""
+    harness = BenchmarkHarness(_config(tmp_path, execute=True, copy_auth=True))
+    prepared = harness.prepare_case("graph-outside-cli-coding", repetition=1)
+    browser_home = tmp_path / "browser-home"
+    source = browser_home / ".codex" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"token":"benchmark-test-secret"}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: browser_home))
+
+    try:
+        harness._copy_auth_to_homes(prepared)
+        source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        for home in (prepared.native_codex_home, prepared.codecortex_codex_home):
+            target = home / ".codex" / "auth.json"
+            assert target.stat().st_mode & 0o777 == 0o600
+            assert hashlib.sha256(target.read_bytes()).hexdigest() == source_digest
+        assert not harness.config.artifact_dir.exists()
+    finally:
+        harness.cleanup(prepared)
 
 
 def test_cleanup_removes_entire_workspace_outside_artifact_directory(

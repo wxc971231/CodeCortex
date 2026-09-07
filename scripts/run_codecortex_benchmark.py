@@ -402,6 +402,8 @@ class BenchmarkHarness:
             raise
 
     def run_case(self, prepared: PreparedCase) -> BenchmarkCaseResult:
+        if self.config.copy_auth:
+            self._copy_auth_to_homes(prepared)
         self._install_codecortex_test_home(prepared.codecortex_codex_home)
         native = self._run_child(prepared, "native")
         augmented = self._run_child(prepared, "codecortex")
@@ -447,6 +449,8 @@ class BenchmarkHarness:
         approval, or malformed applied event is a hard failure—not a skipped
         or synthetic success.
         """
+        if self.config.copy_auth:
+            self._copy_auth_to_homes(prepared)
         self._install_codecortex_test_home(prepared.codecortex_codex_home)
         root = prepared.codecortex_repo
         before = _tree_fingerprint(root / ".codecortex", _FORMAL_FILES)
@@ -692,18 +696,18 @@ class BenchmarkHarness:
         from tests.e2e.conftest import auto_approve_codecortex_tools
 
         auto_approve_codecortex_tools(home)
-        self._copy_auth(home)
-
-    def _copy_auth(self, home: Path) -> None:
+    def _copy_auth_to_homes(self, prepared: PreparedCase) -> None:
+        """Copy authorized browser credentials before either paired arm starts."""
         if not self.config.copy_auth:
             raise BenchmarkExecutionError("Copying browser auth requires explicit --copy-auth")
         source = Path.home() / ".codex" / "auth.json"
         if not source.is_file() or source.is_symlink():
             raise BenchmarkExecutionError("Browser authentication is unavailable for isolated benchmark home")
-        target = home / ".codex" / "auth.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
-        target.chmod(0o600)
+        for home in (prepared.native_codex_home, prepared.codecortex_codex_home):
+            target = home / ".codex" / "auth.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(0o600)
 
     def _run_child(self, prepared: PreparedCase, side: Literal["native", "codecortex"]) -> ChildResult:
         repository = prepared.native_repo if side == "native" else prepared.codecortex_repo

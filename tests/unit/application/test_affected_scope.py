@@ -190,3 +190,65 @@ def test_only_one_resolved_dependency_hop_is_propagated(tmp_path: Path, partial:
 
     assert {"behavior.source", "behavior.middle"} <= set(result.affected_nodes)
     assert "behavior.outer" not in result.affected_nodes
+
+
+def test_partial_scope_traverses_direct_mapping_despite_path_evidence(
+    tmp_path: Path,
+) -> None:
+    """Path-only evidence cannot suppress a current entity's direct mapping."""
+    repository = _repository(tmp_path)
+    _write(
+        repository.root,
+        "app.py",
+        "def mapped() -> int:\n    return 1\n\ndef other() -> int:\n    return 2\n",
+    )
+    sync = FactSyncService(repository)
+    sync.sync()
+    mapped = next(
+        item
+        for item in sync.database.entities_at_path("app.py", None, 10).items
+        if item.kind == "function" and item.qualname == "mapped"
+    )
+    formal = _formal(
+        sync,
+        nodes=(
+            {
+                "id": "behavior.direct-mapping",
+                "kind": "behavior",
+            },
+            {
+                "id": "behavior.path-evidence",
+                "kind": "behavior",
+                "evidence": ({"relative_path": "app.py"},),
+            },
+        ),
+        mappings=(
+            {
+                "entity_uid": mapped.uid,
+                "subject_kind": "node",
+                "subject_id": "behavior.direct-mapping",
+                "resolution_status": "resolved",
+            },
+        ),
+    )
+    sync.database.replace_baseline_entity_snapshots(
+        formal.manifest.cognition_baseline or ""
+    )
+    _write(
+        repository.root,
+        "app.py",
+        "def mapped() -> int:\n    return 3\n\ndef other() -> int:\n    return 2\n",
+    )
+    sync.sync()
+    sync.database.seed_partial_baseline_entity_snapshots(
+        formal.manifest.cognition_baseline or "", ()
+    )
+    change_set = ChangeDetector().detect(formal, sync.database)
+    assert change_set is not None
+    assert change_set.entity_diff_completeness == "partial"
+
+    result = AffectedScopeCalculator(formal, sync.database).calculate(change_set)
+
+    assert "behavior.path-evidence" in result.affected_nodes
+    assert "behavior.direct-mapping" in result.affected_nodes
+    assert result.scope_confidence == "complete"

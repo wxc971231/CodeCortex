@@ -485,14 +485,14 @@ class FactsDatabase:
     def seed_partial_baseline_entity_snapshots(
         self,
         baseline_source_digest: str,
-        entities: Sequence[CodeEntity],
+        entities: Sequence[FactEntitySnapshot],
     ) -> None:
-        """Seed only formally resolvable historical entities after cache recovery.
+        """Seed formal historical entity anchors after cache recovery.
 
-        A clone has no prior cache for entities not referenced by formal
-        cognition.  These rows are useful anchors for diagnostics, but are
-        deliberately marked ``partial`` so ChangeDetector can never claim a
-        complete entity diff from this subset.
+        A clone has no prior cache for source declarations that were deleted
+        after the formal baseline.  Formal refs preserve those anchors for
+        diagnostics and mapping traversal, while the ``partial`` marker keeps
+        ChangeDetector from claiming a complete entity diff from this subset.
         """
         if (
             not isinstance(baseline_source_digest, str)
@@ -501,8 +501,8 @@ class FactsDatabase:
         ):
             raise ValueError("Baseline source digest must be SHA-256")
         records = tuple(entities)
-        if any(not isinstance(entity, CodeEntity) for entity in records):
-            raise TypeError("Baseline seed entities must be CodeEntity records")
+        if any(not isinstance(entity, FactEntitySnapshot) for entity in records):
+            raise TypeError("Baseline seed entities must be FactEntitySnapshot records")
         if len({entity.uid for entity in records}) != len(records):
             raise ValueError("Baseline seed entities must have unique UIDs")
         with self.open_write() as connection:
@@ -519,8 +519,8 @@ class FactsDatabase:
                         baseline_source_digest,
                         entity.relative_path,
                         entity.address,
-                        entity.module_name,
-                        entity.qualname,
+                        _snapshot_module_name(entity.address),
+                        _snapshot_qualname(entity.address),
                         entity.kind,
                         entity.fingerprint,
                         entity.signature,
@@ -1554,6 +1554,18 @@ def _ensure_task4_relation_columns(connection: sqlite3.Connection) -> None:
     for name, definition in additions:
         if name not in actual:
             connection.execute(f"ALTER TABLE relations ADD COLUMN {name} {definition}")
+
+
+def _snapshot_module_name(address: str) -> str:
+    """Derive the indexed module partition from a persisted entity address."""
+    module, separator, _ = address.partition(":")
+    return module if separator else address
+
+
+def _snapshot_qualname(address: str) -> str:
+    """Derive the indexed symbol partition from a persisted entity address."""
+    _, separator, qualname = address.partition(":")
+    return qualname if separator else address
 
 
 _SCHEMA_TABLES = frozenset(

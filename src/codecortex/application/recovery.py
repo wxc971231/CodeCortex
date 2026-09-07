@@ -18,7 +18,10 @@ from codecortex.application.proposals import typed_graph_from_formal
 from codecortex.domain.cognition import FormalState
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.freshness import ChangeSet
-from codecortex.infrastructure.persistence.facts_db import CodeEntity, FactsDatabase
+from codecortex.infrastructure.persistence.facts_db import (
+    FactEntitySnapshot,
+    FactsDatabase,
+)
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.python.parser import EntityIdentityHint, EntityKind
@@ -284,13 +287,16 @@ class RecoveryService:
             # current entity is a sound baseline comparison snapshot.
             self.facts.replace_baseline_entity_snapshots(baseline_digest)
             return
-        resolvable: list[CodeEntity] = []
+        snapshots: dict[str, FactEntitySnapshot] = {}
         for reference in formal.entity_refs.entities:
-            entity = _resolve_formal_reference(self.facts, reference)
-            if entity is not None:
-                resolvable.append(entity)
+            # Entity refs are formal baseline facts.  Even when the live
+            # declaration still resolves, do not replace its historical
+            # fingerprint/address with current cache data during recovery.
+            snapshot = _snapshot_from_formal_reference(reference, baseline_digest)
+            snapshots[snapshot.uid] = snapshot
         self.facts.seed_partial_baseline_entity_snapshots(
-            baseline_digest, tuple(sorted(resolvable, key=lambda entity: entity.uid))
+            baseline_digest,
+            tuple(sorted(snapshots.values(), key=lambda snapshot: snapshot.uid)),
         )
 
     def _replace_effective(self, change_set: ChangeSet | None) -> None:
@@ -327,27 +333,26 @@ def _formal_identity_hints(formal: FormalState) -> tuple[EntityIdentityHint, ...
     return tuple(sorted(hints, key=lambda hint: (hint.relative_path, hint.uid)))
 
 
-def _resolve_formal_reference(
-    facts: FactsDatabase, reference: dict[str, object]
-) -> CodeEntity | None:
+def _snapshot_from_formal_reference(
+    reference: dict[str, object], baseline_digest: str
+) -> FactEntitySnapshot:
+    """Keep a deleted formal anchor visible in an explicitly partial cache."""
     try:
-        uid = str(reference["uid"])
-        direct = facts.entity_by_uid(uid)
-        if direct is not None:
-            return direct
-        resolved = facts.resolve_entity_reference(
-            last_known_address=str(reference["last_known_address"]),
+        return FactEntitySnapshot(
+            uid=str(reference["uid"]),
+            baseline_source_digest=baseline_digest,
+            relative_path=str(reference["relative_path"]),
+            address=str(reference["last_known_address"]),
             kind=str(reference["kind"]),
             signature=(
                 None if reference.get("signature") is None else str(reference["signature"])
             ),
             fingerprint=str(reference["fingerprint"]),
         )
-        return resolved.entity if resolved.status == "resolved" else None
     except (KeyError, TypeError, ValueError) as error:
         raise CodeCortexError(
             ErrorCode.FORMAL_STATE_CORRUPT,
-            "Formal entity reference cannot be resolved during cache recovery",
+            "Formal entity reference cannot seed a missing baseline snapshot",
         ) from error
 
 

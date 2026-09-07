@@ -51,8 +51,9 @@ The run creates fresh Child Codex processes without inheriting this development
 conversation.  Native receives `--ignore-user-config`; CodeCortex receives an
 isolated, test-only home and MCP configuration.  Both sides use the same
 model, reasoning effort, sandbox, prompt, per-turn timeout, fixture source
-tree, and temporary Git commit.  Browser auth is copied only to temporary
-homes. The entire per-pair temporary workspace (both Git copies, the seed, and
+tree, and temporary Git commit. When `--copy-auth` is explicitly authorized,
+browser auth is copied only to both temporary homes before either paired arm
+starts. The entire per-pair temporary workspace (both Git copies, the seed, and
 both homes) lives outside the artifact directory and is deleted after each pair,
 including preparation failures. Cleanup is part of execution validity: a
 removal failure produces a failed report and can never be accepted as a pass.

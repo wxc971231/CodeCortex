@@ -25,11 +25,14 @@ from codecortex.domain.cognition import (
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.infrastructure.formal import FormalStore
+from codecortex.infrastructure.jsonio import write_json_atomic
 from codecortex.infrastructure.locking import RepositoryLock
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.repository import Repository
+from scripts.run_codecortex_benchmark import BenchmarkConfig, BenchmarkHarness
+from tests.benchmark.scoring import materialize_fixture_state
 
 
 def _write(root: Path, relative_path: str, text: str) -> None:
@@ -133,6 +136,36 @@ def _formal_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+def _mapped_clone_without_cache(tmp_path: Path) -> Path:
+    """Build an actual approved graph, then clone it without disposable cache."""
+    origin = tmp_path / "mapped-origin"
+    harness = BenchmarkHarness(
+        BenchmarkConfig(artifact_dir=tmp_path / "benchmark-artifacts")
+    )
+    materialize_fixture_state(harness.config.fixture_root, "fresh", origin)
+    harness._seed_formal_baseline(origin)
+    subprocess.run(["git", "-C", str(origin), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "approved cognition",
+        ],
+        check=True,
+    )
+    clone = tmp_path / "mapped-clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    assert not (clone / ".codecortex" / ".cache").exists()
+    return clone
+
+
 def test_clone_with_changed_source_recovers_exact_file_diff(
     cloned_repo_without_cache: Path,
 ) -> None:
@@ -149,6 +182,45 @@ def test_clone_with_changed_source_recovers_exact_file_diff(
     assert result.rebuilt_facts is True
     assert result.rebuilt_replica is True
     assert _formal_bytes(cloned_repo_without_cache) == before
+
+
+def test_recovery_keeps_deleted_formal_anchor_in_affected_scope(tmp_path: Path) -> None:
+    """A partial rebuild must retain deleted mapped source as a formal anchor."""
+    clone = _mapped_clone_without_cache(tmp_path)
+    graph_path = clone / ".codecortex" / "graph.json"
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    for collection in (
+        "nodes",
+        "semantic_edges",
+        "logical_flows",
+        "implementation_mappings",
+    ):
+        for record in graph[collection]:
+            evidence = record.get("evidence")
+            if isinstance(evidence, list):
+                record["evidence"] = [
+                    item
+                    for item in evidence
+                    if item.get("relative_path") != "src/forge/checkpoint.py"
+                ]
+            for step in record.get("steps", []):
+                evidence = step.get("evidence")
+                if isinstance(evidence, list):
+                    step["evidence"] = [
+                        item
+                        for item in evidence
+                        if item.get("relative_path") != "src/forge/checkpoint.py"
+                    ]
+    write_json_atomic(graph_path, graph)
+    (clone / "src/forge/checkpoint.py").unlink()
+
+    result = _recovery(clone).ensure_cache()
+
+    assert result.change_set is not None
+    assert result.change_set.entity_diff_completeness == "partial"
+    assert "src/forge/checkpoint.py" in result.change_set.changed_files.deleted
+    assert "behavior.persist-checkpoint" in result.change_set.affected_nodes
+    assert result.change_set.scope_confidence in {"partial", "unknown"}
 
 
 def test_changed_non_owned_existing_file_is_not_complete_after_partial_recovery(

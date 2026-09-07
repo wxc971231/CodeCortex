@@ -32,6 +32,17 @@ class AffectedScopeCalculator:
         statuses = {item.relative_path: item for item in self._facts.source_file_statuses()}
         changed_paths = _changed_paths(change_set)
         changed_uids = _changed_entity_uids(change_set)
+        candidate_uids = set(changed_uids)
+        if change_set.entity_diff_completeness == "partial":
+            # Recovery has an exact changed-file diff but not a full historical
+            # entity diff.  Every current or formal-baseline anchor in such a
+            # file is therefore a candidate; path evidence cannot hide a
+            # direct mapping for that candidate.
+            candidate_uids.update(
+                uid
+                for uid, entity in (*current.items(), *baseline.items())
+                if entity.relative_path in changed_paths
+            )
         dependency_uids = set(changed_uids)
         if change_set.entity_diff_completeness == "partial":
             # A recovered cache cannot enumerate exact historical changes.
@@ -46,7 +57,7 @@ class AffectedScopeCalculator:
             tuple(sorted(path for path in changed_paths if path in statuses))
         ) if changed_paths & set(statuses) else {}
         entity_paths: dict[str, str] = {}
-        for uid in changed_uids:
+        for uid in candidate_uids:
             entity = _entity_for_uid(uid, current, baseline)
             if entity is not None:
                 entity_paths[uid] = entity.relative_path
@@ -60,11 +71,11 @@ class AffectedScopeCalculator:
 
         # Stages 1-3: current/missing entities, direct mappings, and evidence.
         unowned_entities: list[str] = []
-        for uid in sorted(changed_uids):
+        for uid in sorted(candidate_uids):
             targets = _formal_targets(graph, uid, None, nodes, flows)
             if targets:
                 directly_owned.add(uid)
-            else:
+            elif uid in changed_uids:
                 unowned_entities.append(uid)
         owned_paths = {
             entity.relative_path
