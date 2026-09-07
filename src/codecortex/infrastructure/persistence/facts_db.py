@@ -283,7 +283,10 @@ class FactsDatabase:
     def _read_uri(self) -> str:
         if self._repository_root is not None:
             return read_only_sqlite_uri(
-                self.path, self._repository_root, label="fact cache"
+                self.path,
+                self._repository_root,
+                label="fact cache",
+                allow_incomplete_wal=not self._read_only,
             )
         return f"{self.path.resolve().as_uri()}?mode=ro"
 

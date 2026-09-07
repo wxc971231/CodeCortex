@@ -11,9 +11,19 @@ from pathlib import Path
 
 
 def read_only_sqlite_uri(
-    database_path: Path, repository_root: Path, *, label: str
+    database_path: Path,
+    repository_root: Path,
+    *,
+    label: str,
+    allow_incomplete_wal: bool = False,
 ) -> str:
-    """Return a fail-closed URI for one repository-contained SQLite coordinate."""
+    """Return a fail-closed URI for one repository-contained SQLite coordinate.
+
+    Main may encounter one regular WAL sidecar during SQLite's normal cleanup
+    window after a local write.  SQLite can validate that coordinate in a
+    normal read-only connection; the default remains strict for Analyzer cache
+    validation.
+    """
     if ".." in database_path.parts:
         raise sqlite3.OperationalError(
             f"Read-only {label} path is unsafe: parent traversal"
@@ -25,7 +35,7 @@ def read_only_sqlite_uri(
     shm = database.with_name(f"{database.name}-shm")
     wal_exists = _require_regular_path(wal, root, allow_missing=True, label=label)
     shm_exists = _require_regular_path(shm, root, allow_missing=True, label=label)
-    if wal_exists != shm_exists:
+    if wal_exists != shm_exists and not allow_incomplete_wal:
         raise sqlite3.OperationalError(
             f"Read-only {label} has an incomplete WAL coordinate"
         )

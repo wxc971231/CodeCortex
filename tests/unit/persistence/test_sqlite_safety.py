@@ -59,3 +59,42 @@ def test_main_fact_cache_read_rejects_symlink_without_touching_target(
         FactsDatabase(cache_path, repository_root=repository).open_read()
 
     assert outside.read_bytes() == before
+
+
+def test_main_fact_cache_read_allows_regular_incomplete_wal_coordinate(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    cache = repository / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    database = cache / "facts.sqlite3"
+    database.write_bytes(b"regular sqlite placeholder")
+    facts_shm = database.with_name("facts.sqlite3-shm")
+    facts_shm.write_bytes(b"regular transient sidecar")
+    before = facts_shm.read_bytes()
+
+    uri = read_only_sqlite_uri(
+        database,
+        repository,
+        label="fact cache",
+        allow_incomplete_wal=True,
+    )
+
+    assert uri.endswith("?mode=ro&nofollow=1&immutable=1")
+    assert facts_shm.read_bytes() == before
+
+
+def test_analyzer_fact_cache_read_rejects_incomplete_wal_coordinate(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    cache = repository / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    database = cache / "facts.sqlite3"
+    database.write_bytes(b"regular sqlite placeholder")
+    database.with_name("facts.sqlite3-wal").write_bytes(b"orphaned sidecar")
+
+    with pytest.raises(sqlite3.OperationalError, match="incomplete WAL"):
+        FactsDatabase(
+            database, repository_root=repository, read_only=True
+        ).open_read()
