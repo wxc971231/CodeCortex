@@ -1,7 +1,7 @@
 """Unit coverage for CodeCortex's read-only installation diagnostics."""
 
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 import tomlkit
