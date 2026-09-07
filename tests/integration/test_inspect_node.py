@@ -126,3 +126,59 @@ def test_inspect_preserves_last_known_location_when_unresolved(
     assert mapping.resolution_status == "missing"
     assert mapping.current_location is None
     assert mapping.last_known_location.relative_path == "src/old.py"
+
+
+def test_inspect_bounds_nested_collections_and_reports_omissions(inspect_service):
+    graph = inspect_service._formal_store.load().graph
+    evidence = [{"id": f"evid_{i:03}", "observation": "Observed"} for i in range(20)]
+    graph.nodes[0]["evidence"] = evidence
+    graph.nodes[0]["aliases"] = [str(i) for i in range(20)]
+    graph.semantic_edges = tuple(
+        {
+            "id": f"edge_{i:03}",
+            "source_id": "behavior.answer",
+            "target_id": f"capability.other-{i}",
+            "evidence": evidence,
+        }
+        for i in range(20)
+    )
+    graph.logical_flows = (
+        {
+            "behavior_id": "behavior.answer",
+            "steps": [
+                {
+                    "id": f"behavior.answer#step.{i}",
+                    "order": i,
+                    "uses_capabilities": [f"capability.other-{j}" for j in range(20)],
+                    "evidence": evidence,
+                }
+                for i in range(20)
+            ],
+        },
+    )
+    template = graph.implementation_mappings[0]
+    graph.implementation_mappings = tuple(
+        {**template, "id": f"map_{i:03}", "evidence": evidence} for i in range(20)
+    )
+    inspect_service._max_node_limit = 2
+    inspect_service._max_entity_limit = 3
+    inspect_service._max_evidence_limit = 4
+    result = inspect_service.inspect_node("behavior.answer")
+    assert len(result.relations) == 2
+    assert len(result.mappings) == 3
+    assert len(result.flow["steps"]) == 2
+    assert len(result.node["aliases"]) == 2
+    nested = [*result.node.get("evidence", ())]
+    for owner in (
+        *result.relations,
+        result.flow,
+        *result.flow["steps"],
+        *(mapping.mapping for mapping in result.mappings),
+    ):
+        nested.extend(owner.get("evidence", ()))
+    assert len(nested) <= 4
+    assert len(result.evidence) <= 4
+    assert result.truncated
+    assert "max_evidence" in result.truncation_reasons
+    assert result.continuation_hints
+    assert len(graph.nodes[0]["evidence"]) == 20

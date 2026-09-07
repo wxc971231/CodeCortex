@@ -125,6 +125,8 @@ class InspectNodeOutput(_Dto):
     mappings: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     truncated: bool = False
+    truncation_reasons: list[str] = Field(default_factory=list)
+    continuation_hints: list[str] = Field(default_factory=list)
 
 
 class HistoryEventOutput(_Dto):
@@ -225,6 +227,8 @@ def inspect_node(services: ApplicationServices, node_id: str) -> InspectNodeOutp
             ],
             evidence=[dict(item) for item in inspection.evidence],
             truncated=inspection.truncated,
+            truncation_reasons=list(inspection.truncation_reasons),
+            continuation_hints=list(inspection.continuation_hints),
         )
     graph = services.cognitive_graph()
     node = next((item for item in graph.nodes if item.get("id") == node_id), None)
@@ -445,6 +449,8 @@ class DiscussionContextOutput(_Dto):
     evidence: list[dict[str, Any]]
     truncated: bool
     cursor: str | None
+    truncation_reasons: list[str] = Field(default_factory=list)
+    continuation_hints: list[str] = Field(default_factory=list)
 
 
 class SearchGraphOutput(_Dto):
@@ -637,6 +643,7 @@ def get_discussion_context(
     max_evidence: int = 80,
     expected_graph_revision: int | None = None,
     expected_source_digest: str | None = None,
+    include_flows: bool = True,
 ) -> DiscussionContextOutput:
     """Return one guarded, bounded discussion-context neighborhood."""
     result = services.get_discussion_context(
@@ -649,6 +656,7 @@ def get_discussion_context(
             max_evidence=max_evidence,
             expected_graph_revision=expected_graph_revision,
             expected_source_digest=expected_source_digest,
+            include_flows=include_flows,
         )
     )
     return DiscussionContextOutput(
@@ -661,6 +669,8 @@ def get_discussion_context(
         evidence=[asdict(evidence) for evidence in result.evidence],
         truncated=result.truncated,
         cursor=result.continuation,
+        truncation_reasons=list(result.truncation_reasons),
+        continuation_hints=list(result.continuation_hints),
     )
 
 

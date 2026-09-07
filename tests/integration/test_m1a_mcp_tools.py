@@ -245,7 +245,9 @@ async def test_inspect_node_tool_uses_m1a_query_projection(m1a_repo) -> None:
     assert "flow" in payload
     assert "evidence" in payload
     assert payload["mappings"][0]["current_location"]["relative_path"] == "pkg/new.py"
-    assert payload["mappings"][0]["last_known_location"]["relative_path"] == "pkg/old.py"
+    assert (
+        payload["mappings"][0]["last_known_location"]["relative_path"] == "pkg/old.py"
+    )
 
 
 @pytest.mark.anyio
@@ -342,6 +344,8 @@ async def test_discussion_context_tool_bounds_and_truncates(m1a_repo) -> None:
     assert payload["truncated"] is True
     assert "cursor" in payload
     assert payload["graph_revision"] == 1
+    assert payload["truncation_reasons"]
+    assert payload["continuation_hints"]
 
     full = await server.call_tool(
         "get_discussion_context",
@@ -359,6 +363,21 @@ async def test_discussion_context_tool_bounds_and_truncates(m1a_repo) -> None:
     assert full.structured_content["flows"]
     assert full.structured_content["mappings"]
     assert full.structured_content["evidence"]
+
+    without_flows = await server.call_tool(
+        "get_discussion_context",
+        {
+            "node_ids": ["behavior.checkpoint-resume"],
+            "depth": 0,
+            "include_flows": False,
+        },
+    )
+    assert not without_flows.is_error
+    payload = without_flows.structured_content
+    assert payload["flows"] == []
+    assert all(mapping["subject_kind"] == "node" for mapping in payload["mappings"])
+    assert not payload["truncated"]
+    assert payload["truncation_reasons"] == []
 
 
 @pytest.mark.anyio

@@ -272,6 +272,34 @@ continuation_hints: []
 
 Main 选择下一局部，不允许自动把剩余图全部拉入上下文。所有 query tools 同样有 hard limit。
 
+实现的 collection budget 对应关系（每类独立上限，跨所选 owner 累计）：
+
+| Budget | Collections |
+| --- | --- |
+| `max_nodes` | nodes、semantic edges、aliases、所有 Flow steps、所有 step capability references；Flow 数量最多为选中的 Behavior 数量 |
+| `max_entities` | implementation mapping **行数**（即使重复引用同一 entity），以及 distinct entity refs |
+| `max_evidence` | 当前保留 owner 的 evidence 总数 |
+
+SQL 在 materialize 前用 `LIMIT cap + 1` 探测溢出；anchor owner expansion 与 BFS
+也只 fetch 有界的 distinct nodes。BFS 按 edge type、neighbor stable ID 排序，
+edges 按 type/ID，steps 按 Behavior/order/ID，mappings/evidence 按 ID 排序。
+未保留的 step/edge/mapping 不会额外展开其 evidence 或 mappings。
+`include_flows=false` 不加载 Flow/steps/capability references，也不包含 step mappings
+及其 evidence；这属于请求过滤，不单独设置 truncated。缓存将 Flow 顶层 evidence
+归属到 Behavior node，因此这些 node evidence 仍保留。
+
+`truncation_reasons` 使用 budget 名或 `budget:collection`（例如
+`max_nodes:flow_steps`、`max_entities:mappings`）。`continuation_hints` 给出缩小
+node/entity anchors、提高到 configured maximum、或直接读取相关 formal graph/source
+文件的建议。兼容 `cursor`/`continuation` 仅编码有限的 omitted node anchors，不是
+可提交的分页 cursor，也不保证枚举所有 omitted nodes；child collections 没有分页端点。
+
+`inspect_node` 使用配置的 `query_max_nodes` / `query_max_entities` /
+`query_max_evidence` 按上述映射裁剪。正式文件的 snapshot 仍须完整解析以校验坐标；
+projection 采用有界选择，只有保留 mappings 才执行源码 resolution。
+所有嵌套 owner 共享 evidence allowance，顶层 `evidence` 是其有界索引副本
+（因此序列化最多包含两份该 allowance）。裁剪不修改正式 snapshot。
+
 ## 13. 回答契约
 
 Skill 要求 Main 按问题需要组织，而非机械模板；但事实性回答应能给出：

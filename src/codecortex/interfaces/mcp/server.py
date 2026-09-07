@@ -317,6 +317,7 @@ def _register_read_tools(
         max_evidence: int | None = None,
         expected_graph_revision: int | None = None,
         expected_source_digest: str | None = None,
+        include_flows: bool = True,
     ) -> tools.DiscussionContextOutput:
         try:
             return _main_query(
@@ -324,6 +325,7 @@ def _register_read_tools(
                 preflight,
                 lambda: tools.get_discussion_context(
                     services,
+                    include_flows=include_flows,
                     node_ids=node_ids or (),
                     entity_ids=entity_ids or (),
                     depth=(

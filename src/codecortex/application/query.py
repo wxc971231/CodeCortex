@@ -31,9 +31,10 @@ Documented design decisions:
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from heapq import nsmallest
 from typing import Protocol
 
 from codecortex.application.ports import FormalStorePort, RepositoryLockPort
@@ -58,6 +59,7 @@ from codecortex.infrastructure.persistence.graph_replica import (
     DiscussionContext,
     GraphHit,
     ReplicaMetadata,
+    context_continuation_hints,
 )
 
 DEFAULT_PAGE_LIMIT = 50
@@ -252,6 +254,8 @@ class NodeInspection:
     mappings: tuple[ResolvedMapping, ...]
     evidence: tuple[Mapping[str, object], ...]
     truncated: bool = False
+    truncation_reasons: tuple[str, ...] = ()
+    continuation_hints: tuple[str, ...] = ()
 
 
 def _rebuild_required(message: str) -> CodeCortexError:
@@ -587,12 +591,19 @@ class QueryService:
                     f"Cognitive graph node does not exist: {checked_node_id}",
                     suggested_action="Use a node ID returned by search_cognitive_graph",
                 )
-            relations = tuple(
-                dict(edge)
-                for edge in state.graph.semantic_edges
-                if edge.get("source_id") == checked_node_id
-                or edge.get("target_id") == checked_node_id
+            budget = _InspectionBudget(self._max_node_limit, self._max_evidence_limit)
+            node = budget.project(node)
+            relations = budget.select(
+                (
+                    dict(edge)
+                    for edge in state.graph.semantic_edges
+                    if edge.get("source_id") == checked_node_id
+                    or edge.get("target_id") == checked_node_id
+                ),
+                self._max_node_limit,
+                "max_nodes:edges",
             )
+            relations = tuple(budget.project(edge) for edge in relations)
             flow = next(
                 (
                     dict(item)
@@ -601,20 +612,35 @@ class QueryService:
                 ),
                 None,
             )
+            if flow is not None:
+                flow = budget.project(flow)
+                steps = budget.select(
+                    _object_sequence(flow.get("steps")),
+                    self._max_node_limit,
+                    "max_nodes:flow_steps",
+                    order_field="order",
+                )
+                flow["steps"] = [budget.project(step) for step in steps]
             flow_step_ids = {
                 str(step.get("id"))
                 for step in _object_sequence(None if flow is None else flow.get("steps"))
             }
-            mappings = tuple(
-                dict(item)
-                for item in state.graph.implementation_mappings
-                if item.get("subject_id") == checked_node_id
-                or item.get("subject_id") in flow_step_ids
+            mappings = budget.select(
+                (
+                    dict(item)
+                    for item in state.graph.implementation_mappings
+                    if item.get("subject_id") == checked_node_id
+                    or item.get("subject_id") in flow_step_ids
+                ),
+                self._max_entity_limit,
+                "max_entities:mappings",
             )
+            mappings = tuple(budget.project(mapping) for mapping in mappings)
+            selected_uids = {mapping.get("entity_uid") for mapping in mappings}
             refs = {
                 str(item.get("uid")): item
                 for item in state.entity_refs.entities
-                if isinstance(item.get("uid"), str)
+                if item.get("uid") in selected_uids
             }
             resolved = tuple(
                 self._resolve_mapping(mapping, refs) for mapping in mappings
@@ -629,6 +655,11 @@ class QueryService:
             flow=flow,
             mappings=resolved,
             evidence=evidence,
+            truncated=bool(budget.reasons),
+            truncation_reasons=tuple(sorted(budget.reasons)),
+            continuation_hints=context_continuation_hints(
+                tuple(sorted(budget.reasons))
+            ),
         )
 
     @contextmanager
@@ -798,10 +829,69 @@ def _optional_reference_text(reference: Mapping[str, object], field: str) -> str
     return value
 
 
-def _object_sequence(value: object) -> tuple[Mapping[str, object], ...]:
+def _object_sequence(value: object) -> Iterable[Mapping[str, object]]:
     if not isinstance(value, (list, tuple)):
         return ()
-    return tuple(item for item in value if isinstance(item, Mapping))
+    return (item for item in value if isinstance(item, Mapping))
+
+
+class _InspectionBudget:
+    """Bound projection memory; evidence budget is shared by all nested owners."""
+
+    def __init__(self, node_limit: int, evidence_limit: int) -> None:
+        self.node_limit = node_limit
+        self.remaining_evidence = evidence_limit
+        self.remaining_capabilities = node_limit
+        self.reasons: set[str] = set()
+
+    def select(
+        self,
+        items: Iterable[Mapping[str, object]],
+        limit: int,
+        reason: str,
+        *,
+        order_field: str = "id",
+    ) -> tuple[Mapping[str, object], ...]:
+        rows = nsmallest(
+            limit + 1,
+            items,
+            key=lambda item: (
+                str(item.get(order_field, "")).zfill(20)
+                if order_field == "order"
+                else str(item.get(order_field, "")),
+                str(item.get("id", "")),
+            ),
+        )
+        if len(rows) > limit:
+            self.reasons.add(reason)
+        return tuple(rows[:limit])
+
+    def project(self, item: Mapping[str, object]) -> dict[str, object]:
+        result = dict(item)
+        if "evidence" in result:
+            evidence = self.select(
+                _object_sequence(result["evidence"]),
+                self.remaining_evidence,
+                "max_evidence",
+            )
+            self.remaining_evidence -= len(evidence)
+            result["evidence"] = [dict(value) for value in evidence]
+        for field, limit, reason in (
+            ("aliases", self.node_limit, "max_nodes:aliases"),
+            (
+                "uses_capabilities",
+                self.remaining_capabilities,
+                "max_nodes:capability_references",
+            ),
+        ):
+            values = result.get(field)
+            if isinstance(values, (list, tuple)):
+                if len(values) > limit:
+                    self.reasons.add(reason)
+                result[field] = list(values[:limit])
+                if field == "uses_capabilities":
+                    self.remaining_capabilities -= min(len(values), limit)
+        return result
 
 
 def _inspection_evidence(

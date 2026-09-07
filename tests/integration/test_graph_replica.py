@@ -2,6 +2,7 @@
 
 import base64
 import json
+import sqlite3
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -42,6 +43,98 @@ TABLE_DUMP_ORDER = (
     ("cognitive_search_terms", "term, node_id, field"),
     ("replica_metadata", "singleton_id"),
 )
+
+
+def test_context_bounds_child_rows_even_when_all_mappings_share_one_entity(
+    tmp_path, discussion_graph, replica_entity_refs, replica_history_events, monkeypatch
+):
+    replica = _replica(
+        _repository(tmp_path), replica_entity_refs, replica_history_events
+    )
+    flow = discussion_graph.logical_flows[0]
+    steps = tuple(
+        replace(
+            flow.steps[0],
+            id=f"{flow.behavior_id}#step.extra-{i}",
+            order=i + 1,
+            evidence=(),
+        )
+        for i in range(200)
+    )
+    mappings = tuple(
+        replace(
+            discussion_graph.implementation_mappings[0],
+            id=replica_ulid("map", f"{i:03}"),
+            evidence=(),
+            subject_kind=MappingSubjectKind.FLOW_STEP,
+            subject_id=steps[i // 2].id,
+            role=MappingRole.PRIMARY if i % 2 == 0 else MappingRole.SUPPORTING,
+        )
+        for i in range(200)
+    )
+    graph = replace(
+        discussion_graph,
+        logical_flows=(replace(flow, steps=steps),),
+        implementation_mappings=mappings,
+    )
+    replica.rebuild(graph, graph.graph_revision)
+    fetched = []
+    original_open = replica.open_read
+
+    def counted_open():
+        connection = original_open()
+
+        def record(cursor, row):
+            fetched.append(row)
+            return sqlite3.Row(cursor, row)
+
+        connection.row_factory = record
+        return connection
+
+    monkeypatch.setattr(replica, "open_read", counted_open)
+    request = ContextRequest(
+        node_ids=(flow.behavior_id,),
+        depth=0,
+        max_nodes=2,
+        max_entities=3,
+        max_evidence=1,
+    )
+    result = replica.context(request)
+    assert len(result.flows[0].steps) == 2
+    assert len(result.mappings) == 3
+    assert result.truncated
+    assert {"max_nodes:flow_steps", "max_entities:mappings"} <= set(
+        result.truncation_reasons
+    )
+    assert result.continuation_hints
+    assert len(fetched) < 50
+    assert replica.context(request) == result
+    fetched.clear()
+    anchored = replica.context(
+        replace(request, node_ids=(), entity_uids=(ENTITY_ALPHA,))
+    )
+    assert [node.node_id for node in anchored.nodes] == [
+        "behavior.checkpoint-resume", "capability.source-retrieval"
+    ]
+    assert len(fetched) < 50
+
+
+def test_context_excludes_flow_children_when_flows_disabled(
+    tmp_path, discussion_graph, replica_entity_refs, replica_history_events
+):
+    replica = _replica(
+        _repository(tmp_path), replica_entity_refs, replica_history_events
+    )
+    replica.rebuild(discussion_graph, discussion_graph.graph_revision)
+    result = replica.context(
+        ContextRequest(
+            node_ids=("behavior.checkpoint-resume",), depth=0, include_flows=False
+        )
+    )
+    assert result.flows == ()
+    assert all(item.subject_kind == "node" for item in result.mappings)
+    assert all(item.owner_kind != "flow_step" for item in result.evidence)
+    assert not result.truncated
 
 
 def _repository(tmp_path: Path) -> Path:
@@ -301,13 +394,11 @@ def test_context_limits_report_truncation_and_continuation(
     assert [node.node_id for node in context.nodes] == [
         "behavior.checkpoint-resume",
         "capability.journal-recovery",
-        "capability.source-retrieval",
+        "responsibility.repository-understanding",
     ]
     assert context.truncated is True
     assert context.continuation is not None
-    assert _decode_continuation(context.continuation) == [
-        "responsibility.repository-understanding"
-    ]
+    assert _decode_continuation(context.continuation) == ["capability.source-retrieval"]
 
     capped = replica.context(
         ContextRequest(
