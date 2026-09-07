@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import secrets
 import stat
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -17,7 +20,7 @@ from codecortex.domain.freshness import (
     ScopeConfidence,
 )
 from codecortex.domain.ids import IdPrefix, validate_id
-from codecortex.infrastructure.jsonio import write_json_atomic
+from codecortex.infrastructure.jsonio import canonical_json_bytes
 
 
 class FreshnessStore:
@@ -49,20 +52,39 @@ class FreshnessStore:
         removes the prior target.
         """
         previous = self._effective_id_or_none()
+        previous_path = (
+            None if previous is None else self.change_set_path(previous)
+        )
         if change_set is None:
-            self.freshness_path.unlink(missing_ok=True)
-            if previous is not None:
-                self.change_set_path(previous).unlink(missing_ok=True)
+            if previous is None:
+                return
+            with self._open_cache_directories(create=True) as (cache_fd, change_sets_fd):
+                assert previous_path is not None
+                _require_regular_entry(change_sets_fd, previous_path.name)
+                _require_regular_entry(cache_fd, self.freshness_path.name)
+                _unlink_regular_at(cache_fd, self.freshness_path.name)
+                _unlink_regular_at(change_sets_fd, previous_path.name)
             return
 
-        self.change_sets_path.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(self.change_set_path(change_set.change_set_id), _to_json(change_set))
-        write_json_atomic(
-            self.freshness_path,
-            {"schema_version": 1, "effective_change_set_id": change_set.change_set_id},
-        )
-        if previous is not None and previous != change_set.change_set_id:
-            self.change_set_path(previous).unlink(missing_ok=True)
+        with self._open_cache_directories(create=True) as (cache_fd, change_sets_fd):
+            if previous_path is not None and previous != change_set.change_set_id:
+                _require_regular_entry(change_sets_fd, previous_path.name)
+            _write_json_atomic_at(
+                change_sets_fd,
+                self.change_set_path(change_set.change_set_id).name,
+                _to_json(change_set),
+            )
+            _write_json_atomic_at(
+                cache_fd,
+                self.freshness_path.name,
+                {
+                    "schema_version": 1,
+                    "effective_change_set_id": change_set.change_set_id,
+                },
+            )
+            if previous is not None and previous != change_set.change_set_id:
+                assert previous_path is not None
+                _unlink_regular_at(change_sets_fd, previous_path.name)
 
     def load_effective(self) -> ChangeSet | None:
         change_set_id = self._effective_id_or_none()
@@ -100,6 +122,59 @@ class FreshnessStore:
         ):
             raise ValueError("Freshness cache pointer is unsupported")
         return raw["effective_change_set_id"]
+
+    @contextmanager
+    def _open_cache_directories(self, *, create: bool) -> Iterator[tuple[int, int]]:
+        """Open cache and payload directories through an anchored descriptor chain."""
+        root = Path(os.path.abspath(self._repository_root))
+        cache = Path(os.path.abspath(self.cache_root))
+        try:
+            relative = cache.relative_to(root)
+        except ValueError as error:
+            raise OSError("Freshness cache path escapes the repository") from error
+        if not relative.parts:
+            raise OSError("Freshness cache path does not name a directory")
+
+        directories: list[int] = []
+        try:
+            if create and not root.exists():
+                root.mkdir(parents=True, exist_ok=True)
+            directories.append(os.open(root, _DIRECTORY_FLAGS))
+            for component in relative.parts:
+                parent = directories[-1]
+                try:
+                    descriptor = os.open(
+                        component, _DIRECTORY_FLAGS, dir_fd=parent
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(component, 0o755, dir_fd=parent)
+                    descriptor = os.open(
+                        component, _DIRECTORY_FLAGS, dir_fd=parent
+                    )
+                directories.append(descriptor)
+            cache_fd = directories[-1]
+            try:
+                change_sets_fd = os.open(
+                    "change_sets", _DIRECTORY_FLAGS, dir_fd=cache_fd
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir("change_sets", 0o755, dir_fd=cache_fd)
+                change_sets_fd = os.open(
+                    "change_sets", _DIRECTORY_FLAGS, dir_fd=cache_fd
+                )
+            try:
+                directories.append(change_sets_fd)
+                yield cache_fd, change_sets_fd
+            finally:
+                os.close(change_sets_fd)
+                directories.pop()
+        finally:
+            for descriptor in reversed(directories):
+                os.close(descriptor)
 
 
 _DIRECTORY_FLAGS = (
@@ -150,6 +225,74 @@ def _read_text_no_follow(path: Path, repository_root: Path) -> str:
             os.close(descriptor)
         for directory in reversed(directories):
             os.close(directory)
+
+
+def _write_json_atomic_at(directory_fd: int, filename: str, value: object) -> None:
+    """Durably replace one regular JSON entry within an already-open directory."""
+    payload = canonical_json_bytes(value)
+    temporary_name: str | None = None
+    temporary_fd: int | None = None
+    for _ in range(10):
+        candidate = f".{filename}.{secrets.token_hex(8)}.tmp"
+        try:
+            temporary_fd = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        temporary_name = candidate
+        break
+    if temporary_name is None or temporary_fd is None:
+        raise OSError(errno.EEXIST, "Could not allocate freshness cache temp file")
+
+    installed = False
+    try:
+        with os.fdopen(temporary_fd, "wb") as temporary_file:
+            temporary_file.write(payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        _require_regular_entry(directory_fd, filename)
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        installed = True
+        os.fsync(directory_fd)
+    finally:
+        if not installed:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _require_regular_entry(directory_fd: int, filename: str) -> None:
+    try:
+        mode = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise OSError("Freshness cache target is not a regular file")
+
+
+def _unlink_regular_at(directory_fd: int, filename: str) -> None:
+    try:
+        mode = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise OSError("Freshness cache target is not a regular file")
+    os.unlink(filename, dir_fd=directory_fd)
+    os.fsync(directory_fd)
 
 
 def _to_json(change_set: ChangeSet) -> dict[str, object]:

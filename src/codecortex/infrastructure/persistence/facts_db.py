@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from codecortex.infrastructure.persistence.sqlite_safety import read_only_sqlite_uri
+from codecortex.infrastructure.persistence.sqlite_safety import (
+    read_only_sqlite_uri,
+    read_write_sqlite_uri,
+)
 from codecortex.infrastructure.python.parser import (
     EntityIdentityHint,
     ParsedFile,
@@ -262,7 +265,15 @@ class FactsDatabase:
         """Open the only connection mode permitted to mutate the local cache."""
         if self._read_only:
             raise sqlite3.OperationalError("Read-only fact cache cannot be modified")
-        connection = sqlite3.connect(self.path)
+        if self._repository_root is None:
+            connection = sqlite3.connect(self.path)
+        else:
+            connection = sqlite3.connect(
+                read_write_sqlite_uri(
+                    self.path, self._repository_root, label="fact cache"
+                ),
+                uri=True,
+            )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")

@@ -134,3 +134,82 @@ def test_change_set_payload_read_rejects_symlink_escape(tmp_path) -> None:
         store.load_effective()
 
     assert outside.read_bytes() == before
+
+
+def test_change_set_write_rejects_symlinked_change_sets_directory(tmp_path) -> None:
+    root = tmp_path / "repository"
+    cache = root / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    outside = tmp_path / "outside-change-sets"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("must not be touched", encoding="utf-8")
+    (cache / "change_sets").symlink_to(outside, target_is_directory=True)
+    store = FreshnessStore(cache, repository_root=root)
+    change_set = _change_set(
+        "chg_01J00000000000000000000001", "sha256:" + "b" * 64
+    )
+
+    with pytest.raises(OSError):
+        store.replace_effective(change_set)
+
+    assert sentinel.read_text(encoding="utf-8") == "must not be touched"
+    assert not (cache / "freshness.json").exists()
+
+
+def test_change_set_write_rejects_symlinked_pointer_without_touching_target(
+    tmp_path,
+) -> None:
+    root = tmp_path / "repository"
+    store = FreshnessStore(
+        root / ".codecortex" / ".cache", repository_root=root
+    )
+    first = _change_set(
+        "chg_01J00000000000000000000001", "sha256:" + "b" * 64
+    )
+    second = _change_set(
+        "chg_01J00000000000000000000002", "sha256:" + "c" * 64
+    )
+    store.replace_effective(first)
+    outside = tmp_path / "outside-pointer.json"
+    outside.write_bytes(store.freshness_path.read_bytes())
+    store.freshness_path.unlink()
+    store.freshness_path.symlink_to(outside)
+    before = outside.read_bytes()
+
+    with pytest.raises(ValueError, match="pointer is unreadable"):
+        store.replace_effective(second)
+
+    assert outside.read_bytes() == before
+
+
+def test_replacing_change_set_rejects_symlinked_old_payload_before_pointer_move(
+    tmp_path,
+) -> None:
+    root = tmp_path / "repository"
+    store = FreshnessStore(
+        root / ".codecortex" / ".cache", repository_root=root
+    )
+    first = _change_set(
+        "chg_01J00000000000000000000001", "sha256:" + "b" * 64
+    )
+    second = _change_set(
+        "chg_01J00000000000000000000002", "sha256:" + "c" * 64
+    )
+    store.replace_effective(first)
+    payload = store.change_set_path(first.change_set_id)
+    outside = tmp_path / "outside-old-payload.json"
+    outside.write_bytes(payload.read_bytes())
+    payload.unlink()
+    payload.symlink_to(outside)
+    before = outside.read_bytes()
+
+    with pytest.raises(OSError):
+        store.replace_effective(second)
+
+    assert outside.read_bytes() == before
+    assert not store.freshness_path.is_symlink()
+    assert json.loads(store.freshness_path.read_text(encoding="utf-8"))[
+        "effective_change_set_id"
+    ] == first.change_set_id
+    assert not store.change_set_path(second.change_set_id).exists()
