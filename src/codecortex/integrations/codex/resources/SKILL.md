@@ -135,6 +135,18 @@ conclusion. It refreshes only disposable facts and computes one current
 baseline-to-source ChangeSet; it never calls an Agent and never needs user
 approval. Do not make ordinary Codex coding run this workflow.
 
+For every explicit `$codecortex ask`, `inspect`, or `sync`, call
+`pending_changes(cursor=null, limit=50)` after Preflight and report its result
+faithfully before describing freshness or changed source. Keep
+`changed_files` and `unmapped_changes` as separate lists: only the former are
+baseline-detected added, modified, deleted, or renamed files. An unmapped
+dependency or entity is not a modified or refreshed source file. Preserve its
+reported path and reason (for example
+`one_hop_dependency_has_no_formal_owner`) as an uncertainty. If the result is
+truncated, page it before making a complete-file claim. Report
+`scope_confidence=partial` or `unknown` as a limit on the conclusion; never
+upgrade it by narration.
+
 For a question, use `search_cognitive_graph` for bounded candidate recall, use
 your own reasoning to confirm relevant Responsibility/Behavior/Capability
 anchors, obtain `effective_query_freshness`, then pull only bounded discussion
@@ -146,7 +158,11 @@ exploration without restriction.
 If query freshness is `affected_source_first` or `unknown_source_first`, label
 the graph as baseline navigation only. Read current facts and source before
 answering, distinguish approved graph conclusions from current-source evidence
-and uncertainty, and do not block the answer waiting for a graph update.
+and uncertainty, and do not block the answer waiting for a graph update. For
+`affected_source_first`, identify changed locations only from
+`pending_changes.changed_files` and use those current files as source evidence;
+describe any `unmapped_changes` separately as unresolved scope rather than as
+the changed location.
 
 For a relevant unmaterialized Behavior, ask **once per explicit CodeCortex
 invocation**:

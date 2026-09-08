@@ -27,6 +27,23 @@ def test_install_writes_parseable_skill_agent_and_config(
     )
 
 
+def test_installed_skill_requires_faithful_pending_change_reporting(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "codecortex"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    install_codex(tmp_path, executable, dry_run=False, force=False)
+
+    skill = (
+        tmp_path / ".agents" / "skills" / "codecortex" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(skill.split())
+    assert "`pending_changes(cursor=null, limit=50)`" in normalized
+    assert "`changed_files` and `unmapped_changes` as separate lists" in normalized
+    assert "unmapped dependency or entity is not a modified or refreshed source file" in normalized
+    assert "`scope_confidence=partial` or `unknown`" in normalized
+
+
 def test_packaged_resources_are_available_to_installed_code() -> None:
     resources = importlib.resources.files("codecortex.integrations.codex.resources")
     assert resources.joinpath("SKILL.md").is_file()

@@ -158,6 +158,18 @@ unknown_source_first
 
 结果附带 matched affected nodes、unmapped changes 和依据，Main 不自行重算。
 
+### 7.3 Main 报告契约
+
+对每次显式 `$codecortex ask`、`inspect` 或 `sync`，Main 在 Preflight 后读取
+`pending_changes`，并按返回值分别报告 `changed_files` 和 `unmapped_changes`。
+前者才是 baseline 确定的 added/modified/deleted/renamed 文件；后者是无法归属的
+变化或依赖，必须保留原始 path 和 reason，不能叙述成“已修改”或“已刷新”的源码文件。
+输出截断时，Main 必须继续分页后才可声称文件清单完整。
+
+`affected_source_first` 的当前源码结论只可引用 `changed_files` 中的位置；
+`unmapped_changes` 只能作为未解决范围单独披露。`scope_confidence=partial` 或
+`unknown` 是结论边界，Main 必须明确说明，不能通过自然语言把它升级成 complete。
+
 ## 8. Semantic Cognition Sync
 
 Fact Preflight 不自动触发 Analyzer。语义同步发生在：
