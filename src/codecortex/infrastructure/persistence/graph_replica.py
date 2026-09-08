@@ -42,6 +42,11 @@ from codecortex.domain.graph import (
     Evidence,
     validate_cognitive_graph,
 )
+from codecortex.infrastructure.persistence.sqlite_safety import (
+    read_only_sqlite_uri,
+    read_write_sqlite_uri,
+    remove_sqlite_coordinate,
+)
 
 _REPLICA_SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 10_000
@@ -325,6 +330,7 @@ class ContextRequest:
     max_evidence: int = 80
     expected_graph_revision: int | None = None
     expected_source_digest: str | None = None
+    include_flows: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +419,8 @@ class DiscussionContext:
     evidence: tuple[ContextEvidence, ...]
     truncated: bool
     continuation: str | None
+    truncation_reasons: tuple[str, ...] = ()
+    continuation_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +434,7 @@ class _ContextBundle:
     entities: tuple[ContextEntity, ...]
     evidence: tuple[ContextEvidence, ...]
     truncated: bool
+    truncation_reasons: tuple[str, ...] = ()
 
 
 def _ngrams(run: str, size: int) -> tuple[str, ...]:
@@ -507,12 +516,34 @@ class GraphReplica:
         self,
         path: Path,
         *,
+        read_only: bool = False,
+        repository_root: Path | None = None,
+        max_search_limit: int = 100,
+        max_context_nodes: int = 200,
+        max_context_entities: int = 500,
+        max_context_evidence: int = 500,
         entity_refs: Iterable[EntityRefRecord]
         | Callable[[], Iterable[EntityRefRecord]] = (),
         history_events: Iterable[HistoryEventRecord]
         | Callable[[], Iterable[HistoryEventRecord]] = (),
     ) -> None:
         self.path = Path(path)
+        self._read_only = read_only
+        self._repository_root = (
+            None if repository_root is None else Path(repository_root)
+        )
+        if read_only and self._repository_root is None:
+            raise ValueError("Read-only cognitive replica requires a repository root")
+        self.max_limit = _positive_bound(max_search_limit, "max_search_limit")
+        self.max_context_nodes = _positive_bound(
+            max_context_nodes, "max_context_nodes"
+        )
+        self.max_context_entities = _positive_bound(
+            max_context_entities, "max_context_entities"
+        )
+        self.max_context_evidence = _positive_bound(
+            max_context_evidence, "max_context_evidence"
+        )
         self._entity_refs = (
             entity_refs if callable(entity_refs) else lambda: entity_refs
         )
@@ -524,16 +555,45 @@ class GraphReplica:
     def create_new(cls, path: Path, **providers: object) -> GraphReplica:
         """Create the replica schema (or verify a compatible one) at *path*."""
         replica = cls(path, **providers)  # type: ignore[arg-type]
-        replica.path.parent.mkdir(parents=True, exist_ok=True)
-        with replica.open_write() as connection:
-            connection.executescript(_DDL)
+        try:
+            replica._create_schema()
+        except sqlite3.DatabaseError as error:
+            if not _is_corrupt_sqlite(error):
+                raise
+            # This database is a wholly disposable local projection.  A
+            # damaged file must never prevent the formal-state recovery path
+            # from starting on a new machine.
+            replica.reset()
         return replica
+
+    def reset(self) -> None:
+        """Discard a damaged local replica and recreate only its empty schema."""
+        if self._read_only:
+            raise sqlite3.OperationalError(
+                "Read-only cognitive replica cannot be reset"
+            )
+        if self._repository_root is None:
+            for path in (
+                self.path,
+                self.path.with_name(f"{self.path.name}-wal"),
+                self.path.with_name(f"{self.path.name}-shm"),
+            ):
+                path.unlink(missing_ok=True)
+        else:
+            remove_sqlite_coordinate(
+                self.path, self._repository_root, label="cognitive replica"
+            )
+        self._create_schema()
+
+    def _create_schema(self) -> None:
+        if self._repository_root is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.open_write() as connection:
+            connection.executescript(_DDL)
 
     def open_read(self) -> sqlite3.Connection:
         """Open a URI-mode read-only, query-only connection for bounded reads."""
-        connection = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?mode=ro", uri=True
-        )
+        connection = sqlite3.connect(self._read_uri(), uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
@@ -542,12 +602,31 @@ class GraphReplica:
 
     def open_write(self) -> sqlite3.Connection:
         """Open the only connection mode permitted to mutate the replica."""
-        connection = sqlite3.connect(self.path)
+        if self._read_only:
+            raise sqlite3.OperationalError(
+                "Read-only cognitive replica cannot be modified"
+            )
+        if self._repository_root is None:
+            connection = sqlite3.connect(self.path)
+        else:
+            connection = sqlite3.connect(
+                read_write_sqlite_uri(
+                    self.path, self._repository_root, label="cognitive replica"
+                ),
+                uri=True,
+            )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         return connection
+
+    def _read_uri(self) -> str:
+        if self._repository_root is not None:
+            return read_only_sqlite_uri(
+                self.path, self._repository_root, label="cognitive replica"
+            )
+        return f"{self.path.resolve().as_uri()}?mode=ro"
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:
@@ -619,6 +698,7 @@ class GraphReplica:
         entity_refs = self._validated_entity_refs(graph)
         history_events = self._validated_history_events()
 
+        self._create_schema()
         with self.open_write() as connection:
             connection.execute("BEGIN IMMEDIATE")
             for table in _DELETE_ORDER:
@@ -922,7 +1002,14 @@ class GraphReplica:
             for alias in node.aliases:
                 normalized = _normalize_alias(alias)
                 if normalized:
-                    rows.add((normalized, node.id, "exact_alias", _FIELD_WEIGHTS["exact_alias"]))
+                    rows.add(
+                        (
+                            normalized,
+                            node.id,
+                            "exact_alias",
+                            _FIELD_WEIGHTS["exact_alias"],
+                        )
+                    )
                 for term in normalize_search_terms(alias):
                     if term == normalized:
                         continue  # already indexed as the exact alias
@@ -1042,8 +1129,7 @@ class GraphReplica:
         with self.open_read() as connection:
             self._require_revision(connection, expected_revision)
             rows = connection.execute(
-                "SELECT kind, COUNT(*) AS node_count FROM cognitive_nodes "
-                "GROUP BY kind"
+                "SELECT kind, COUNT(*) AS node_count FROM cognitive_nodes GROUP BY kind"
             ).fetchall()
         return {row["kind"]: row["node_count"] for row in rows}
 
@@ -1140,15 +1226,27 @@ class GraphReplica:
         max_evidence = _bounded_int(
             request.max_evidence, 1, self.max_context_evidence, "max_evidence"
         )
+        if type(request.include_flows) is not bool:
+            raise ValueError("include_flows must be a boolean")
 
         with self.open_read() as connection:
             actual_revision = self._current_revision(connection)
             if request.expected_graph_revision is not None:
                 self._require_revision(connection, request.expected_graph_revision)
-            anchors = self._resolve_anchors(connection, node_anchors, entity_anchors)
+            anchors = self._resolve_anchors(
+                connection, node_anchors, entity_anchors, max_nodes
+            )
             included, cut = self._traverse(connection, anchors, depth, max_nodes)
-            bundle = self._materialize(connection, included, max_entities, max_evidence)
+            bundle = self._materialize(
+                connection,
+                included,
+                max_nodes,
+                max_entities,
+                max_evidence,
+                request.include_flows,
+            )
         truncated = bool(cut) or bundle.truncated
+        reasons = (("max_nodes",) if cut else ()) + bundle.truncation_reasons
         continuation = _encode_continuation(cut) if cut else None
         return DiscussionContext(
             graph_revision=actual_revision,
@@ -1160,6 +1258,8 @@ class GraphReplica:
             evidence=bundle.evidence,
             truncated=truncated,
             continuation=continuation,
+            truncation_reasons=reasons,
+            continuation_hints=context_continuation_hints(reasons),
         )
 
     def _resolve_anchors(
@@ -1167,6 +1267,7 @@ class GraphReplica:
         connection: sqlite3.Connection,
         node_ids: tuple[str, ...],
         entity_uids: tuple[str, ...],
+        max_nodes: int,
     ) -> list[str]:
         anchors: set[str] = set(node_ids)
         if node_ids:
@@ -1204,83 +1305,29 @@ class GraphReplica:
                     details={"entity_uids": unknown},
                     suggested_action="Resolve the entity through repository facts first",
                 )
-            mapping_rows = connection.execute(
+            # Resolve owners inside SQLite, then fetch only bounded distinct
+            # nodes. A single UID may otherwise expand into millions of rows.
+            rows = connection.execute(
+                "WITH owners(kind, id) AS ("
                 "SELECT subject_kind, subject_id FROM implementation_mappings "
-                f"WHERE entity_uid IN ({placeholders})",
-                values,
-            ).fetchall()
-            evidence_rows = connection.execute(
+                f"WHERE entity_uid IN ({placeholders}) UNION "
                 "SELECT owner_kind, owner_id FROM cognitive_evidence "
-                f"WHERE entity_uid IN ({placeholders})",
-                values,
+                f"WHERE entity_uid IN ({placeholders})), "
+                "subjects(kind, id) AS (SELECT kind, id FROM owners UNION "
+                "SELECT m.subject_kind, m.subject_id FROM owners o "
+                "JOIN implementation_mappings m ON o.kind = 'mapping' "
+                "AND o.id = m.mapping_id), "
+                "nodes(node_id) AS (SELECT id FROM subjects WHERE kind = 'node' "
+                "UNION SELECT s.behavior_id FROM subjects o JOIN flow_steps s "
+                "ON o.kind = 'flow_step' AND o.id = s.step_id "
+                "UNION SELECT e.source_node_id FROM subjects o JOIN cognitive_edges e "
+                "ON o.kind = 'edge' AND o.id = e.edge_id "
+                "UNION SELECT e.target_node_id FROM subjects o JOIN cognitive_edges e "
+                "ON o.kind = 'edge' AND o.id = e.edge_id) "
+                "SELECT node_id FROM nodes ORDER BY node_id LIMIT ?",
+                (*values, *values, max_nodes + 1),
             ).fetchall()
-            step_ids = {
-                row["subject_id"]
-                for row in mapping_rows
-                if row["subject_kind"] == "flow_step"
-            } | {
-                row["owner_id"]
-                for row in evidence_rows
-                if row["owner_kind"] == "flow_step"
-            }
-            anchors.update(
-                row["subject_id"]
-                for row in mapping_rows
-                if row["subject_kind"] == "node"
-            )
-            anchors.update(
-                row["owner_id"]
-                for row in evidence_rows
-                if row["owner_kind"] == "node"
-            )
-            mapping_ids = tuple(
-                row["owner_id"]
-                for row in evidence_rows
-                if row["owner_kind"] == "mapping"
-            )
-            mapping_step_ids: set[str] = set()
-            if mapping_ids:
-                map_placeholders, map_values = _in_clause(mapping_ids)
-                subject_rows = connection.execute(
-                    "SELECT subject_kind, subject_id FROM implementation_mappings "
-                    f"WHERE mapping_id IN ({map_placeholders})",
-                    map_values,
-                ).fetchall()
-                anchors.update(
-                    row["subject_id"]
-                    for row in subject_rows
-                    if row["subject_kind"] == "node"
-                )
-                mapping_step_ids = {
-                    row["subject_id"]
-                    for row in subject_rows
-                    if row["subject_kind"] == "flow_step"
-                }
-            step_ids |= mapping_step_ids
-            if step_ids:
-                step_placeholders, step_values = _in_clause(sorted(step_ids))
-                anchors.update(
-                    row["behavior_id"]
-                    for row in connection.execute(
-                        "SELECT step_id, behavior_id FROM flow_steps "
-                        f"WHERE step_id IN ({step_placeholders})",
-                        step_values,
-                    )
-                )
-            edge_ids = tuple(
-                row["owner_id"]
-                for row in evidence_rows
-                if row["owner_kind"] == "edge"
-            )
-            if edge_ids:
-                edge_placeholders, edge_values = _in_clause(edge_ids)
-                for row in connection.execute(
-                    "SELECT source_node_id, target_node_id FROM cognitive_edges "
-                    f"WHERE edge_id IN ({edge_placeholders})",
-                    edge_values,
-                ):
-                    anchors.add(row["source_node_id"])
-                    anchors.add(row["target_node_id"])
+            anchors.update(row[0] for row in rows)
         return sorted(anchors)
 
     def _traverse(
@@ -1305,20 +1352,18 @@ class GraphReplica:
             if not frontier:
                 break
             placeholders, values = _in_clause(frontier)
+            excluded, excluded_values = _in_clause(tuple(included))
             rows = connection.execute(
-                "SELECT source_node_id, target_node_id FROM cognitive_edges "
-                f"WHERE source_node_id IN ({placeholders}) "
-                f"OR target_node_id IN ({placeholders})",
-                (*values, *values),
+                "SELECT neighbor FROM ("
+                "SELECT target_node_id AS neighbor, edge_type, edge_id "
+                f"FROM cognitive_edges WHERE source_node_id IN ({placeholders}) "
+                "UNION ALL SELECT source_node_id AS neighbor, edge_type, edge_id "
+                f"FROM cognitive_edges WHERE target_node_id IN ({placeholders})) "
+                f"WHERE neighbor NOT IN ({excluded}) "
+                "GROUP BY neighbor ORDER BY MIN(edge_type), neighbor LIMIT ?",
+                (*values, *values, *excluded_values, max_nodes - len(included) + 1),
             ).fetchall()
-            neighbors = sorted(
-                {
-                    neighbor
-                    for row in rows
-                    for neighbor in (row["source_node_id"], row["target_node_id"])
-                }
-                - set(included)
-            )
+            neighbors = [row["neighbor"] for row in rows]
             frontier = []
             for neighbor in neighbors:
                 if len(included) >= max_nodes:
@@ -1326,16 +1371,32 @@ class GraphReplica:
                 else:
                     included[neighbor] = None
                     frontier.append(neighbor)
+            if cut:
+                break
         return list(included), sorted(set(cut))
 
     def _materialize(
         self,
         connection: sqlite3.Connection,
         included: list[str],
+        max_nodes: int,
         max_entities: int,
         max_evidence: int,
+        include_flows: bool,
     ) -> _ContextBundle:
         """Materialize the bounded neighborhood with batch queries only."""
+
+        reasons: list[str] = []
+
+        def bounded(
+            sql: str, parameters: Sequence[object], limit: int, reason: str
+        ) -> list[sqlite3.Row]:
+            rows = connection.execute(
+                sql + " LIMIT ?", (*parameters, limit + 1)
+            ).fetchall()
+            if len(rows) > limit:
+                reasons.append(reason)
+            return rows[:limit]
 
         node_placeholders, node_values = _in_clause(included)
         node_rows = connection.execute(
@@ -1344,50 +1405,58 @@ class GraphReplica:
             f"WHERE node_id IN ({node_placeholders}) ORDER BY node_id",
             node_values,
         ).fetchall()
-        alias_rows = connection.execute(
+        alias_rows = bounded(
             "SELECT node_id, alias FROM cognitive_aliases "
             f"WHERE node_id IN ({node_placeholders}) ORDER BY node_id, position",
             node_values,
-        ).fetchall()
-        edge_rows = connection.execute(
+            max_nodes,
+            "max_nodes:aliases",
+        )
+        edge_rows = bounded(
             "SELECT edge_id, edge_type, source_node_id, target_node_id, "
             "epistemic_status FROM cognitive_edges "
             f"WHERE source_node_id IN ({node_placeholders}) "
-            f"AND target_node_id IN ({node_placeholders}) ORDER BY edge_id",
+            f"AND target_node_id IN ({node_placeholders}) ORDER BY edge_type, edge_id",
             (*node_values, *node_values),
-        ).fetchall()
+            max_nodes,
+            "max_nodes:edges",
+        )
 
         behavior_ids = tuple(row["node_id"] for row in node_rows if row["kind"] == "behavior")
         flow_rows: list[sqlite3.Row] = []
         step_rows: list[sqlite3.Row] = []
         capability_rows: list[sqlite3.Row] = []
-        if behavior_ids:
+        if behavior_ids and include_flows:
             behavior_placeholders, behavior_values = _in_clause(behavior_ids)
             flow_rows = connection.execute(
                 "SELECT behavior_id, materialization_status FROM logical_flows "
                 f"WHERE behavior_id IN ({behavior_placeholders}) ORDER BY behavior_id",
                 behavior_values,
             ).fetchall()
-            step_rows = connection.execute(
+            step_rows = bounded(
                 "SELECT step_id, behavior_id, step_order, title, summary "
                 "FROM flow_steps "
                 f"WHERE behavior_id IN ({behavior_placeholders}) "
-                "ORDER BY behavior_id, step_order",
+                "ORDER BY behavior_id, step_order, step_id",
                 behavior_values,
-            ).fetchall()
+                max_nodes,
+                "max_nodes:flow_steps",
+            )
             step_ids = tuple(row["step_id"] for row in step_rows)
             if step_ids:
                 step_placeholders, step_values = _in_clause(step_ids)
-                capability_rows = connection.execute(
+                capability_rows = bounded(
                     "SELECT step_id, capability_id FROM flow_step_capabilities "
                     f"WHERE step_id IN ({step_placeholders}) "
                     "ORDER BY step_id, position",
                     step_values,
-                ).fetchall()
+                    max_nodes,
+                    "max_nodes:capability_references",
+                )
 
         step_ids = tuple(row["step_id"] for row in step_rows)
         step_placeholders, step_values = _in_clause(step_ids)
-        mapping_rows = connection.execute(
+        mapping_rows = bounded(
             "SELECT mapping_id, subject_kind, subject_id, entity_uid, role, "
             "resolution_status, evidence_note FROM implementation_mappings "
             f"WHERE (subject_kind = 'node' AND subject_id IN ({node_placeholders})) "
@@ -1398,7 +1467,9 @@ class GraphReplica:
             )
             + "ORDER BY mapping_id",
             (*node_values, *step_values) if step_ids else node_values,
-        ).fetchall()
+            max_entities,
+            "max_entities:mappings",
+        )
 
         edge_ids = tuple(row["edge_id"] for row in edge_rows)
         mapping_ids = tuple(row["mapping_id"] for row in mapping_rows)
@@ -1415,15 +1486,14 @@ class GraphReplica:
         ):
             if ids:
                 placeholders, values = _in_clause(ids)
-                evidence_sql += (
-                    f"OR (owner_kind = '{owner_kind}' AND owner_id IN ({placeholders})) "
-                )
+                evidence_sql += f"OR (owner_kind = '{owner_kind}' AND owner_id IN ({placeholders})) "
                 evidence_params = (*evidence_params, *values)
         evidence_sql += "ORDER BY evidence_id LIMIT ?"
         evidence_rows = connection.execute(
             evidence_sql, (*evidence_params, max_evidence + 1)
         ).fetchall()
-        truncated = len(evidence_rows) > max_evidence
+        if len(evidence_rows) > max_evidence:
+            reasons.append("max_evidence")
         evidence_rows = evidence_rows[:max_evidence]
 
         entity_uids = sorted(
@@ -1435,7 +1505,7 @@ class GraphReplica:
             }
         )
         if len(entity_uids) > max_entities:
-            truncated = True
+            reasons.append("max_entities")
             entity_uids = entity_uids[:max_entities]
         entity_rows: list[sqlite3.Row] = []
         if entity_uids:
@@ -1469,7 +1539,8 @@ class GraphReplica:
                 )
             )
         return _ContextBundle(
-            truncated=truncated,
+            truncated=bool(reasons),
+            truncation_reasons=tuple(reasons),
             nodes=tuple(
                 ContextNode(
                     node_id=row["node_id"],
@@ -1543,11 +1614,31 @@ class GraphReplica:
         )
 
 
+def context_continuation_hints(reasons: Sequence[str]) -> tuple[str, ...]:
+    """Explain recovery without implying a nonexistent child-page endpoint."""
+    if not reasons:
+        return ()
+    return (
+        (
+            "Request a smaller neighborhood with explicit node/entity anchors, or raise "
+            "the reported budget up to the configured maximum. Child collections have "
+            "no pagination endpoint; if a single owner still exceeds the maximum, "
+            "inspect the relevant formal graph/source files directly."
+        ),
+    )
+
+
 def _validated_anchors(values: Sequence[str], label: str) -> tuple[str, ...]:
     materialized = tuple(dict.fromkeys(values))
     if any(not isinstance(value, str) or not value for value in materialized):
         raise ValueError(f"{label} list must contain non-empty strings")
     return materialized
+
+
+def _positive_bound(value: int, label: str) -> int:
+    if type(value) is not int or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
 
 
 def _bounded_int(value: int, minimum: int, maximum: int, label: str) -> int:
@@ -1556,3 +1647,12 @@ def _bounded_int(value: int, minimum: int, maximum: int, label: str) -> int:
     if value < minimum or value > maximum:
         raise ValueError(f"Context {label} must be between {minimum} and {maximum}")
     return value
+
+
+def _is_corrupt_sqlite(error: sqlite3.DatabaseError) -> bool:
+    """Whether SQLite identified the file itself as unreadable, not merely busy."""
+    message = str(error).lower()
+    return (
+        "file is not a database" in message
+        or "database disk image is malformed" in message
+    )

@@ -130,6 +130,62 @@ def test_connection_policies_match_fact_cache(tmp_path):
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 10_000
 
 
+def test_main_write_rejects_database_symlink_escape(tmp_path):
+    root = tmp_path / "repo"
+    cache = root / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    outside = tmp_path / "outside.sqlite3"
+    with sqlite3.connect(outside) as connection:
+        connection.execute("CREATE TABLE outside_marker(value TEXT)")
+        connection.execute("INSERT INTO outside_marker VALUES ('unchanged')")
+    path = cache / "cognitive.sqlite3"
+    path.symlink_to(outside)
+    before = outside.read_bytes()
+    replica = GraphReplica(path, repository_root=root)
+
+    with pytest.raises(sqlite3.OperationalError, match="unsafe"):
+        replica.open_write()
+
+    assert path.is_symlink()
+    assert outside.read_bytes() == before
+
+
+def test_main_reset_rejects_cache_directory_symlink_escape(tmp_path):
+    root = tmp_path / "repo"
+    (root / ".codecortex").mkdir(parents=True)
+    outside_cache = tmp_path / "outside-cache"
+    outside_cache.mkdir()
+    outside = outside_cache / "cognitive.sqlite3"
+    with sqlite3.connect(outside) as connection:
+        connection.execute("CREATE TABLE outside_marker(value TEXT)")
+        connection.execute("INSERT INTO outside_marker VALUES ('unchanged')")
+    (root / ".codecortex" / ".cache").symlink_to(
+        outside_cache, target_is_directory=True
+    )
+    before = outside.read_bytes()
+    replica = GraphReplica(
+        root / ".codecortex" / ".cache" / "cognitive.sqlite3",
+        repository_root=root,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="unsafe"):
+        replica.reset()
+
+    assert outside.read_bytes() == before
+
+
+def test_main_write_rejects_parent_traversal_outside_repository(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside.sqlite3"
+    replica = GraphReplica(root / ".." / outside.name, repository_root=root)
+
+    with pytest.raises(sqlite3.OperationalError, match="parent traversal"):
+        replica.open_write()
+
+    assert not outside.exists()
+
+
 def test_enum_checks_are_locked(tmp_path):
     replica = GraphReplica.create_new(tmp_path / "cognitive.sqlite3")
 

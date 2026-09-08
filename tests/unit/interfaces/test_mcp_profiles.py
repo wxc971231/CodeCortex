@@ -1,14 +1,19 @@
 """MCP profile registration and adapter-boundary tests."""
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import anyio
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codecortex.application.services import RepositoryOverview
 from codecortex.domain.errors import CodeCortexError, ErrorCode
-from codecortex.interfaces.mcp.server import _recover_main_formal_state, build_server
+from codecortex.interfaces.mcp.server import (
+    _recover_main_formal_state,
+    build_server,
+    run_stdio,
+)
 
 ANALYZER_TOOLS = {
     "repository_overview",
@@ -21,6 +26,9 @@ ANALYZER_TOOLS = {
     "resolve_entity_context",
     "get_discussion_context",
     "search_cognitive_graph",
+    "cognitive_freshness",
+    "pending_changes",
+    "effective_query_freshness",
 }
 MAIN_TOOLS = ANALYZER_TOOLS | {
     "initialize_repository",
@@ -30,6 +38,7 @@ MAIN_TOOLS = ANALYZER_TOOLS | {
     "revise_cognitive_proposal",
     "cognitive_proposal",
     "apply_cognitive_proposal",
+    "advance_cognition_baseline",
 }
 
 
@@ -95,6 +104,66 @@ async def test_read_tool_returns_versioned_dto(services: MagicMock) -> None:
 
 
 @pytest.mark.anyio
+async def test_sync_tool_handler_completes_without_worker_thread_deadlock(
+    services: MagicMock,
+) -> None:
+    """Python 3.14 must not strand synchronous MCP callbacks in AnyIO's worker."""
+    services.repository_overview.return_value = RepositoryOverview(
+        repository_root="/repo",
+        graph_revision=0,
+        cognition_initialized=False,
+        cognition_baseline_source_digest=None,
+        formal_files={"manifest.json": True},
+    )
+
+    server = build_server("analyzer", services)
+    assert server._tool_manager._tools["repository_overview"].is_async is True
+    with anyio.fail_after(1):
+        result = await server.call_tool("repository_overview", {})
+
+    assert result.structured_content["graph_revision"] == 0
+
+
+@pytest.mark.anyio
+async def test_query_tool_defaults_respect_repository_configured_caps(
+    services: MagicMock,
+) -> None:
+    services.query_default_depth = 1
+    services.query_max_nodes = 2
+    services.query_max_entities = 3
+    services.query_max_evidence = 4
+    services.run_analyzer_query_read.side_effect = (
+        lambda operation, **_kwargs: operation()
+    )
+    server = build_server("analyzer", services)
+
+    with patch("codecortex.interfaces.mcp.server.tools.repository_facts") as adapter:
+        await server._tool_manager._tools["repository_facts"].fn(scope="pkg")
+        assert adapter.call_args.args[3] == 3
+    with patch("codecortex.interfaces.mcp.server.tools.analysis_scope") as adapter:
+        await server._tool_manager._tools["analysis_scope"].fn()
+        assert adapter.call_args.args[3] == 3
+    with patch(
+        "codecortex.interfaces.mcp.server.tools.resolve_entity_context"
+    ) as adapter:
+        await server._tool_manager._tools["resolve_entity_context"].fn(path="pkg/a.py")
+        assert adapter.call_args.kwargs["limit"] == 3
+    with patch(
+        "codecortex.interfaces.mcp.server.tools.get_discussion_context"
+    ) as adapter:
+        await server._tool_manager._tools["get_discussion_context"].fn()
+        assert adapter.call_args.kwargs["depth"] == 1
+        assert adapter.call_args.kwargs["max_nodes"] == 2
+        assert adapter.call_args.kwargs["max_entities"] == 3
+        assert adapter.call_args.kwargs["max_evidence"] == 4
+    with patch(
+        "codecortex.interfaces.mcp.server.tools.search_cognitive_graph"
+    ) as adapter:
+        await server._tool_manager._tools["search_cognitive_graph"].fn(query="thing")
+        assert adapter.call_args.kwargs["limit"] == 2
+
+
+@pytest.mark.anyio
 async def test_domain_error_is_a_stable_structured_tool_error(
     services: MagicMock,
 ) -> None:
@@ -129,6 +198,38 @@ def test_analyzer_process_never_attempts_recovery_writes(services: MagicMock) ->
     services.recover_formal_state.assert_not_called()
 
 
+def test_stdio_uses_supplied_composition_before_starting(
+    services: MagicMock,
+) -> None:
+    factory = MagicMock(return_value=services)
+    server = MagicMock()
+    with patch("codecortex.interfaces.mcp.server.build_server", return_value=server):
+        assert run_stdio("analyzer", factory) == 0
+
+    factory.assert_called_once_with()
+    services.recover_formal_state.assert_not_called()
+    server.run.assert_called_once_with(transport="stdio")
+
+
+def test_stdio_keeps_zero_argument_service_factory_compatibility(
+    services: MagicMock,
+) -> None:
+    calls = 0
+
+    def factory() -> MagicMock:
+        nonlocal calls
+        calls += 1
+        return services
+
+    server = MagicMock()
+    with patch("codecortex.interfaces.mcp.server.build_server", return_value=server):
+        assert run_stdio("analyzer", factory) == 0
+
+    assert calls == 1
+    services.recover_formal_state.assert_not_called()
+    server.run.assert_called_once_with(transport="stdio")
+
+
 def test_main_process_allows_uninitialized_repository(services: MagicMock) -> None:
     """Main must still start so its initialize tool can create the skeleton."""
     services.recover_formal_state.side_effect = CodeCortexError(
@@ -148,3 +249,24 @@ def test_main_process_refuses_unsafe_recovery_failure(services: MagicMock) -> No
 
     with pytest.raises(CodeCortexError, match="unprovable transaction"):
         _recover_main_formal_state("main", services)
+
+
+@pytest.mark.anyio
+async def test_bootstrap_read_never_bypasses_preflight_for_initialized_cognition(
+    services: MagicMock,
+) -> None:
+    services.run_preflight.side_effect = CodeCortexError(
+        ErrorCode.NOT_INITIALIZED, "misconfigured preflight"
+    )
+    services.repository_overview.return_value = RepositoryOverview(
+        repository_root="/repo",
+        graph_revision=4,
+        cognition_initialized=True,
+        cognition_baseline_source_digest="sha256:current",
+        formal_files={"manifest.json": True},
+    )
+
+    with pytest.raises(ToolError):
+        await build_server("main", services).call_tool("analysis_scope", {})
+
+    services.analysis_scope.assert_not_called()

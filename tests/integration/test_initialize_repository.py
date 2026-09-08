@@ -85,6 +85,27 @@ def test_initialize_creates_exact_valid_empty_formal_state(
     )
 
 
+def test_formal_load_treats_absent_empty_structural_directories_as_empty(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    app.initialize_repository()
+    codecortex_root = repo_root / ".codecortex"
+    absent = (
+        "history/events",
+        "history",
+        "views/responsibilities",
+        "views/behaviors",
+        "views/capabilities",
+    )
+    for relative in absent:
+        (codecortex_root / relative).rmdir()
+
+    state = app.formal_store.load()
+
+    assert state.history_events == ()
+    assert all(not (codecortex_root / relative).exists() for relative in absent)
+
+
 def test_initialize_is_byte_idempotent(
     app: ApplicationServices, repo_root: Path
 ) -> None:
@@ -95,6 +116,30 @@ def test_initialize_is_byte_idempotent(
     app.initialize_repository()
 
     assert digest_tree(repo_root / ".codecortex") == before
+
+
+def test_load_rejects_source_baseline_with_forged_aggregate_digest(
+    app: ApplicationServices, repo_root: Path
+) -> None:
+    app.initialize_repository()
+    baseline_path = repo_root / ".codecortex" / "source_baseline.json"
+    manifest_path = repo_root / ".codecortex" / "manifest.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forged = "sha256:" + "a" * 64
+    baseline["repository_source_digest"] = forged
+    baseline["files"] = [
+        {"relative_path": "app.py", "content_digest": "sha256:" + "b" * 64}
+    ]
+    manifest["cognition_initialized"] = True
+    manifest["cognition_baseline"] = forged
+    baseline_path.write_bytes(canonical_json_bytes(baseline))
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(CodeCortexError) as raised:
+        app.formal_store.load()
+
+    assert raised.value.code is ErrorCode.FORMAL_STATE_CORRUPT
 
 
 @pytest.mark.parametrize(

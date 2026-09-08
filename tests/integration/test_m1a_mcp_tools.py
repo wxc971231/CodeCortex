@@ -6,7 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -51,18 +51,23 @@ def _compose(root: Path, *, max_graph_objects: int = 500) -> ApplicationServices
     formal_store = FormalStore(repository)
     lock = RepositoryLock(root)
     cache_directory = root / ".codecortex" / ".cache"
+    facts = FactsDatabase(cache_directory / "facts.sqlite3")
+    fact_sync = FactSyncService(
+        repository,
+        database=facts,
+        formal_store=formal_store,
+        repository_lock=lock,
+    )
     return ApplicationServices(
         repository=repository,
         formal_store=formal_store,
         repository_lock=lock,
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
-        fact_sync=FactSyncService(
-            repository, formal_store=formal_store, repository_lock=lock
-        ),
+        fact_sync=fact_sync,
         query_service=QueryService(
             formal_store=formal_store,
-            facts=FactsDatabase(cache_directory / "facts.sqlite3"),
+            facts=facts,
             replica=GraphReplica(
                 cache_directory / "cognitive.sqlite3",
                 entity_refs=formal_entity_ref_provider(formal_store),
@@ -70,6 +75,9 @@ def _compose(root: Path, *, max_graph_objects: int = 500) -> ApplicationServices
             ),
             repository_lock=lock,
         ),
+        # These M1a projection tests isolate query behavior; M1b integration
+        # tests exercise the real deterministic preflight service.
+        preflight_service=MagicMock(),
         cognitive_graph_max_objects=max_graph_objects,
     )
 
@@ -122,7 +130,10 @@ def _write_sources(root: Path) -> None:
 
 @pytest.fixture
 def m1a_repo(
-    tmp_path: Path, replica_entity_refs, replica_history_events
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replica_entity_refs,
+    replica_history_events,
 ) -> ApplicationServices:
     root = tmp_path / "repo"
     root.mkdir()
@@ -138,6 +149,14 @@ def m1a_repo(
         history_events=replica_history_events,
     )
     replica.rebuild(build_discussion_graph(graph_revision=1), 1)
+    # This module isolates M1a query projection. The production Analyzer
+    # initialization gate is exercised with real formal state in the M1b MCP
+    # integration suite.
+    monkeypatch.setattr(
+        app,
+        "run_analyzer_query_read",
+        lambda operation, **_kwargs: operation(),
+    )
     return app
 
 
@@ -204,9 +223,12 @@ async def test_inspect_node_tool_uses_m1a_query_projection(m1a_repo) -> None:
         ),
         evidence=(),
     )
-    overview = SimpleNamespace(cognition_initialized=True)
     with (
-        patch.object(m1a_repo, "repository_overview", return_value=overview),
+        patch.object(
+            m1a_repo,
+            "repository_overview",
+            return_value=SimpleNamespace(cognition_initialized=True),
+        ),
         patch.object(m1a_repo, "inspect_node", return_value=inspection),
     ):
         server = build_server("analyzer", m1a_repo)
@@ -223,7 +245,9 @@ async def test_inspect_node_tool_uses_m1a_query_projection(m1a_repo) -> None:
     assert "flow" in payload
     assert "evidence" in payload
     assert payload["mappings"][0]["current_location"]["relative_path"] == "pkg/new.py"
-    assert payload["mappings"][0]["last_known_location"]["relative_path"] == "pkg/old.py"
+    assert (
+        payload["mappings"][0]["last_known_location"]["relative_path"] == "pkg/old.py"
+    )
 
 
 @pytest.mark.anyio
@@ -320,6 +344,8 @@ async def test_discussion_context_tool_bounds_and_truncates(m1a_repo) -> None:
     assert payload["truncated"] is True
     assert "cursor" in payload
     assert payload["graph_revision"] == 1
+    assert payload["truncation_reasons"]
+    assert payload["continuation_hints"]
 
     full = await server.call_tool(
         "get_discussion_context",
@@ -337,6 +363,21 @@ async def test_discussion_context_tool_bounds_and_truncates(m1a_repo) -> None:
     assert full.structured_content["flows"]
     assert full.structured_content["mappings"]
     assert full.structured_content["evidence"]
+
+    without_flows = await server.call_tool(
+        "get_discussion_context",
+        {
+            "node_ids": ["behavior.checkpoint-resume"],
+            "depth": 0,
+            "include_flows": False,
+        },
+    )
+    assert not without_flows.is_error
+    payload = without_flows.structured_content
+    assert payload["flows"] == []
+    assert all(mapping["subject_kind"] == "node" for mapping in payload["mappings"])
+    assert not payload["truncated"]
+    assert payload["truncation_reasons"] == []
 
 
 @pytest.mark.anyio
@@ -441,13 +482,20 @@ async def test_sync_repository_facts_main_only(m1a_repo) -> None:
 
 
 @pytest.fixture
-def zero_cap_repo(tmp_path: Path) -> ApplicationServices:
+def zero_cap_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> ApplicationServices:
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     app = _compose(root, max_graph_objects=0)
     app.initialize_repository()
     _apply_node(app, "behavior.answer-question")
+    monkeypatch.setattr(
+        app,
+        "run_analyzer_query_read",
+        lambda operation, **_kwargs: operation(),
+    )
     return app
 
 
@@ -465,3 +513,59 @@ async def test_cognitive_graph_compatibility_cap(
     assert payload["error"]["code"] == "CONTEXT_LIMIT_EXCEEDED"
     assert "search_cognitive_graph" in payload["error"]["message"]
     assert "get_discussion_context" in payload["error"]["message"]
+
+
+@pytest.mark.anyio
+async def test_apply_tool_uses_native_confirmation_with_exact_digest(m1a_repo) -> None:
+    proposal = m1a_repo.create_cognitive_proposal(
+        operations=(_add_node("behavior.native-tool-approval"),),
+        affected_nodes=("behavior.native-tool-approval",),
+        reason="Verify native MCP approval",
+    )
+    server = build_server("main", m1a_repo)
+    apply_tool = next(
+        tool for tool in await server.list_tools() if tool.name == "apply_cognitive_proposal"
+    )
+
+    assert set(apply_tool.input_schema["properties"]) == {"proposal_id", "patch_digest"}
+    assert set(apply_tool.input_schema["required"]) == {"proposal_id", "patch_digest"}
+
+    result = await server.call_tool(
+        "apply_cognitive_proposal",
+        {"proposal_id": proposal.proposal_id, "patch_digest": proposal.patch_digest},
+    )
+
+    assert result.is_error is False
+    payload = result.structured_content
+    event = m1a_repo.formal_store.read_history_event(payload["event_id"])
+    assert event["approval"] == {
+        "proposal_id": proposal.proposal_id,
+        "patch_digest": proposal.patch_digest,
+        "approved_by": "user",
+        "approved_at": event["approval"]["approved_at"],
+        "approval_summary": "Approved through Codex host tool approval.",
+    }
+    assert payload["applied_proposal_id"] == proposal.proposal_id
+
+
+@pytest.mark.anyio
+async def test_apply_tool_rejects_mismatched_digest_without_applying(m1a_repo) -> None:
+    proposal = m1a_repo.create_cognitive_proposal(
+        operations=(_add_node("behavior.native-tool-mismatch"),),
+        affected_nodes=("behavior.native-tool-mismatch",),
+        reason="Reject a mismatched digest",
+    )
+    server = build_server("main", m1a_repo)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool(
+            "apply_cognitive_proposal",
+            {
+                "proposal_id": proposal.proposal_id,
+                "patch_digest": "sha256:" + "0" * 64,
+            },
+        )
+
+    assert _tool_error_payload(excinfo)["error"]["code"] == "APPROVAL_MISMATCH"
+    assert m1a_repo.formal_store.load().graph.graph_revision == 1
+    assert m1a_repo.cognitive_proposal(proposal.proposal_id).patch_digest == proposal.patch_digest

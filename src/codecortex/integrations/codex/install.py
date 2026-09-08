@@ -255,7 +255,11 @@ def _restore_previous(
             _write_bytes_atomic(path, prior)
 
 
-def _validate_outputs(root: Path, targets: Mapping[Path, bytes], executable: Path) -> None:
+def _validate_outputs(
+    root: Path,
+    targets: Mapping[Path, bytes],
+    executable: Path,
+) -> None:
     for path, expected in targets.items():
         if not path.is_file() or path.is_symlink() or path.read_bytes() != expected:
             raise ValueError(f"Installed target failed validation: {path.relative_to(root)}")
@@ -267,6 +271,10 @@ def _validate_outputs(root: Path, targets: Mapping[Path, bytes], executable: Pat
         "main",
     ]:
         raise ValueError("Installed CodeCortex MCP configuration failed validation")
+    tools = server.get("tools")
+    apply = tools.get("apply_cognitive_proposal") if isinstance(tools, Table) else None
+    if not isinstance(apply, Table) or apply.get("approval_mode") != "prompt":
+        raise ValueError("Installed CodeCortex proposal approval mode failed validation")
     tomlkit.parse((root / AGENT_RELATIVE).read_text(encoding="utf-8"))
 
 

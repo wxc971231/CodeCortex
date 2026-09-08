@@ -17,8 +17,14 @@ Codex coding depend on CodeCortex.
 3. Treat every formal cognition change as a discussion: create a Proposal,
    show its affected scope and current `patch_digest`, and allow the user to
    discuss or revise it.
-4. Call `apply_cognitive_proposal` only after the user explicitly approves the
-   exact current patch digest. Never infer approval from an earlier message.
+4. When you present a pending Proposal, show its affected scope and current
+   `patch_digest`, then call `apply_cognitive_proposal` with exactly that
+   `proposal_id` and `patch_digest`. The default host configuration uses
+   Codex's native MCP tool approval; do not ask the user to retype an ID or
+   digest. If the user has selected Codex's own “approve for me” or Guardian
+   review, the host resolves that same approval automatically. Do not add a
+   separate CodeCortex bypass mode or claim a custom approval button. Core
+   still rejects stale or mismatched patches.
 5. If CodeCortex is unavailable or the graph does not cover the question, use
    normal Codex source search and explain the limitation. Do not block ordinary
    work while waiting for CodeCortex.
@@ -37,7 +43,7 @@ sync_repository_facts(mode="full")
 → create_cognitive_proposal_from_analysis
 → show Big Picture + operation diff + affected scope + uncertainties
 → discuss/revise if requested
-→ apply only after explicit approval of the current patch_digest
+→ apply with the displayed proposal_id and current patch_digest through Codex host approval
 ```
 
 The Analyzer must use its read-only profile, read only bounded fact/context
@@ -86,12 +92,104 @@ user-confirmed intent: conflicts remain explicit Proposal operations for the
 user to discuss and approve. "No deletion proposed" is an explicit outcome,
 not permission to erase unmentioned nodes.
 
+The reinitialize AnalysisReport must include `change_operations`; candidate
+collections alone are not a diff. Each operation has exactly
+`kind`, `target_id`, `before_revision`, `change_kind`, and `change_group`.
+Use the existing stable-ID primitives (`add/update/remove_node`,
+`add/update/remove_edge`, `set_logical_flow`, `remove_logical_flow`, and
+`add/update/remove_mapping`). A non-remove operation references its after
+value by the same stable ID in exactly one candidate collection. Use null
+`before_revision` only when the target must be absent; update/remove requires
+the exact positive object revision from the existing graph. Never infer a
+remove from an omitted candidate.
+
+`change_kind` is one of add/update/remove/move/merge/split/conflict and
+`change_group` is a lowercase slug shared by all primitives for that change.
+These are audit labels, not magic operations: spell out every edge, flow, and
+mapping rewire. A merge group needs an explicit `remove_node` plus a retained
+or rewired primitive; a split group needs an explicit `add_node` plus an
+updated or rewired primitive. Mark a concrete proposed conflict resolution
+with `conflict`; if no deterministic primitive resolution is ready, report it
+under `uncertainties` and do not invent an operation. Initial analysis may
+omit `change_operations` only while `cognition_initialized=false`, in which
+case Core retains the legacy add-only interpretation.
+
 The user approving analysis or an Analyzer dispatch is not Proposal approval.
-Apply only if the user explicitly approves the exact, currently displayed
-`proposal_id` and `patch_digest`; a changed/revised/stale patch needs fresh
-approval.
+After displaying the current `proposal_id` and `patch_digest`, invoke the
+apply tool with both exact values. The default `prompt` mode asks Codex to
+approve the native tool call. A user-selected “approve for me” or Guardian
+session may resolve that host approval automatically; it is not a
+CodeCortex-specific bypass. A changed/revised/stale patch needs a fresh tool
+call and remains subject to Core's exact digest checks.
 
 M1a supports deterministic Python facts, bounded Analyzer reports,
 analysis-backed aggregate Proposals, source baselines, rendering/inspection,
 and the safe Proposal lifecycle. General freshness-routed project Q&A remains
 an M1b capability.
+
+## M1b explicit project discussions and semantic synchronization
+
+For every explicit `$codecortex ask`, `inspect`, `sync`, `expand`, or
+reinitialize operation, run deterministic Fact Preflight before drawing a
+conclusion. It refreshes only disposable facts and computes one current
+baseline-to-source ChangeSet; it never calls an Agent and never needs user
+approval. Do not make ordinary Codex coding run this workflow.
+
+For every explicit `$codecortex ask`, `inspect`, or `sync`, call
+`pending_changes(cursor=null, limit=50)` after Preflight and report its result
+faithfully before describing freshness or changed source. Keep
+`changed_files` and `unmapped_changes` as separate lists: only the former are
+baseline-detected added, modified, deleted, or renamed files. An unmapped
+dependency or entity is not a modified or refreshed source file. Preserve its
+reported path and reason (for example
+`one_hop_dependency_has_no_formal_owner`) as an uncertainty. If the result is
+truncated, page it before making a complete-file claim. Report
+`scope_confidence=partial` or `unknown` as a limit on the conclusion; never
+upgrade it by narration.
+
+For a question, use `search_cognitive_graph` for bounded candidate recall, use
+your own reasoning to confirm relevant Responsibility/Behavior/Capability
+anchors, obtain `effective_query_freshness`, then pull only bounded discussion
+context and the necessary current facts/source. A graph result is a preference,
+not a search restriction. If there is no confirmed semantic anchor, use normal
+Native Codex `rg`, directory, source, configuration, test, and documentation
+exploration without restriction.
+
+If query freshness is `affected_source_first` or `unknown_source_first`, label
+the graph as baseline navigation only. Read current facts and source before
+answering, distinguish approved graph conclusions from current-source evidence
+and uncertainty, and do not block the answer waiting for a graph update. For
+`affected_source_first`, identify changed locations only from
+`pending_changes.changed_files` and use those current files as source evidence;
+describe any `unmapped_changes` separately as unresolved scope rather than as
+the changed location.
+
+For a relevant unmaterialized Behavior, ask **once per explicit CodeCortex
+invocation**:
+
+```text
+A. Expand it now: analyze the current bounded scope, then show one aggregate
+   Proposal. This authorizes analysis only; it is not approval of an unknown
+   patch. After displaying a resulting proposal, invoke the exact-digest apply
+   tool so Codex can resolve host approval.
+B. Keep it transient: answer now from current graph coverage, indexed facts,
+   and source. Create no Proposal and do not repeat this question for the same
+   Behavior during this invocation.
+```
+
+Keep that one-time decision only in the live Main invocation; do not persist a
+Codex thread or chat history in Core or `.codecortex/`. Never auto-apply,
+auto-create a formal graph change, or turn a per-file observation into a
+Proposal.
+
+For explicit `$codecortex sync`, use a small, complete, single-Responsibility
+scope for Main Codex analysis. Use the read-only `codecortex-analyzer` for a
+large, cross-Responsibility, unresolved, or otherwise unbounded scope. Either
+path may produce an aggregate Proposal only after analysis; semantic changes
+use native exact-digest host approval to apply. A no-semantic-change conclusion may
+use the audited baseline-advance path described by Core.
+
+Summarize pending Proposals at most once per explicit CodeCortex invocation.
+After the user defers or rejects one, do not repeat the reminder in that
+invocation. Mention high-impact deletion or migration only at a natural
+checkpoint; never interrupt ordinary Codex work for it.

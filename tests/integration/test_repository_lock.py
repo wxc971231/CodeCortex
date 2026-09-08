@@ -8,7 +8,7 @@ import pytest
 
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.infrastructure import locking
-from codecortex.infrastructure.locking import RepositoryLock
+from codecortex.infrastructure.locking import ReadOnlyRepositoryLock, RepositoryLock
 
 
 def hold_lock(repo_path: str, mode: str, ready: Event, release: Event) -> None:
@@ -126,11 +126,46 @@ def test_lock_file_is_private_and_persists_after_release(repo_path: Path) -> Non
     assert lock_path.is_file()
 
 
+@pytest.mark.parametrize("unsafe_component", ["cache", "lock"])
+def test_main_lock_rejects_symlink_escape_without_touching_target(
+    repo_path: Path, unsafe_component: str
+) -> None:
+    """Main must not create or chmod a lock through a repository symlink."""
+    codecortex = repo_path / ".codecortex"
+    codecortex.mkdir()
+    outside = repo_path.parent / "outside"
+    outside.mkdir()
+    if unsafe_component == "cache":
+        (codecortex / ".cache").symlink_to(outside, target_is_directory=True)
+        outside_target = outside / "repository.lock"
+        outside_target.write_text("outside", encoding="utf-8")
+    else:
+        cache = codecortex / ".cache"
+        cache.mkdir()
+        outside_target = outside / "repository.lock"
+        outside_target.write_text("outside", encoding="utf-8")
+        (cache / "repository.lock").symlink_to(outside_target)
+    before = outside_target.read_bytes()
+    before_mode = outside_target.stat().st_mode
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        RepositoryLock(repo_path).acquire("exclusive", timeout_seconds=0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.PATH_OUTSIDE_REPOSITORY
+    assert outside_target.read_bytes() == before
+    assert outside_target.stat().st_mode == before_mode
+
+
 def test_permission_setting_failure_closes_lock_descriptor(
     repo_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A permission-setting failure must not leak the newly opened descriptor."""
+    opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
+    open_descriptor = locking.os.open
     close_descriptor = locking.os.close
 
     def fail_permission_setting(*_args: object) -> None:
@@ -140,6 +175,12 @@ def test_permission_setting_failure_closes_lock_descriptor(
         closed_descriptors.append(descriptor)
         close_descriptor(descriptor)
 
+    def record_open(*args: object, **kwargs: object) -> int:
+        descriptor = open_descriptor(*args, **kwargs)  # type: ignore[arg-type]
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(locking.os, "open", record_open)
     monkeypatch.setattr(locking.os, "chmod", fail_permission_setting)
     monkeypatch.setattr(locking.os, "fchmod", fail_permission_setting)
     monkeypatch.setattr(locking.os, "close", record_close)
@@ -150,14 +191,16 @@ def test_permission_setting_failure_closes_lock_descriptor(
     ):
         pass
 
-    assert len(closed_descriptors) == 1
+    assert sorted(opened_descriptors) == sorted(closed_descriptors)
 
 
 def test_unlock_failure_still_closes_lock_descriptor(
     repo_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unlock error must not prevent the descriptor from being closed."""
+    opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
+    open_descriptor = locking.os.open
     close_descriptor = locking.os.close
     flock = locking.fcntl.flock
 
@@ -170,7 +213,13 @@ def test_unlock_failure_still_closes_lock_descriptor(
         closed_descriptors.append(descriptor)
         close_descriptor(descriptor)
 
+    def record_open(*args: object, **kwargs: object) -> int:
+        descriptor = open_descriptor(*args, **kwargs)  # type: ignore[arg-type]
+        opened_descriptors.append(descriptor)
+        return descriptor
+
     monkeypatch.setattr(locking.fcntl, "flock", fail_unlock)
+    monkeypatch.setattr(locking.os, "open", record_open)
     monkeypatch.setattr(locking.os, "close", record_close)
 
     with (
@@ -179,4 +228,104 @@ def test_unlock_failure_still_closes_lock_descriptor(
     ):
         pass
 
-    assert len(closed_descriptors) == 1
+    assert sorted(opened_descriptors) == sorted(closed_descriptors)
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "directory"])
+def test_read_only_lock_rejects_non_regular_lock_targets(
+    repo_path: Path, unsafe_kind: str
+) -> None:
+    cache = repo_path / ".codecortex" / ".cache"
+    cache.mkdir(parents=True)
+    target = cache / "repository.lock"
+    if unsafe_kind == "symlink":
+        outside = repo_path.parent / "outside.lock"
+        outside.write_text("", encoding="utf-8")
+        target.symlink_to(outside)
+    else:
+        target.mkdir()
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+
+
+def test_read_only_lock_rejects_cache_directory_symlink_escape(
+    repo_path: Path,
+) -> None:
+    outside = repo_path.parent / "outside-cache"
+    outside.mkdir()
+    (outside / "repository.lock").write_text("", encoding="utf-8")
+    (repo_path / ".codecortex").mkdir()
+    (repo_path / ".codecortex" / ".cache").symlink_to(outside)
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+
+
+def test_read_only_lock_maps_open_oserror_to_rebuild_required(
+    repo_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with RepositoryLock(repo_path).acquire("shared", 0.05):
+        pass
+    monkeypatch.setattr(
+        locking.os,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("lock cannot be opened")
+        ),
+    )
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+
+
+def test_read_only_lock_closes_every_descriptor_when_fstat_fails(
+    repo_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with RepositoryLock(repo_path).acquire("shared", 0.05):
+        pass
+    opened: list[int] = []
+    closed: list[int] = []
+    open_descriptor = locking.os.open
+    close_descriptor = locking.os.close
+
+    def record_open(*args: object, **kwargs: object) -> int:
+        descriptor = open_descriptor(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        close_descriptor(descriptor)
+
+    monkeypatch.setattr(locking.os, "open", record_open)
+    monkeypatch.setattr(locking.os, "close", record_close)
+    monkeypatch.setattr(
+        locking.os,
+        "fstat",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("fstat failed")),
+    )
+
+    with (
+        pytest.raises(CodeCortexError) as raised,
+        ReadOnlyRepositoryLock(repo_path).acquire("shared", 0.05),
+    ):
+        pass
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+    assert sorted(opened) == sorted(closed)

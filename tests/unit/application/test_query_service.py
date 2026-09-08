@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -227,6 +228,44 @@ def test_analysis_scope_partitions_by_module(
     assert [diagnostic.code for diagnostic in result.diagnostics] == ["E_TEST"]
     assert result.truncated is False
     assert result.cursor is None
+
+
+def test_non_metadata_fact_query_corruption_maps_to_rebuild_required(
+    query_service: QueryService,
+    facts: FactsDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        facts,
+        "analysis_totals",
+        lambda: (_ for _ in ()).throw(sqlite3.DatabaseError("malformed page")),
+    )
+
+    with pytest.raises(CodeCortexError) as raised:
+        query_service.analysis_scope()
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+    assert raised.value.retryable is True
+
+
+def test_non_metadata_replica_query_corruption_maps_to_rebuild_required(
+    query_service: QueryService,
+    replica: GraphReplica,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        replica,
+        "node_kind_counts",
+        lambda _revision: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database disk image is malformed")
+        ),
+    )
+
+    with pytest.raises(CodeCortexError) as raised:
+        query_service.analysis_scope()
+
+    assert raised.value.code is ErrorCode.CACHE_REBUILD_REQUIRED
+    assert raised.value.retryable is True
 
 
 def test_analysis_scope_scoped_to_package_prefix(

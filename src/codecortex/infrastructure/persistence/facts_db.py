@@ -16,11 +16,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from codecortex.infrastructure.persistence.sqlite_safety import (
+    read_only_sqlite_uri,
+    read_write_sqlite_uri,
+)
 from codecortex.infrastructure.python.parser import (
     EntityIdentityHint,
     ParsedFile,
     SyntacticRelation,
 )
+from codecortex.telemetry import traced
 
 if TYPE_CHECKING:
     from codecortex.infrastructure.python.resolver import ResolvedRelation, SymbolIndex
@@ -149,6 +154,28 @@ class CacheMetadata:
 
 
 @dataclass(frozen=True)
+class FactEntitySnapshot:
+    """A compact entity projection used for baseline-to-current comparison."""
+
+    uid: str
+    baseline_source_digest: str | None
+    relative_path: str
+    address: str
+    kind: str
+    signature: str | None
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class SourceFileStatus:
+    """Current parse state needed for conservative freshness decisions."""
+
+    relative_path: str
+    parse_status: str
+    diagnostic_count: int
+
+
+@dataclass(frozen=True)
 class ModulePartition:
     """One package/module partition of the current managed-source facts."""
 
@@ -187,8 +214,20 @@ class FactsDatabase:
     max_relation_entity_uids = 200
     schema_version = _CACHE_SCHEMA_VERSION
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        read_only: bool = False,
+        repository_root: Path | None = None,
+    ) -> None:
         self.path = Path(path)
+        self._read_only = read_only
+        self._repository_root = (
+            None if repository_root is None else Path(repository_root)
+        )
+        if read_only and self._repository_root is None:
+            raise ValueError("Read-only fact cache requires a repository root")
 
     @classmethod
     def create_new(cls, path: Path) -> FactsDatabase:
@@ -215,9 +254,7 @@ class FactsDatabase:
 
     def open_read(self) -> sqlite3.Connection:
         """Open a URI-mode read-only, query-only connection for bounded reads."""
-        connection = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?mode=ro", uri=True
-        )
+        connection = sqlite3.connect(self._read_uri(), uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
@@ -226,12 +263,32 @@ class FactsDatabase:
 
     def open_write(self) -> sqlite3.Connection:
         """Open the only connection mode permitted to mutate the local cache."""
-        connection = sqlite3.connect(self.path)
+        if self._read_only:
+            raise sqlite3.OperationalError("Read-only fact cache cannot be modified")
+        if self._repository_root is None:
+            connection = sqlite3.connect(self.path)
+        else:
+            connection = sqlite3.connect(
+                read_write_sqlite_uri(
+                    self.path, self._repository_root, label="fact cache"
+                ),
+                uri=True,
+            )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         return connection
+
+    def _read_uri(self) -> str:
+        if self._repository_root is not None:
+            return read_only_sqlite_uri(
+                self.path,
+                self._repository_root,
+                label="fact cache",
+                allow_incomplete_wal=not self._read_only,
+            )
+        return f"{self.path.resolve().as_uri()}?mode=ro"
 
     def foreign_keys_enabled(self) -> bool:
         with self.open_read() as connection:
@@ -289,6 +346,120 @@ class FactsDatabase:
             ).fetchall()
         return {row["relative_path"]: row["content_digest"] for row in rows}
 
+    def current_entity_snapshots(self) -> tuple[FactEntitySnapshot, ...]:
+        """Return all current entities in a stable, narrow comparison projection."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT e.uid, sf.relative_path, e.address, e.kind, e.signature, "
+                "e.fingerprint FROM entities AS e JOIN source_files AS sf "
+                "ON sf.file_id = e.file_id ORDER BY e.uid"
+            ).fetchall()
+        return tuple(
+            FactEntitySnapshot(
+                uid=row["uid"],
+                baseline_source_digest=None,
+                relative_path=row["relative_path"],
+                address=row["address"],
+                kind=row["kind"],
+                signature=row["signature"],
+                fingerprint=row["fingerprint"],
+            )
+            for row in rows
+        )
+
+    def baseline_entity_snapshots(self) -> tuple[FactEntitySnapshot, ...]:
+        """Return the formal-baseline cache snapshot, never an implicit fallback."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT uid, baseline_source_digest, relative_path, address, kind, "
+                "signature, fingerprint FROM baseline_entity_snapshots ORDER BY uid"
+            ).fetchall()
+        return tuple(
+            FactEntitySnapshot(
+                uid=row["uid"],
+                baseline_source_digest=row["baseline_source_digest"],
+                relative_path=row["relative_path"],
+                address=row["address"],
+                kind=row["kind"],
+                signature=row["signature"],
+                fingerprint=row["fingerprint"],
+            )
+            for row in rows
+        )
+
+    def source_file_statuses(self) -> tuple[SourceFileStatus, ...]:
+        """Return every current source file's parse state in stable path order."""
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relative_path, parse_status, diagnostic_count FROM source_files "
+                "ORDER BY relative_path"
+            ).fetchall()
+        return tuple(
+            SourceFileStatus(
+                relative_path=row["relative_path"],
+                parse_status=row["parse_status"],
+                diagnostic_count=row["diagnostic_count"],
+            )
+            for row in rows
+        )
+
+    def diagnostic_codes_for_paths(
+        self, relative_paths: Sequence[str]
+    ) -> dict[str, tuple[str, ...]]:
+        """Return current parse/analysis diagnostic codes for explicit source paths."""
+        paths = _validated_non_empty_strings(relative_paths, "Source path list")
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT sf.relative_path, d.code FROM diagnostics AS d "
+                "JOIN source_files AS sf ON sf.file_id = d.file_id "
+                f"WHERE sf.relative_path IN ({_placeholders(paths)}) "
+                "ORDER BY sf.relative_path, d.code",
+                paths,
+            ).fetchall()
+        codes: dict[str, list[str]] = {}
+        for row in rows:
+            codes.setdefault(row["relative_path"], []).append(row["code"])
+        return {path: tuple(values) for path, values in codes.items()}
+
+    def relations_touching_entity_uids(
+        self, entity_uids: Sequence[str]
+    ) -> tuple[CodeRelation, ...]:
+        """Return one-hop local dependency facts touching the supplied entities."""
+        uids = _validated_non_empty_strings(entity_uids, "Entity UID list")
+        if len(uids) > self.max_relation_entity_uids:
+            raise ValueError("Entity UID list exceeds the configured maximum")
+        placeholders = _placeholders(uids)
+        with self.open_read() as connection:
+            rows = connection.execute(
+                "SELECT relation_id, relation_type, source_uid, source_file_id, "
+                "target_uid, target_module, target_address, raw_expression, "
+                "resolution_status, confidence, resolver_version, relation_key "
+                "FROM relations WHERE relation_type IN ('imports', 'inherits', 'calls') "
+                f"AND (source_uid IN ({placeholders}) OR target_uid IN ({placeholders})) "
+                "ORDER BY relation_id",
+                (*uids, *uids),
+            ).fetchall()
+        return tuple(_code_relation_from_row(row) for row in rows)
+
+    def copy_baseline_entity_snapshots_from(self, previous: FactsDatabase) -> None:
+        """Preserve historical rows when replacing a healthy cache under its lock."""
+        with previous.open_read() as connection:
+            rows = connection.execute(
+                "SELECT uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature "
+                "FROM baseline_entity_snapshots ORDER BY uid"
+            ).fetchall()
+        with self.open_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM baseline_entity_snapshots")
+            connection.executemany(
+                "INSERT INTO baseline_entity_snapshots "
+                "(uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(tuple(row) for row in rows),
+            )
+
     def replace_baseline_entity_snapshots(self, baseline_source_digest: str) -> None:
         """Copy every current entity into the baseline snapshot table.
 
@@ -318,6 +489,60 @@ class FactsDatabase:
             cursor = connection.execute(
                 "UPDATE cache_metadata "
                 "SET baseline_entity_snapshot_completeness = 'complete' "
+                "WHERE singleton_id = 1"
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Fact cache metadata is missing")
+
+    def seed_partial_baseline_entity_snapshots(
+        self,
+        baseline_source_digest: str,
+        entities: Sequence[FactEntitySnapshot],
+    ) -> None:
+        """Seed formal historical entity anchors after cache recovery.
+
+        A clone has no prior cache for source declarations that were deleted
+        after the formal baseline.  Formal refs preserve those anchors for
+        diagnostics and mapping traversal, while the ``partial`` marker keeps
+        ChangeDetector from claiming a complete entity diff from this subset.
+        """
+        if (
+            not isinstance(baseline_source_digest, str)
+            or not baseline_source_digest.startswith("sha256:")
+            or len(baseline_source_digest) != 71
+        ):
+            raise ValueError("Baseline source digest must be SHA-256")
+        records = tuple(entities)
+        if any(not isinstance(entity, FactEntitySnapshot) for entity in records):
+            raise TypeError("Baseline seed entities must be FactEntitySnapshot records")
+        if len({entity.uid for entity in records}) != len(records):
+            raise ValueError("Baseline seed entities must have unique UIDs")
+        with self.open_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM baseline_entity_snapshots")
+            connection.executemany(
+                "INSERT INTO baseline_entity_snapshots "
+                "(uid, baseline_source_digest, relative_path, address, "
+                "module_name, qualname, kind, fingerprint, signature) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(
+                    (
+                        entity.uid,
+                        baseline_source_digest,
+                        entity.relative_path,
+                        entity.address,
+                        _snapshot_module_name(entity.address),
+                        _snapshot_qualname(entity.address),
+                        entity.kind,
+                        entity.fingerprint,
+                        entity.signature,
+                    )
+                    for entity in records
+                ),
+            )
+            cursor = connection.execute(
+                "UPDATE cache_metadata "
+                "SET baseline_entity_snapshot_completeness = 'partial' "
                 "WHERE singleton_id = 1"
             )
             if cursor.rowcount != 1:
@@ -659,6 +884,7 @@ class FactsDatabase:
                 connection, parsed, deleted_paths=deleted_paths
             )
 
+    @traced("fact_sync.commit", level="DEBUG")
     def synchronize(
         self,
         parsed: Sequence[ParsedFile],
@@ -1340,6 +1566,18 @@ def _ensure_task4_relation_columns(connection: sqlite3.Connection) -> None:
     for name, definition in additions:
         if name not in actual:
             connection.execute(f"ALTER TABLE relations ADD COLUMN {name} {definition}")
+
+
+def _snapshot_module_name(address: str) -> str:
+    """Derive the indexed module partition from a persisted entity address."""
+    module, separator, _ = address.partition(":")
+    return module if separator else address
+
+
+def _snapshot_qualname(address: str) -> str:
+    """Derive the indexed symbol partition from a persisted entity address."""
+    _, separator, qualname = address.partition(":")
+    return qualname if separator else address
 
 
 _SCHEMA_TABLES = frozenset(

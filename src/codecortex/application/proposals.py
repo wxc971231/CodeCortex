@@ -43,7 +43,10 @@ from codecortex.application.ports import (
     ViewRendererPort,
 )
 from codecortex.domain import graph as graph_model
-from codecortex.domain.analysis import AnalysisReport
+from codecortex.domain.analysis import (
+    AnalysisOperationKind,
+    AnalysisReport,
+)
 from codecortex.domain.cognition import (
     DIGEST_PROFILE_VERSION,
     MANAGED_SOURCE_SET_VERSION,
@@ -70,6 +73,7 @@ from codecortex.infrastructure.persistence.entity_refs import recompute_entity_r
 from codecortex.infrastructure.persistence.facts_db import FactsDatabase
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.views import render_legacy_views
+from codecortex.telemetry import traced
 
 SourceProbe = Callable[[], "ManagedSourceSnapshot"]
 
@@ -92,8 +96,28 @@ class GraphApplyResult:
     cache_warnings: tuple[str, ...] = ()
 
 
-def operations_from_report(report: AnalysisReport) -> tuple[PatchOperation, ...]:
-    """Convert validated report candidates into stable-ID patch operations."""
+def operations_from_report(
+    report: AnalysisReport,
+    graph: CognitiveGraph | None = None,
+    *,
+    cognition_initialized: bool = False,
+) -> tuple[PatchOperation, ...]:
+    """Convert a report into primitives after checking target expectations.
+
+    Legacy candidate-only reports remain an initialization-only compatibility
+    form.  Once cognition exists, every change must be explicit so omission
+    can never be interpreted as replacement or deletion.
+    """
+    if report.change_operations is not None:
+        if graph is None:
+            raise _invalid_patch(
+                "Explicit analysis changes require the current formal graph"
+            )
+        return _explicit_operations_from_report(report, graph)
+    if cognition_initialized:
+        raise _invalid_patch(
+            "An initialized graph requires explicit AnalysisReport change_operations"
+        )
     operations = [
         PatchOperation("add_node", node.id, _node_value(node))
         for node in report.candidate_nodes
@@ -113,15 +137,170 @@ def operations_from_report(report: AnalysisReport) -> tuple[PatchOperation, ...]
     return tuple(operations)
 
 
-def affected_nodes_from_report(report: AnalysisReport) -> tuple[str, ...]:
+def _explicit_operations_from_report(
+    report: AnalysisReport, graph: CognitiveGraph
+) -> tuple[PatchOperation, ...]:
+    candidates: dict[tuple[str, str], dict[str, object]] = {
+        **{("node", node.id): _node_value(node) for node in report.candidate_nodes},
+        **{("edge", edge.id): _edge_value(edge) for edge in report.candidate_edges},
+        **{
+            ("flow", flow.behavior_id): _flow_value(flow)
+            for flow in report.candidate_flows
+        },
+        **{
+            ("mapping", mapping.id): _mapping_value(mapping)
+            for mapping in report.candidate_mappings
+        },
+    }
+    current: dict[tuple[str, str], Mapping[str, object]] = {
+        **{("node", str(item.get("id"))): item for item in graph.nodes},
+        **{("edge", str(item.get("id"))): item for item in graph.semantic_edges},
+        **{
+            ("flow", str(item.get("behavior_id"))): item
+            for item in graph.logical_flows
+        },
+        **{
+            ("mapping", str(item.get("id"))): item
+            for item in graph.implementation_mappings
+        },
+    }
+    revision_keys = {
+        "node": "node_revision",
+        "edge": "edge_revision",
+        "flow": "flow_revision",
+        "mapping": "mapping_revision",
+    }
+    operations: list[PatchOperation] = []
+    consumed: set[tuple[str, str]] = set()
+    for requested in report.change_operations or ():
+        object_kind = _analysis_operation_object_kind(requested.kind)
+        target = (object_kind, requested.target_id)
+        existing = current.get(target)
+        if requested.before_revision is None:
+            if existing is not None:
+                raise _invalid_patch(
+                    f"Expected {object_kind} to be absent before change: "
+                    f"{requested.target_id}"
+                )
+        else:
+            if existing is None:
+                raise _invalid_patch(
+                    f"Expected {object_kind} does not exist: {requested.target_id}"
+                )
+            actual_revision = existing.get(revision_keys[object_kind])
+            if actual_revision != requested.before_revision:
+                raise _invalid_patch(
+                    f"Analysis before_revision does not match current {object_kind}: "
+                    f"{requested.target_id}"
+                )
+        if requested.kind is AnalysisOperationKind.REMOVE_LOGICAL_FLOW:
+            operations.append(
+                PatchOperation(
+                    "set_logical_flow",
+                    requested.target_id,
+                    None,
+                    expected_revision=requested.before_revision,
+                )
+            )
+        elif requested.kind.value.startswith("remove_"):
+            operations.append(
+                PatchOperation(
+                    requested.kind.value,
+                    requested.target_id,
+                    None,
+                    expected_revision=requested.before_revision,
+                )
+            )
+        else:
+            value = candidates.get(target)
+            if value is None:
+                raise _invalid_patch(
+                    f"Analysis operation has no candidate value: {requested.target_id}"
+                )
+            consumed.add(target)
+            operations.append(
+                PatchOperation(
+                    requested.kind.value,
+                    requested.target_id,
+                    value,
+                    expected_revision=(
+                        "absent"
+                        if requested.before_revision is None
+                        else requested.before_revision
+                    ),
+                )
+            )
+    unused = set(candidates) - consumed
+    if unused:
+        raise _invalid_patch(
+            "Explicit analysis candidates must each have one change operation"
+        )
+    return tuple(operations)
+
+
+def _analysis_operation_object_kind(kind: AnalysisOperationKind) -> str:
+    if kind.value.endswith("_node"):
+        return "node"
+    if kind.value.endswith("_edge"):
+        return "edge"
+    if kind.value.endswith("_mapping"):
+        return "mapping"
+    return "flow"
+
+
+def affected_nodes_from_report(
+    report: AnalysisReport, graph: CognitiveGraph | None = None
+) -> tuple[str, ...]:
     """Collect the sorted semantic-node scope one report touches."""
     affected = {node.id for node in report.candidate_nodes}
     affected.update(flow.behavior_id for flow in report.candidate_flows)
+    for edge in report.candidate_edges:
+        affected.update((edge.source_id, edge.target_id))
     affected.update(
         mapping.subject_id
         for mapping in report.candidate_mappings
         if mapping.subject_kind == graph_model.MappingSubjectKind.NODE
     )
+    affected.update(
+        mapping.subject_id.split("#step.", 1)[0]
+        for mapping in report.candidate_mappings
+        if mapping.subject_kind == graph_model.MappingSubjectKind.FLOW_STEP
+    )
+    if report.change_operations is not None:
+        current_edges = (
+            {}
+            if graph is None
+            else {str(item.get("id")): item for item in graph.semantic_edges}
+        )
+        current_mappings = (
+            {}
+            if graph is None
+            else {
+                str(item.get("id")): item
+                for item in graph.implementation_mappings
+            }
+        )
+        for operation in report.change_operations:
+            object_kind = _analysis_operation_object_kind(operation.kind)
+            if object_kind in {"node", "flow"}:
+                affected.add(operation.target_id)
+            elif object_kind == "edge":
+                current_edge = current_edges.get(operation.target_id)
+                if current_edge is not None:
+                    affected.update(
+                        str(endpoint)
+                        for endpoint in (
+                            current_edge.get("source_id"),
+                            current_edge.get("target_id"),
+                        )
+                        if isinstance(endpoint, str)
+                    )
+            else:
+                mapping = current_mappings.get(operation.target_id)
+                if mapping is not None:
+                    subject = mapping.get("subject_id")
+                    if isinstance(subject, str):
+                        affected.add(subject.split("#step.", 1)[0])
     return tuple(sorted(affected))
 
 
@@ -152,6 +331,13 @@ def apply_operations_to_graph(
     for operation in operations:
         kind = PatchOperationKind(operation.kind)
         target = operation.target_id
+        _verify_target_revision(
+            operation,
+            nodes=nodes,
+            edges=edges,
+            flows=flows,
+            mappings=mappings,
+        )
         if kind is PatchOperationKind.ADD_NODE:
             if target in nodes:
                 raise _invalid_patch(f"Node already exists: {target}")
@@ -224,6 +410,41 @@ def apply_operations_to_graph(
     )
 
 
+def _verify_target_revision(
+    operation: PatchOperation,
+    *,
+    nodes: Mapping[str, Mapping[str, object]],
+    edges: Mapping[str, Mapping[str, object]],
+    flows: Mapping[str, Mapping[str, object]],
+    mappings: Mapping[str, Mapping[str, object]],
+) -> None:
+    expected = operation.expected_revision
+    if expected is None:
+        return
+    kind = PatchOperationKind(operation.kind)
+    if kind.value.endswith("_node"):
+        records, revision_key = nodes, "node_revision"
+    elif kind.value.endswith("_edge"):
+        records, revision_key = edges, "edge_revision"
+    elif kind.value.endswith("_mapping"):
+        records, revision_key = mappings, "mapping_revision"
+    else:
+        records, revision_key = flows, "flow_revision"
+    current = records.get(operation.target_id)
+    if expected == "absent":
+        if current is not None:
+            raise _invalid_patch(
+                f"Target expected to be absent: {operation.target_id}"
+            )
+        return
+    actual = None if current is None else current.get(revision_key)
+    if actual != expected:
+        raise _invalid_patch(
+            f"Target expected revision {expected}, found {actual}: "
+            f"{operation.target_id}"
+        )
+
+
 class ProposalService:
     """Create analysis-backed proposals and apply them as one transaction."""
 
@@ -250,6 +471,7 @@ class ProposalService:
         self._replica = replica
         self._lock_timeout_seconds = lock_timeout_seconds
 
+    @traced("proposal.create")
     def create_proposal_from_analysis(
         self,
         report: AnalysisReport,
@@ -289,13 +511,50 @@ class ProposalService:
                 raise _stale_proposal(
                     "Analysis report source digest no longer matches the repository"
                 )
+            operations = operations_from_report(
+                report,
+                state.graph,
+                cognition_initialized=state.manifest.cognition_initialized,
+            )
+            preview_event_id = new_id(IdPrefix.EVENT)
+            preview_revision = state.graph.graph_revision + 1
+            preview_graph = apply_operations_to_graph(
+                state.graph, operations, preview_event_id, preview_revision
+            )
+            preview_refs = recompute_entity_refs(
+                preview_graph,
+                preview_revision,
+                facts=self._facts,
+                previous=state.entity_refs,
+            )
+            preview_state = replace(
+                state,
+                graph=preview_graph,
+                entity_refs=preview_refs,
+            )
+            violations = graph_model.validate_cognitive_graph(
+                typed_graph_from_formal(preview_state)
+            )
+            if violations:
+                raise CodeCortexError(
+                    ErrorCode.ANALYSIS_REPORT_INVALID,
+                    "Analysis report operations do not produce a valid cognitive graph",
+                    details={
+                        "issues": [
+                            f"{violation.code} at {violation.location}: "
+                            f"{violation.message}"
+                            for violation in violations
+                        ]
+                    },
+                    suggested_action="Correct the report operations and rerun analysis",
+                )
             proposal = Proposal.create(
                 proposal_id=proposal_id or new_id(IdPrefix.PROPOSAL),
                 base_graph_revision=report.base_graph_revision,
                 analyzed_source_digest=report.analyzed_source_digest,
                 source_preconditions=_source_preconditions(snapshot),
-                operations=operations_from_report(report),
-                affected_nodes=affected_nodes_from_report(report),
+                operations=operations,
+                affected_nodes=affected_nodes_from_report(report, state.graph),
                 reason=reason,
                 evidence=tuple(
                     _evidence_value(evidence) for evidence in report.evidence
@@ -308,6 +567,7 @@ class ProposalService:
             self._pending.create(proposal)
             return proposal
 
+    @traced("proposal.apply", result=lambda value: {"graph_revision": value.graph_revision, "cache_warning_count": len(value.cache_warnings)})
     def apply_cognitive_proposal(
         self, proposal_id: str, approval: ApprovalRecord
     ) -> GraphApplyResult:
@@ -426,6 +686,7 @@ class ProposalService:
         with self._repository_lock.acquire("exclusive", self._lock_timeout_seconds):
             self._formal_store.recover()
 
+    @traced("proposal.cache_refresh", level="DEBUG", result=lambda value: {"cache_warning_count": len(value)})
     def _refresh_caches(
         self, applied: FormalState, *, baseline_digest: str | None
     ) -> tuple[str, ...]:

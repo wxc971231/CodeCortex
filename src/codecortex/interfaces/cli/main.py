@@ -14,14 +14,17 @@ import traceback
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from codecortex import __version__
+from codecortex.application.baseline import BaselineAdvanceService
 from codecortex.application.fact_sync import FactSyncService
 from codecortex.application.initialize import InitializationService
 from codecortex.application.ports import RepositoryContextPort
+from codecortex.application.preflight import PreflightService
 from codecortex.application.proposals import ManagedSourceSnapshot, ProposalService
 from codecortex.application.query import QueryService
+from codecortex.application.recovery import RecoveryService
 from codecortex.application.replica_providers import (
     formal_entity_ref_provider,
     formal_history_event_provider,
@@ -30,8 +33,10 @@ from codecortex.application.services import ApplicationServices
 from codecortex.domain.errors import CodeCortexError, ErrorCode
 from codecortex.domain.facts import DigestProfile, SourceConfig
 from codecortex.infrastructure.formal import FormalStore
-from codecortex.infrastructure.locking import RepositoryLock
+from codecortex.infrastructure.locking import ReadOnlyRepositoryLock, RepositoryLock
 from codecortex.infrastructure.pending import PendingProposalStore
+from codecortex.infrastructure.persistence.facts_db import FactsDatabase
+from codecortex.infrastructure.persistence.freshness import FreshnessStore
 from codecortex.infrastructure.persistence.graph_replica import GraphReplica
 from codecortex.infrastructure.python.digest import (
     digest_source_file,
@@ -40,6 +45,7 @@ from codecortex.infrastructure.python.digest import (
 from codecortex.infrastructure.python.discovery import discover_python_source_set
 from codecortex.infrastructure.repository import Repository, find_repository
 from codecortex.infrastructure.views import render_views
+from codecortex.telemetry import configure, span
 
 ERROR_EXIT = {
     ErrorCode.NOT_INITIALIZED: 3,
@@ -124,28 +130,60 @@ def _doctor_unavailable(*, as_json: bool) -> int:
 def _mcp_unavailable(*, profile: str) -> int:
     from codecortex.interfaces.mcp.server import run_stdio
 
-    return run_stdio(profile, _default_services)
+    checked_profile = cast(Literal["main", "analyzer"], profile)
+    return run_stdio(profile, lambda: _default_services(checked_profile))
 
 
-def _default_services() -> ApplicationServices:
-    """Compose application services over the repository containing the CWD."""
+def _default_services(
+    profile: Literal["main", "analyzer"] = "main",
+) -> ApplicationServices:
+    """Compose profile-safe services over the repository containing the CWD."""
     repository = find_repository(Path.cwd())
     # Repository.root is a frozen (read-only) dataclass attribute while the port
     # declares a settable one; the composition only ever reads it.
     context = cast(RepositoryContextPort, repository)
     formal_store = FormalStore(repository)
-    repository_lock = RepositoryLock(repository.root)
+    runtime_config = formal_store.load_runtime_config()
+    source_config = runtime_config.source
+    digest_profile = DigestProfile()
+    query_config = runtime_config.query
+    lock_timeout_seconds = runtime_config.lock_timeout_seconds
+    repository_lock = (
+        RepositoryLock(repository.root)
+        if profile == "main"
+        else ReadOnlyRepositoryLock(repository.root)
+    )
     cache_directory = repository.root / ".codecortex" / ".cache"
+    freshness_store = FreshnessStore(
+        cache_directory, repository_root=repository.root
+    )
+    facts = FactsDatabase(
+        cache_directory / "facts.sqlite3",
+        read_only=(profile == "analyzer"),
+        repository_root=repository.root,
+    )
     fact_sync = FactSyncService(
         repository,
+        database=facts,
         repository_lock=repository_lock,
         formal_store=formal_store,
+        source_config=source_config,
+        digest_profile=digest_profile,
+        lock_timeout_seconds=lock_timeout_seconds,
     )
-    facts = fact_sync.database
-    replica = GraphReplica.create_new(
-        cache_directory / "cognitive.sqlite3",
-        entity_refs=formal_entity_ref_provider(formal_store),
-        history_events=formal_history_event_provider(formal_store),
+    replica_path = cache_directory / "cognitive.sqlite3"
+    entity_refs = formal_entity_ref_provider(formal_store)
+    history_events = formal_history_event_provider(formal_store)
+    replica = GraphReplica(
+        replica_path,
+        read_only=(profile == "analyzer"),
+        repository_root=repository.root,
+        max_search_limit=query_config.max_nodes,
+        max_context_nodes=query_config.max_nodes,
+        max_context_entities=query_config.max_entities,
+        max_context_evidence=query_config.max_evidence,
+        entity_refs=entity_refs,
+        history_events=history_events,
     )
     proposal_service = ProposalService(
         formal_store=formal_store,
@@ -153,14 +191,40 @@ def _default_services() -> ApplicationServices:
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
         fact_sync=fact_sync,
-        source_probe=lambda: _probe_sources(repository),
+        source_probe=lambda: _probe_sources(
+            repository, source_config, digest_profile
+        ),
         facts=facts,
         replica=replica,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
+    recovery = (
+        RecoveryService(
+            formal_store=formal_store,
+            fact_sync=fact_sync,
+            facts=facts,
+            freshness_store=freshness_store,
+            repository_lock=repository_lock,
+            cognitive_replica=replica,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
+        if profile == "main"
+        else None
+    )
+    preflight = PreflightService(
+        formal_store=formal_store,
+        fact_sync=fact_sync,
+        facts=facts,
+        freshness_store=freshness_store,
+        repository_lock=repository_lock,
+        recovery_service=recovery,
+        lock_timeout_seconds=lock_timeout_seconds,
     )
     return ApplicationServices(
         repository=context,
         formal_store=formal_store,
         repository_lock=repository_lock,
+        lock_timeout_seconds=lock_timeout_seconds,
         pending_proposals=PendingProposalStore(repository),
         view_renderer=render_views,
         fact_sync=fact_sync,
@@ -169,24 +233,46 @@ def _default_services() -> ApplicationServices:
             facts=facts,
             replica=replica,
             repository_lock=repository_lock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            max_node_limit=query_config.max_nodes,
+            max_entity_limit=query_config.max_entities,
+            max_evidence_limit=query_config.max_evidence,
         ),
         initialization_service=InitializationService(
             formal_store=formal_store,
             fact_sync=fact_sync,
             repository_lock=repository_lock,
             proposal_service=proposal_service,
+            lock_timeout_seconds=lock_timeout_seconds,
         ),
         m1a_proposal_service=proposal_service,
+        preflight_service=preflight,
+        baseline_advance_service=BaselineAdvanceService(
+            formal_store=formal_store,
+            fact_sync=fact_sync,
+            facts=facts,
+            freshness_store=freshness_store,
+            repository_lock=repository_lock,
+            lock_timeout_seconds=lock_timeout_seconds,
+        ),
         cognitive_replica=replica,
+        query_default_depth=query_config.default_depth,
+        query_max_nodes=query_config.max_nodes,
+        query_max_entities=query_config.max_entities,
+        query_max_evidence=query_config.max_evidence,
     )
 
 
-def _probe_sources(repository: Repository) -> ManagedSourceSnapshot:
+def _probe_sources(
+    repository: Repository,
+    source_config: SourceConfig,
+    digest_profile: DigestProfile,
+) -> ManagedSourceSnapshot:
     """Return a fresh managed-source snapshot for M1a proposal preconditions."""
-    discovered = discover_python_source_set(repository, SourceConfig())
+    discovered = discover_python_source_set(repository, source_config)
     files = [digest_source_file(source) for source in discovered.sources]
     return ManagedSourceSnapshot(
-        repository_source_digest=repository_digest(files, DigestProfile()),
+        repository_source_digest=repository_digest(files, digest_profile),
         file_digests={
             item.source.relative_path: item.content_digest for item in files
         },
@@ -208,7 +294,6 @@ def build_parser() -> ArgumentParser:
     install_codex.add_argument(
         "--force", action="store_true", help="overwrite CodeCortex-managed resources"
     )
-
     doctor = commands.add_parser("doctor", help="check the local CodeCortex setup")
     doctor.add_argument("--json", action="store_true", help="print JSON results")
 
@@ -272,6 +357,23 @@ def main(
     """Run the CLI contract, translating domain errors into exit codes."""
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    profile = arguments.profile if arguments.command == "mcp" else "main"
+    configure(profile)
+    with span("cli.command", profile=profile, level="DEBUG") as metrics:
+        code = _execute(arguments, parser, services_factory, install_codex, doctor, mcp, metrics)
+        metrics["exit_code"] = code
+        return code
+
+
+def _execute(
+    arguments: Namespace,
+    parser: ArgumentParser,
+    services_factory: Callable[[], ApplicationServices] | None,
+    install_codex: InstallCodexCommand | None,
+    doctor: DoctorCommand | None,
+    mcp: McpCommand | None,
+    metrics: dict[str, object],
+) -> int:
     as_json = bool(getattr(arguments, "json", False))
     try:
         if arguments.version:
@@ -295,9 +397,11 @@ def main(
         parser.print_help(sys.stderr)
         return USAGE_ERROR_EXIT
     except CodeCortexError as error:
+        metrics.update(error_code=error.code.value, error_class=type(error).__name__)
         _report_error(error, as_json=as_json)
         return ERROR_EXIT.get(error.code, UNEXPECTED_ERROR_EXIT)
-    except Exception:  # noqa: BLE001 - the contract maps any unexpected failure to 10
+    except Exception as error:  # noqa: BLE001 - the contract maps any unexpected failure to 10
+        metrics["error_class"] = type(error).__name__
         traceback.print_exc()
         return UNEXPECTED_ERROR_EXIT
 

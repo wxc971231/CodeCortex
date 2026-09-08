@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "states": {
+    "cache-deleted": {"delete": [], "replace": {}},
+    "conflict-current-source": {
+      "delete": [],
+      "replace": {
+        "src/forge/checkpoint.py": "\"\"\"Current checkpoint implementation after a source change.\"\"\"\n\nfrom __future__ import annotations\n\nfrom pathlib import Path\n\n\ndef write_checkpoint(path: Path, payload: str) -> None:\n    \"\"\"Current writer uses a temporary file before atomic replacement.\"\"\"\n    temporary = path.with_suffix(\".tmp\")\n    temporary.write_text(payload, encoding=\"utf-8\")\n    temporary.replace(path)\n\n\ndef load_checkpoint(path: Path) -> str:\n    return path.read_text(encoding=\"utf-8\")\n"
+      }
+    },
+    "fresh": {"delete": [], "replace": {}},
+    "training-changed": {
+      "delete": [],
+      "replace": {
+        "src/forge/training.py": "\"\"\"Training responsibility with a changed current checkpoint contract.\"\"\"\n\nfrom __future__ import annotations\n\nfrom pathlib import Path\n\nfrom forge.checkpoint import write_checkpoint\nfrom forge.evaluation import evaluate_batch\n\n\ndef train_epoch(values: list[int], checkpoint_path: Path) -> dict[str, float]:\n    \"\"\"Current training records the epoch label in its atomic checkpoint.\"\"\"\n    metrics = evaluate_batch(values)\n    write_checkpoint(checkpoint_path, repr({\"epoch\": 1, **metrics}))\n    return metrics\n"
+      }
+    },
+    "unknown-dynamic": {
+      "delete": [],
+      "replace": {
+        "src/forge/plugins.py": "\"\"\"Runtime-loaded plugin seam changed outside resolvable local relations.\"\"\"\n\nfrom __future__ import annotations\n\nfrom importlib import import_module\n\n\ndef load_formatter(module_name: str) -> object:\n    \"\"\"Load a deployment-specific formatter selected at runtime.\"\"\"\n    return import_module(module_name + \".formatter\")\n"
+      }
+    }
+  }
+}

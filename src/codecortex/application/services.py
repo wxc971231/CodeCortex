@@ -3,13 +3,24 @@
 import hashlib
 import os
 import re
-from collections.abc import Mapping
+import sqlite3
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from codecortex.application.discussion import (
+    DiscussionPlan,
+    DiscussionPlanner,
+    InvocationState,
+    QuestionScope,
+)
 from codecortex.application.fact_sync import FactSyncResult
+from codecortex.application.freshness import (
+    FreshnessService,
+    RepositoryFreshnessSummary,
+)
 from codecortex.application.ports import (
     FactSyncPort,
     FormalStorePort,
@@ -38,6 +49,7 @@ from codecortex.domain.cognition import (
     validate_formal_state,
 )
 from codecortex.domain.errors import CodeCortexError, ErrorCode
+from codecortex.domain.freshness import ChangeSet
 from codecortex.domain.ids import IdPrefix, new_id
 from codecortex.domain.proposals import (
     ApprovalRecord,
@@ -52,11 +64,20 @@ from codecortex.infrastructure.formal import view_manifest_for
 from codecortex.infrastructure.persistence.graph_replica import (
     ContextRequest,
     DiscussionContext,
+    GraphHit,
     GraphReplica,
 )
 
 if TYPE_CHECKING:
+    from codecortex.application.baseline import (
+        BaselineAdvanceReason,
+        BaselineAdvanceResult,
+        BaselineAdvanceService,
+        BaselineApprovalRecord,
+        DecisionRecord,
+    )
     from codecortex.application.initialize import InitializationService
+    from codecortex.application.preflight import PreflightResult, PreflightService
     from codecortex.application.proposals import ProposalService
 
 
@@ -81,6 +102,21 @@ class ApplyResult:
     cache_warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class FreshnessSnapshot:
+    """One verified repository freshness view for an MCP caller.
+
+    Main obtains this by running deterministic Fact Preflight.  Analyzer may
+    only read the already prepared cache/formal coordinate, so its sandbox
+    never receives a cache-writing synchronization path.
+    """
+
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set: ChangeSet | None
+    repository_status: RepositoryFreshnessSummary
+
+
 @dataclass
 class ApplicationServices:
     """Coordinate use cases while keeping policy out of CLI and MCP adapters."""
@@ -95,8 +131,14 @@ class ApplicationServices:
     query_service: QueryService | None = None
     initialization_service: InitializationService | None = None
     m1a_proposal_service: ProposalService | None = None
+    preflight_service: PreflightService | None = None
+    baseline_advance_service: BaselineAdvanceService | None = None
     cognitive_replica: GraphReplica | None = None
     cognitive_graph_max_objects: int = 500
+    query_default_depth: int = 2
+    query_max_nodes: int = 40
+    query_max_entities: int = 80
+    query_max_evidence: int = 80
 
     def initialize_repository(self) -> RepositoryOverview:
         """Idempotently establish the revision-zero technical skeleton."""
@@ -152,6 +194,174 @@ class ApplicationServices:
                 "Fact synchronization is not configured",
             )
         return self.fact_sync.sync(cast(Literal["auto", "full"], mode))
+
+    def run_preflight(self) -> PreflightResult:
+        """Run the single mandatory M1b readiness gate for an explicit operation."""
+        if self.preflight_service is None:
+            raise CodeCortexError(
+                ErrorCode.NOT_INITIALIZED,
+                "Fact Preflight is not configured",
+            )
+        return self.preflight_service.run()
+
+    def run_m1a_bootstrap_read[QueryResult](
+        self, operation: Callable[[], QueryResult]
+    ) -> QueryResult:
+        """Authorize and execute one M1a bootstrap read in one shared snapshot."""
+        preflight = self.preflight_service
+        recovery = None if preflight is None else preflight.recovery_service
+        if recovery is None:
+            raise CodeCortexError(
+                ErrorCode.CACHE_REBUILD_REQUIRED,
+                "Main bootstrap cache recovery is not configured",
+                suggested_action="Start the Main CodeCortex profile",
+            )
+        recovery.ensure_bootstrap_cache()
+        with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+            state = self.formal_store.load()
+            if state.manifest.cognition_initialized:
+                raise CodeCortexError(
+                    ErrorCode.NOT_INITIALIZED,
+                    "M1a bootstrap reads are unavailable after cognition initialization",
+                )
+            return operation()
+
+    def run_analyzer_query_read[QueryResult](
+        self,
+        operation: Callable[[], QueryResult],
+        *,
+        allow_m1a_bootstrap: bool = False,
+    ) -> QueryResult:
+        """Execute one Analyzer read against an atomic formal-state snapshot."""
+        with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+            if (
+                not self.formal_store.load().manifest.cognition_initialized
+                and not allow_m1a_bootstrap
+            ):
+                raise CodeCortexError(
+                    ErrorCode.NOT_INITIALIZED,
+                    "Analyzer cognition queries require initialized repository cognition",
+                )
+            return operation()
+
+    def plan_discussion(
+        self,
+        question_scope: QuestionScope,
+        candidates: Sequence[GraphHit],
+        invocation: InvocationState,
+    ) -> DiscussionPlan:
+        """Prepare one explicit discussion through the mandatory fact gate.
+
+        The caller performs bounded candidate recall and semantic confirmation;
+        this entry recomputes the deterministic source coordinate immediately
+        before deriving the route.  It has no Agent invocation and no formal
+        cognition write path.
+        """
+        result = self.run_preflight()
+        return DiscussionPlanner(FreshnessService(result.change_set)).plan(
+            question_scope, candidates, invocation
+        )
+
+    def advance_cognition_baseline(
+        self,
+        change_set_id: str,
+        reason: BaselineAdvanceReason,
+        decision_record: DecisionRecord,
+        approval_record: BaselineApprovalRecord | None,
+    ) -> BaselineAdvanceResult:
+        if self.baseline_advance_service is None:
+            raise CodeCortexError(ErrorCode.NOT_INITIALIZED, "Baseline advance is not configured")
+        return self.baseline_advance_service.advance(
+            change_set_id, reason, decision_record, approval_record
+        )
+
+    def freshness_snapshot(self, *, preflight: bool) -> FreshnessSnapshot:
+        """Return freshness after Main preparation or from Analyzer's read view.
+
+        A read-only Analyzer is intentionally unable to repair stale cache
+        state.  It must fail closed and ask Main to run the deterministic gate.
+        """
+        if preflight:
+            result = self.run_preflight()
+            change_set = result.change_set
+            return FreshnessSnapshot(
+                baseline_source_digest=(
+                    result.fact_sync.repository_source_digest
+                    if change_set is None
+                    else change_set.baseline_source_digest
+                ),
+                current_source_digest=result.fact_sync.repository_source_digest,
+                change_set=change_set,
+                repository_status=result.repository_status,
+            )
+        return self._prepared_freshness_snapshot()
+
+    def _prepared_freshness_snapshot(self) -> FreshnessSnapshot:
+        """Read a Main-prepared freshness coordinate without modifying cache."""
+        preflight_service = self.preflight_service
+        if preflight_service is None:
+            raise CodeCortexError(
+                ErrorCode.CACHE_REBUILD_REQUIRED,
+                "Read-only freshness is unavailable until Main runs Fact Preflight",
+                suggested_action="Ask Main CodeCortex to run cognitive_freshness first",
+            )
+        try:
+            with self.repository_lock.acquire("shared", self.lock_timeout_seconds):
+                state = self.formal_store.load()
+                if not state.manifest.cognition_initialized:
+                    raise CodeCortexError(
+                        ErrorCode.NOT_INITIALIZED,
+                        "M1b freshness requires initialized repository cognition",
+                    )
+                baseline = state.manifest.cognition_baseline
+                if baseline is None:
+                    raise CodeCortexError(
+                        ErrorCode.FORMAL_STATE_CORRUPT,
+                        "Initialized cognition has no formal source baseline",
+                    )
+                metadata = preflight_service.facts.cache_metadata()
+                if metadata.graph_revision != state.manifest.graph_revision:
+                    raise _freshness_cache_error("Fact cache graph revision is stale")
+                if (
+                    metadata.digest_profile_version
+                    != state.manifest.digest_profile_version
+                    or metadata.managed_source_set_version
+                    != state.manifest.managed_source_set_version
+                ):
+                    raise _freshness_cache_error(
+                        "Fact cache digest profile does not match formal source baseline"
+                    )
+                change_set = preflight_service.freshness_store.load_effective()
+                current = metadata.repository_source_digest
+                live = preflight_service.fact_sync.probe_source_digest()
+                if live != current:
+                    raise _freshness_cache_error(
+                        "Managed source changed after Main prepared Analyzer freshness"
+                    )
+                if current == baseline:
+                    if change_set is not None:
+                        raise _freshness_cache_error(
+                            "Fresh cache has an unexpected effective ChangeSet"
+                        )
+                elif (
+                    change_set is None
+                    or change_set.baseline_source_digest != baseline
+                    or change_set.current_source_digest != current
+                ):
+                    raise _freshness_cache_error(
+                        "Fact cache and effective ChangeSet do not describe one source coordinate"
+                    )
+                summary = FreshnessService(change_set).repository_status()
+                return FreshnessSnapshot(
+                    baseline_source_digest=baseline,
+                    current_source_digest=current,
+                    change_set=change_set,
+                    repository_status=summary,
+                )
+        except CodeCortexError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+            raise _freshness_cache_error("Prepared freshness cache is unreadable") from error
 
     def repository_facts(
         self,
@@ -746,4 +956,14 @@ def _invalid_patch(message: str) -> CodeCortexError:
         ErrorCode.ANALYSIS_REPORT_INVALID,
         message,
         suggested_action="Revise or recreate the proposal",
+    )
+
+
+def _freshness_cache_error(message: str) -> CodeCortexError:
+    """Return the single fail-closed error for an Analyzer cache mismatch."""
+    return CodeCortexError(
+        ErrorCode.CACHE_REBUILD_REQUIRED,
+        message,
+        retryable=True,
+        suggested_action="Ask Main CodeCortex to run Fact Preflight and retry",
     )

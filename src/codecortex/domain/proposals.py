@@ -94,6 +94,7 @@ class PatchOperation:
     kind: PatchOperationKind | str
     target_id: str
     value: JsonObject | None
+    expected_revision: int | str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -106,6 +107,20 @@ class PatchOperation:
         is_mapping = kind.value.endswith("_mapping")
         is_flow = kind is PatchOperationKind.SET_LOGICAL_FLOW
         is_remove = kind.value.startswith("remove_")
+        if self.expected_revision is not None:
+            if self.expected_revision == "absent":
+                if not (kind.value.startswith("add_") or is_flow):
+                    raise _invalid_proposal(
+                        "Only add or flow operations may expect an absent target"
+                    )
+            elif (
+                type(self.expected_revision) is not int
+                or self.expected_revision < 1
+                or kind.value.startswith("add_")
+            ):
+                raise _invalid_proposal(
+                    "Expected revision must be a positive integer or 'absent'"
+                )
         if is_node or is_flow:
             _validate_semantic_node_id(self.target_id)
             if is_flow and not self.target_id.startswith("behavior."):
@@ -151,11 +166,14 @@ class PatchOperation:
 
     def to_canonical_value(self) -> dict[str, object]:
         """Return the JSON value covered by the patch digest."""
-        return {
+        result: dict[str, object] = {
             "kind": PatchOperationKind(self.kind).value,
             "target_id": self.target_id,
             "value": json_value_to_mutable(self.value),
         }
+        if self.expected_revision is not None:
+            result["expected_revision"] = self.expected_revision
+        return result
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -109,6 +110,53 @@ def test_begin_analysis_records_current_source_digest_and_revision(
     expected = FactSyncService(repository).sync()
     assert coordinate.graph_revision == 0
     assert coordinate.source_digest == expected.repository_source_digest
+
+
+def test_begin_analysis_retries_when_source_changes_after_fact_sync(
+    app: ApplicationServices,
+    initialization: InitializationService,
+    repo_root: Path,
+) -> None:
+    app.initialize_repository()
+    sync = initialization._fact_sync
+    original_probe = sync.probe_source_digest
+    raced = False
+
+    def mutate_before_first_final_probe() -> str:
+        nonlocal raced
+        if not raced:
+            raced = True
+            _write(repo_root, "pkg/a.py", "value = 3\n")
+        return original_probe()
+
+    with (
+        patch.object(
+            sync,
+            "probe_source_digest",
+            side_effect=mutate_before_first_final_probe,
+        ),
+        patch.object(sync, "sync", wraps=sync.sync) as synchronize,
+    ):
+        coordinate = initialization.begin_analysis()
+
+    assert synchronize.call_count == 2
+    assert coordinate.source_digest == original_probe()
+
+
+def test_consume_fails_closed_when_live_digest_never_matches_synced_cache(
+    app: ApplicationServices,
+    initialization: InitializationService,
+) -> None:
+    app.initialize_repository()
+    coordinate = initialization.begin_analysis()
+    sync = initialization._fact_sync
+
+    with patch.object(
+        sync, "probe_source_digest", return_value="sha256:" + "f" * 64
+    ), pytest.raises(CodeCortexError) as raised:
+        initialization.consume_report(_fresh_report(coordinate))
+
+    assert raised.value.code is ErrorCode.PROPOSAL_STALE
 
 
 def test_consume_accepts_report_matching_the_recorded_coordinate(

@@ -3,11 +3,14 @@
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
 
+from codecortex.application.baseline import BaselineApprovalRecord, DecisionRecord
+from codecortex.application.freshness import FreshnessService
 from codecortex.application.services import ApplicationServices, RepositoryOverview
 from codecortex.domain.cognition import CognitiveGraph, ValidationResult
 from codecortex.domain.errors import CodeCortexError, ErrorCode
@@ -36,9 +39,15 @@ class PatchOperationInput(_Dto):
     kind: PatchOperationKind
     target_id: str = Field(min_length=1, max_length=256)
     value: dict[str, Any] | None = None
+    expected_revision: int | Literal["absent"] | None = None
 
     def to_domain(self) -> PatchOperation:
-        return PatchOperation(self.kind, self.target_id, self.value)
+        return PatchOperation(
+            self.kind,
+            self.target_id,
+            self.value,
+            expected_revision=self.expected_revision,
+        )
 
 
 class ProposalInput(_Dto):
@@ -72,25 +81,6 @@ class ProposalRevisionInput(_Dto):
     uncertainties: list[Any] | None = Field(default=None, max_length=100)
 
 
-class ApprovalRecordInput(_Dto):
-    """The structured approval Main Codex derives from explicit user consent."""
-
-    proposal_id: str = Field(min_length=1, max_length=256)
-    patch_digest: str = Field(min_length=1, max_length=80)
-    approved_by: str = Field(min_length=1, max_length=64)
-    approved_at: str = Field(min_length=1, max_length=64)
-    approval_summary: str = Field(min_length=1, max_length=4_000)
-
-    def to_domain(self) -> ApprovalRecord:
-        return ApprovalRecord(
-            proposal_id=self.proposal_id,
-            patch_digest=self.patch_digest,
-            approved_by=self.approved_by,
-            approved_at=self.approved_at,
-            approval_summary=self.approval_summary,
-        )
-
-
 class RepositoryOverviewOutput(_Dto):
     repository_root: str
     graph_revision: int
@@ -117,6 +107,8 @@ class InspectNodeOutput(_Dto):
     mappings: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     truncated: bool = False
+    truncation_reasons: list[str] = Field(default_factory=list)
+    continuation_hints: list[str] = Field(default_factory=list)
 
 
 class HistoryEventOutput(_Dto):
@@ -136,6 +128,37 @@ class ApplyProposalOutput(_Dto):
     event_id: str
     graph_revision: int
     applied_proposal_id: str
+    cache_warnings: list[str] = Field(default_factory=list)
+
+
+class DecisionRecordInput(_Dto):
+    decided_by: Literal["analyzer", "main_codex"]
+    evidence_summary: str = Field(min_length=1, max_length=4_000)
+    decided_at: str = Field(min_length=1, max_length=64)
+
+    def to_domain(self) -> DecisionRecord:
+        return DecisionRecord(self.decided_by, self.evidence_summary, self.decided_at)
+
+
+class BaselineApprovalRecordInput(_Dto):
+    change_set_id: str = Field(min_length=1, max_length=64)
+    source_digest: str = Field(min_length=1, max_length=80)
+    approved_by: Literal["user"]
+    approved_at: str = Field(min_length=1, max_length=64)
+    approval_summary: str = Field(min_length=1, max_length=4_000)
+
+    def to_domain(self) -> BaselineApprovalRecord:
+        return BaselineApprovalRecord(
+            self.change_set_id, self.source_digest, self.approved_by,
+            self.approved_at, self.approval_summary,
+        )
+
+
+class BaselineAdvanceOutput(_Dto):
+    event_id: str
+    graph_revision: int
+    previous_source_digest: str
+    current_source_digest: str
     cache_warnings: list[str] = Field(default_factory=list)
 
 
@@ -186,6 +209,8 @@ def inspect_node(services: ApplicationServices, node_id: str) -> InspectNodeOutp
             ],
             evidence=[dict(item) for item in inspection.evidence],
             truncated=inspection.truncated,
+            truncation_reasons=list(inspection.truncation_reasons),
+            continuation_hints=list(inspection.continuation_hints),
         )
     graph = services.cognitive_graph()
     node = next((item for item in graph.nodes if item.get("id") == node_id), None)
@@ -318,14 +343,47 @@ def cognitive_proposal(services: ApplicationServices, proposal_id: str) -> Propo
 def apply_cognitive_proposal(
     services: ApplicationServices,
     proposal_id: str,
-    approval_record: ApprovalRecordInput,
+    patch_digest: str,
 ) -> ApplyProposalOutput:
-    """Atomically apply the explicitly approved current proposal snapshot."""
-    result = services.apply_cognitive_proposal(proposal_id, approval_record.to_domain())
+    """Apply one exact patch after Codex approves this native MCP tool call."""
+    approval = ApprovalRecord(
+        proposal_id=proposal_id,
+        patch_digest=patch_digest,
+        approved_by="user",
+        approved_at=_utc_now_rfc3339(),
+        approval_summary="Approved through Codex host tool approval.",
+    )
+    result = services.apply_cognitive_proposal(proposal_id, approval)
     return ApplyProposalOutput(
         event_id=result.event_id,
         graph_revision=result.graph_revision,
         applied_proposal_id=result.applied_proposal_id,
+        cache_warnings=list(result.cache_warnings),
+    )
+
+
+def _utc_now_rfc3339() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def advance_cognition_baseline(
+    services: ApplicationServices,
+    change_set_id: str,
+    reason: Literal["no_semantic_change", "user_accepted"],
+    decision_record: DecisionRecordInput,
+    approval_record: BaselineApprovalRecordInput | None = None,
+) -> BaselineAdvanceOutput:
+    result = services.advance_cognition_baseline(
+        change_set_id,
+        reason,
+        decision_record.to_domain(),
+        None if approval_record is None else approval_record.to_domain(),
+    )
+    return BaselineAdvanceOutput(
+        event_id=result.event_id,
+        graph_revision=result.graph_revision,
+        previous_source_digest=result.previous_source_digest,
+        current_source_digest=result.current_source_digest,
         cache_warnings=list(result.cache_warnings),
     )
 
@@ -384,6 +442,8 @@ class DiscussionContextOutput(_Dto):
     evidence: list[dict[str, Any]]
     truncated: bool
     cursor: str | None
+    truncation_reasons: list[str] = Field(default_factory=list)
+    continuation_hints: list[str] = Field(default_factory=list)
 
 
 class SearchGraphOutput(_Dto):
@@ -409,6 +469,67 @@ class SyncFactsOutput(_Dto):
     retry_count: int
     rebuilt: bool
     diagnostics: list[dict[str, Any]]
+
+
+class CognitiveFreshnessOutput(_Dto):
+    """Bounded repository-level cognition freshness and ChangeSet summary."""
+
+    repository_status: Literal["fresh", "pending", "unresolved"]
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set_id: str | None
+    file_diff_completeness: Literal["complete", "partial"] | None
+    entity_diff_completeness: Literal["complete", "partial"] | None
+    scope_confidence: Literal["complete", "partial", "unknown"] | None
+    affected_nodes: list[str]
+    affected_flows: list[str]
+    affected_entities: list[str]
+    diagnostics: list[str]
+    reason_codes: list[str]
+    truncated: bool
+
+
+class PendingChangesOutput(_Dto):
+    """One bounded page over the single effective baseline-to-current ChangeSet."""
+
+    repository_status: Literal["fresh", "pending", "unresolved"]
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set_id: str | None
+    file_diff_completeness: Literal["complete", "partial"] | None
+    entity_diff_completeness: Literal["complete", "partial"] | None
+    scope_confidence: Literal["complete", "partial", "unknown"] | None
+    changed_files: list[dict[str, Any]]
+    changed_entities: list[dict[str, Any]]
+    affected_nodes: list[str]
+    affected_flows: list[str]
+    affected_entities: list[str]
+    unmapped_changes: list[dict[str, Any]]
+    diagnostics: list[str]
+    reason_codes: list[str]
+    cursor: str | None
+    truncated: bool
+
+
+class EffectiveQueryFreshnessOutput(_Dto):
+    """Bounded, auditable route decision for a supplied graph/entity scope."""
+
+    status: Literal[
+        "current",
+        "unaffected_current",
+        "affected_source_first",
+        "unknown_source_first",
+    ]
+    repository_status: Literal["fresh", "pending", "unresolved"]
+    baseline_source_digest: str
+    current_source_digest: str
+    change_set_id: str | None
+    scope_confidence: Literal["complete", "partial", "unknown"] | None
+    matched_affected_nodes: list[str]
+    matched_affected_entities: list[str]
+    unmapped_changes: list[dict[str, Any]]
+    unmapped_changes_truncated: bool
+    reason_codes: list[str]
 
 
 def repository_facts(
@@ -449,6 +570,7 @@ def analysis_scope(
         scope,
         cursor,
         limit,
+        diagnostics_limit=min(limit, services.query_max_evidence),
         expected_source_digest=expected_source_digest,
         expected_graph_revision=expected_graph_revision,
     )
@@ -514,6 +636,7 @@ def get_discussion_context(
     max_evidence: int = 80,
     expected_graph_revision: int | None = None,
     expected_source_digest: str | None = None,
+    include_flows: bool = True,
 ) -> DiscussionContextOutput:
     """Return one guarded, bounded discussion-context neighborhood."""
     result = services.get_discussion_context(
@@ -526,6 +649,7 @@ def get_discussion_context(
             max_evidence=max_evidence,
             expected_graph_revision=expected_graph_revision,
             expected_source_digest=expected_source_digest,
+            include_flows=include_flows,
         )
     )
     return DiscussionContextOutput(
@@ -538,6 +662,8 @@ def get_discussion_context(
         evidence=[asdict(evidence) for evidence in result.evidence],
         truncated=result.truncated,
         cursor=result.continuation,
+        truncation_reasons=list(result.truncation_reasons),
+        continuation_hints=list(result.continuation_hints),
     )
 
 
@@ -586,6 +712,247 @@ def sync_repository_facts(
     )
 
 
+_MAX_FRESHNESS_PAGE_SIZE = 100
+_DEFAULT_FRESHNESS_PAGE_SIZE = 50
+_MAX_QUERY_SCOPE_IDS = 100
+
+
+def cognitive_freshness(
+    services: ApplicationServices, *, preflight: bool
+) -> CognitiveFreshnessOutput:
+    """Return a bounded repository status after Main prep or Analyzer readback."""
+    snapshot = services.freshness_snapshot(preflight=preflight)
+    change_set = snapshot.change_set
+    if change_set is None:
+        return CognitiveFreshnessOutput(
+            repository_status=snapshot.repository_status.status,
+            baseline_source_digest=snapshot.baseline_source_digest,
+            current_source_digest=snapshot.current_source_digest,
+            change_set_id=None,
+            file_diff_completeness=None,
+            entity_diff_completeness=None,
+            scope_confidence=None,
+            affected_nodes=[],
+            affected_flows=[],
+            affected_entities=[],
+            diagnostics=[],
+            reason_codes=list(snapshot.repository_status.reason_codes),
+            truncated=False,
+        )
+    affected_nodes, nodes_truncated = _bounded_items(
+        change_set.affected_nodes, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    affected_flows, flows_truncated = _bounded_items(
+        change_set.affected_flows, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    affected_entities, entities_truncated = _bounded_items(
+        change_set.affected_entities, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    diagnostics, diagnostics_truncated = _bounded_items(
+        change_set.diagnostics, 0, _DEFAULT_FRESHNESS_PAGE_SIZE
+    )
+    return CognitiveFreshnessOutput(
+        repository_status=snapshot.repository_status.status,
+        baseline_source_digest=snapshot.baseline_source_digest,
+        current_source_digest=snapshot.current_source_digest,
+        change_set_id=change_set.change_set_id,
+        file_diff_completeness=change_set.file_diff_completeness,
+        entity_diff_completeness=change_set.entity_diff_completeness,
+        scope_confidence=change_set.scope_confidence,
+        affected_nodes=list(affected_nodes),
+        affected_flows=list(affected_flows),
+        affected_entities=list(affected_entities),
+        diagnostics=list(diagnostics),
+        reason_codes=list(snapshot.repository_status.reason_codes),
+        truncated=(
+            nodes_truncated
+            or flows_truncated
+            or entities_truncated
+            or diagnostics_truncated
+            or len(change_set.unmapped_changes) > _DEFAULT_FRESHNESS_PAGE_SIZE
+        ),
+    )
+
+
+def pending_changes(
+    services: ApplicationServices,
+    cursor: str | None = None,
+    limit: int = _DEFAULT_FRESHNESS_PAGE_SIZE,
+    *,
+    preflight: bool,
+) -> PendingChangesOutput:
+    """Return bounded details of the one effective ChangeSet, if any."""
+    offset, page_size = _page_window(cursor, limit)
+    snapshot = services.freshness_snapshot(preflight=preflight)
+    change_set = snapshot.change_set
+    if change_set is None:
+        return PendingChangesOutput(
+            repository_status=snapshot.repository_status.status,
+            baseline_source_digest=snapshot.baseline_source_digest,
+            current_source_digest=snapshot.current_source_digest,
+            change_set_id=None,
+            file_diff_completeness=None,
+            entity_diff_completeness=None,
+            scope_confidence=None,
+            changed_files=[],
+            changed_entities=[],
+            affected_nodes=[],
+            affected_flows=[],
+            affected_entities=[],
+            unmapped_changes=[],
+            diagnostics=[],
+            reason_codes=list(snapshot.repository_status.reason_codes),
+            cursor=None,
+            truncated=False,
+        )
+    collections: tuple[Sequence[Any], ...] = (
+        _file_changes(change_set),
+        _entity_changes(change_set),
+        change_set.affected_nodes,
+        change_set.affected_flows,
+        change_set.affected_entities,
+        change_set.unmapped_changes,
+        change_set.diagnostics,
+    )
+    pages = [_bounded_items(values, offset, page_size) for values in collections]
+    truncated = any(is_truncated for _, is_truncated in pages)
+    next_cursor = str(offset + page_size) if truncated else None
+    changed_files, changed_entities, nodes, flows, entities, unmapped, diagnostics = (
+        page for page, _ in pages
+    )
+    return PendingChangesOutput(
+        repository_status=snapshot.repository_status.status,
+        baseline_source_digest=snapshot.baseline_source_digest,
+        current_source_digest=snapshot.current_source_digest,
+        change_set_id=change_set.change_set_id,
+        file_diff_completeness=change_set.file_diff_completeness,
+        entity_diff_completeness=change_set.entity_diff_completeness,
+        scope_confidence=change_set.scope_confidence,
+        changed_files=[dict(item) for item in changed_files],
+        changed_entities=[dict(item) for item in changed_entities],
+        affected_nodes=list(nodes),
+        affected_flows=list(flows),
+        affected_entities=list(entities),
+        unmapped_changes=[dict(item) for item in unmapped],
+        diagnostics=list(diagnostics),
+        reason_codes=list(snapshot.repository_status.reason_codes),
+        cursor=next_cursor,
+        truncated=truncated,
+    )
+
+
+def effective_query_freshness(
+    services: ApplicationServices,
+    node_ids: Sequence[str] = (),
+    entity_ids: Sequence[str] = (),
+    max_unmapped_changes: int = _DEFAULT_FRESHNESS_PAGE_SIZE,
+    *,
+    preflight: bool,
+) -> EffectiveQueryFreshnessOutput:
+    """Return Core's local source-first decision without unbounded evidence."""
+    nodes = _bounded_identifiers(node_ids, "node_ids")
+    entities = _bounded_identifiers(entity_ids, "entity_ids")
+    detail_limit = _bounded_limit(max_unmapped_changes, "max_unmapped_changes")
+    snapshot = services.freshness_snapshot(preflight=preflight)
+    result = FreshnessService(snapshot.change_set).for_query(nodes, entities)
+    unmapped, unmapped_truncated = _bounded_items(
+        result.unmapped_changes, 0, detail_limit
+    )
+    return EffectiveQueryFreshnessOutput(
+        status=result.status,
+        repository_status=result.repository_status,
+        baseline_source_digest=snapshot.baseline_source_digest,
+        current_source_digest=snapshot.current_source_digest,
+        change_set_id=result.change_set_id,
+        scope_confidence=result.scope_confidence,
+        matched_affected_nodes=list(result.matched_affected_nodes),
+        matched_affected_entities=list(result.matched_affected_entities),
+        unmapped_changes=[dict(item) for item in unmapped],
+        unmapped_changes_truncated=unmapped_truncated,
+        reason_codes=list(result.reason_codes),
+    )
+
+
+def _file_changes(change_set: Any) -> tuple[dict[str, object], ...]:
+    records = [
+        {"kind": kind, "relative_path": path}
+        for kind, paths in (
+            ("added", change_set.changed_files.added),
+            ("modified", change_set.changed_files.modified),
+            ("deleted", change_set.changed_files.deleted),
+        )
+        for path in paths
+    ]
+    records.extend(
+        {"kind": "renamed", "old_relative_path": old, "relative_path": new}
+        for old, new in change_set.changed_files.renamed
+    )
+    return tuple(sorted(records, key=lambda item: (str(item.get("relative_path")), str(item["kind"]))))
+
+
+def _entity_changes(change_set: Any) -> tuple[dict[str, object], ...]:
+    records = [
+        {"kind": kind, "entity_uid": uid}
+        for kind, entities in (
+            ("added", change_set.changed_entities.added),
+            ("modified", change_set.changed_entities.modified),
+            ("missing", change_set.changed_entities.missing),
+        )
+        for uid in entities
+    ]
+    records.extend(
+        {
+            "kind": "moved",
+            "entity_uid": uid,
+            "old_relative_path": old,
+            "relative_path": new,
+        }
+        for uid, old, new in change_set.changed_entities.moved
+    )
+    return tuple(sorted(records, key=lambda item: (str(item["entity_uid"]), str(item["kind"]))))
+
+
+def _page_window(cursor: str | None, limit: int) -> tuple[int, int]:
+    if cursor is None:
+        offset = 0
+    elif (
+        isinstance(cursor, str)
+        and len(cursor) <= 10
+        and cursor.isascii()
+        and cursor.isdecimal()
+    ):
+        offset = int(cursor)
+    else:
+        raise ValueError("cursor must be a non-negative decimal offset")
+    return offset, _bounded_limit(limit, "limit")
+
+
+def _bounded_limit(value: int, name: str) -> int:
+    if type(value) is not int or not 1 <= value <= _MAX_FRESHNESS_PAGE_SIZE:
+        raise ValueError(f"{name} must be an integer from 1 to {_MAX_FRESHNESS_PAGE_SIZE}")
+    return value
+
+
+def _bounded_identifiers(values: Sequence[str], name: str) -> tuple[str, ...]:
+    if isinstance(values, str):
+        raise TypeError(f"{name} must be a list of identifiers")
+    result = tuple(values)
+    if len(result) > _MAX_QUERY_SCOPE_IDS:
+        raise ValueError(f"{name} may contain at most {_MAX_QUERY_SCOPE_IDS} identifiers")
+    if any(not isinstance(value, str) or not value for value in result):
+        raise ValueError(f"{name} must contain non-empty identifiers")
+    if len(set(result)) != len(result):
+        raise ValueError(f"{name} must not contain duplicates")
+    return result
+
+
+def _bounded_items(
+    values: Sequence[Any], offset: int, limit: int
+) -> tuple[tuple[Any, ...], bool]:
+    page = tuple(values[offset : offset + limit])
+    return page, offset + limit < len(values)
+
+
 def as_tool_error(error: CodeCortexError) -> ToolError:
     """Preserve the stable Core error contract inside an anticipated MCP error."""
     return ToolError(
@@ -597,7 +964,7 @@ def as_tool_error(error: CodeCortexError) -> ToolError:
     )
 
 
-def invalid_argument(error: ValueError) -> CodeCortexError:
+def invalid_argument(error: ValueError | TypeError) -> CodeCortexError:
     """Translate request-validation failures into the stable error contract."""
     return CodeCortexError(
         ErrorCode.INVALID_ARGUMENT,

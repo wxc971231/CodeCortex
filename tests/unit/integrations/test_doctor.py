@@ -1,5 +1,6 @@
 """Unit coverage for CodeCortex's read-only installation diagnostics."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,34 @@ def test_doctor_reports_clean_install_without_writing(
         for path in tmp_path.rglob("*")
         if path.is_file() and ".codecortex-backup-" not in path.name
     } == before
+
+
+def test_doctor_requires_and_reports_native_prompt_approval(
+    tmp_path: Path, codecortex_executable: Path
+) -> None:
+    install_codex(tmp_path, codecortex_executable, dry_run=False, force=False)
+
+    report = run_doctor(tmp_path, codecortex_executable, repository=None)
+
+    check = report.by_code("CODEX_MCP_COMMAND")
+    assert check.status is DoctorStatus.OK
+    assert "approval mode: prompt" in check.summary
+
+
+def test_doctor_rejects_non_prompt_proposal_approval(
+    tmp_path: Path, codecortex_executable: Path
+) -> None:
+    install_codex(tmp_path, codecortex_executable, dry_run=False, force=False)
+    config_path = tmp_path / CONFIG_RELATIVE
+    document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    document["mcp_servers"]["codecortex"]["tools"][
+        "apply_cognitive_proposal"
+    ]["approval_mode"] = "approve"
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+    report = run_doctor(tmp_path, codecortex_executable, repository=None)
+
+    assert report.by_code("CODEX_MCP_COMMAND").status is DoctorStatus.ERROR
 
 
 def test_doctor_reports_actionable_mcp_mismatch(
@@ -91,7 +120,7 @@ def test_doctor_marks_missing_installed_skill_as_error(
 def test_doctor_validates_repository_formal_state(
     tmp_path: Path, codecortex_executable: Path
 ) -> None:
-    (tmp_path / ".git").mkdir()
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     repository = Repository(tmp_path)
     ApplicationServices(
         repository=repository,

@@ -39,8 +39,13 @@ def test_two_processes_apply_one_proposal_once(tmp_path: Path) -> None:
         affected_nodes=("behavior.concurrent-apply",), reason="Exercise the process lock around apply.",
         proposal_id="prop_01J00000000000000000000002", created_at="2026-09-03T00:00:00Z",
     )
-    queue = multiprocessing.Queue()
-    children = [multiprocessing.Process(target=_apply_child, args=(str(root), proposal.proposal_id, proposal.patch_digest, queue)) for _ in range(2)]
+    # Use an explicit start method to avoid forkserver socket permission failures in restricted sandboxes.
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    children = [
+        ctx.Process(target=_apply_child, args=(str(root), proposal.proposal_id, proposal.patch_digest, queue))
+        for _ in range(2)
+    ]
     for child in children:
         child.start()
     outcomes = [queue.get(timeout=10) for _ in children]

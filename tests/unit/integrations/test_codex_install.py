@@ -71,7 +71,6 @@ def test_dry_run_reports_changes_without_creating_user_files(
     assert not (tmp_path / ".agents").exists()
     assert not (tmp_path / ".codex").exists()
 
-
 def test_rejects_symlinked_managed_target(
     tmp_path: Path, codecortex_executable: Path
 ) -> None:

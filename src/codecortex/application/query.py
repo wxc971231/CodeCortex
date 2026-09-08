@@ -31,8 +31,10 @@ Documented design decisions:
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from heapq import nsmallest
 from typing import Protocol
 
 from codecortex.application.ports import FormalStorePort, RepositoryLockPort
@@ -57,7 +59,9 @@ from codecortex.infrastructure.persistence.graph_replica import (
     DiscussionContext,
     GraphHit,
     ReplicaMetadata,
+    context_continuation_hints,
 )
+from codecortex.telemetry import traced
 
 DEFAULT_PAGE_LIMIT = 50
 DEFAULT_SEARCH_LIMIT = 20
@@ -251,6 +255,8 @@ class NodeInspection:
     mappings: tuple[ResolvedMapping, ...]
     evidence: tuple[Mapping[str, object], ...]
     truncated: bool = False
+    truncation_reasons: tuple[str, ...] = ()
+    continuation_hints: tuple[str, ...] = ()
 
 
 def _rebuild_required(message: str) -> CodeCortexError:
@@ -351,6 +357,9 @@ class QueryService:
         repository_lock: RepositoryLockPort,
         lock_timeout_seconds: float = 10,
         max_limit: int = 100,
+        max_node_limit: int | None = None,
+        max_entity_limit: int | None = None,
+        max_evidence_limit: int | None = None,
     ) -> None:
         if type(max_limit) is not int or isinstance(max_limit, bool) or max_limit < 1:
             raise ValueError("Query maximum limit must be a positive integer")
@@ -363,7 +372,15 @@ class QueryService:
         self._repository_lock = repository_lock
         self._lock_timeout_seconds = lock_timeout_seconds
         self._max_limit = max_limit
+        self._max_node_limit = _configured_limit(max_node_limit, max_limit, "node")
+        self._max_entity_limit = _configured_limit(
+            max_entity_limit, max_limit, "entity"
+        )
+        self._max_evidence_limit = _configured_limit(
+            max_evidence_limit, max_limit, "evidence"
+        )
 
+    @traced("query.repository_facts", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated})
     def repository_facts(
         self,
         scope: str,
@@ -375,12 +392,11 @@ class QueryService:
     ) -> RepositoryFactsPage:
         """Return one guarded, cursor-paginated page of module entities."""
         module = _required_text(scope, "repository_facts scope")
-        checked_limit = self._bounded_limit(limit)
+        checked_limit = self._bounded_limit(limit, self._max_entity_limit)
         checked_cursor = _optional_cursor(cursor)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             page = self._facts.query_entities(
                 FactScope.module(module), checked_cursor, checked_limit
             )
@@ -391,6 +407,7 @@ class QueryService:
             truncated=page.truncated,
         )
 
+    @traced("query.analysis_scope", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated or value.diagnostics_truncated})
     def analysis_scope(
         self,
         scope: str | None = None,
@@ -403,13 +420,14 @@ class QueryService:
     ) -> AnalysisScopeResult:
         """Return guarded package/module partitions, totals, and diagnostics."""
         module = _optional_text(scope, "analysis_scope scope")
-        checked_limit = self._bounded_limit(limit)
-        checked_diagnostics_limit = self._bounded_limit(diagnostics_limit)
+        checked_limit = self._bounded_limit(limit, self._max_entity_limit)
+        checked_diagnostics_limit = self._bounded_limit(
+            diagnostics_limit, self._max_evidence_limit
+        )
         checked_cursor = _optional_cursor(cursor)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             totals = self._facts.analysis_totals()
             partitions = self._facts.analysis_partitions(
                 module, checked_cursor, checked_limit
@@ -430,6 +448,7 @@ class QueryService:
             diagnostics_truncated=diagnostics.truncated,
         )
 
+    @traced("query.resolve_entity_context", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated or value.mappings_truncated or value.relations_truncated})
     def resolve_entity_context(
         self,
         *,
@@ -459,13 +478,12 @@ class QueryService:
             )
         anchor_kind, raw_anchor = anchors[0]
         anchor_value = _required_text(raw_anchor, f"{anchor_kind} anchor")
-        checked_limit = self._bounded_limit(limit)
+        checked_limit = self._bounded_limit(limit, self._max_entity_limit)
         checked_cursor = _optional_cursor(cursor)
         types = _relation_types(relation_types)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             if anchor_kind == "entity_uid":
                 entity = self._facts.entity_by_uid(anchor_value)
                 entity_page: Page[CodeEntity] = Page(
@@ -510,20 +528,25 @@ class QueryService:
             relations_truncated=relations.truncated,
         )
 
+    @traced("query.discussion_context", result=lambda value: {
+        "graph_revision": value.graph_revision, "truncated": value.truncated,
+        "node_count": len(value.nodes), "entity_count": len(value.entities),
+        "evidence_count": len(value.evidence), "truncation_count": len(value.truncation_reasons),
+    })
     def get_discussion_context(self, request: ContextRequest) -> DiscussionContext:
         """Return one guarded, bounded discussion-context neighborhood."""
         if not isinstance(request, ContextRequest):
             raise ValueError(  # noqa: TRY004 - validation contract uses ValueError
                 "Discussion context requires a ContextRequest"
             )
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                request.expected_source_digest, request.expected_graph_revision
-            )
+        with self._guarded_read(
+            request.expected_source_digest, request.expected_graph_revision
+        ) as coordinate:
             return self._replica.context(
                 replace(request, expected_graph_revision=coordinate.graph_revision)
             )
 
+    @traced("query.search_cognitive_graph", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated})
     def search_cognitive_graph(
         self,
         query: str,
@@ -535,12 +558,11 @@ class QueryService:
     ) -> SearchPage:
         """Return guarded, deterministic, bounded cognitive search hits."""
         text = _required_text(query, "search query")
-        checked_limit = self._bounded_limit(limit)
+        checked_limit = self._bounded_limit(limit, self._max_node_limit)
         kind_filter = _node_kinds(kinds)
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             hits = self._replica.search(
                 text, kind_filter, checked_limit, coordinate.graph_revision
             )
@@ -550,6 +572,7 @@ class QueryService:
             truncated=len(hits) >= checked_limit,
         )
 
+    @traced("query.inspect_node", result=lambda value: {"graph_revision": value.coordinate.graph_revision, "repository_source_digest": value.coordinate.repository_source_digest, "truncated": value.truncated})
     def inspect_node(
         self,
         node_id: str,
@@ -565,11 +588,10 @@ class QueryService:
         outcomes preserve the entity-ref's last known location for the UI.
         """
         checked_node_id = _required_text(node_id, "inspect_node node ID")
-        with self._repository_lock.acquire("shared", self._lock_timeout_seconds):
+        with self._guarded_read(
+            expected_source_digest, expected_graph_revision
+        ) as coordinate:
             state = self._formal_store.load()
-            coordinate = self.cache_guard.require_current(
-                expected_source_digest, expected_graph_revision
-            )
             node = next(
                 (item for item in state.graph.nodes if item.get("id") == checked_node_id),
                 None,
@@ -580,12 +602,19 @@ class QueryService:
                     f"Cognitive graph node does not exist: {checked_node_id}",
                     suggested_action="Use a node ID returned by search_cognitive_graph",
                 )
-            relations = tuple(
-                dict(edge)
-                for edge in state.graph.semantic_edges
-                if edge.get("source_id") == checked_node_id
-                or edge.get("target_id") == checked_node_id
+            budget = _InspectionBudget(self._max_node_limit, self._max_evidence_limit)
+            node = budget.project(node)
+            relations = budget.select(
+                (
+                    dict(edge)
+                    for edge in state.graph.semantic_edges
+                    if edge.get("source_id") == checked_node_id
+                    or edge.get("target_id") == checked_node_id
+                ),
+                self._max_node_limit,
+                "max_nodes:edges",
             )
+            relations = tuple(budget.project(edge) for edge in relations)
             flow = next(
                 (
                     dict(item)
@@ -594,20 +623,35 @@ class QueryService:
                 ),
                 None,
             )
+            if flow is not None:
+                flow = budget.project(flow)
+                steps = budget.select(
+                    _object_sequence(flow.get("steps")),
+                    self._max_node_limit,
+                    "max_nodes:flow_steps",
+                    order_field="order",
+                )
+                flow["steps"] = [budget.project(step) for step in steps]
             flow_step_ids = {
                 str(step.get("id"))
                 for step in _object_sequence(None if flow is None else flow.get("steps"))
             }
-            mappings = tuple(
-                dict(item)
-                for item in state.graph.implementation_mappings
-                if item.get("subject_id") == checked_node_id
-                or item.get("subject_id") in flow_step_ids
+            mappings = budget.select(
+                (
+                    dict(item)
+                    for item in state.graph.implementation_mappings
+                    if item.get("subject_id") == checked_node_id
+                    or item.get("subject_id") in flow_step_ids
+                ),
+                self._max_entity_limit,
+                "max_entities:mappings",
             )
+            mappings = tuple(budget.project(mapping) for mapping in mappings)
+            selected_uids = {mapping.get("entity_uid") for mapping in mappings}
             refs = {
                 str(item.get("uid")): item
                 for item in state.entity_refs.entities
-                if isinstance(item.get("uid"), str)
+                if item.get("uid") in selected_uids
             }
             resolved = tuple(
                 self._resolve_mapping(mapping, refs) for mapping in mappings
@@ -622,7 +666,33 @@ class QueryService:
             flow=flow,
             mappings=resolved,
             evidence=evidence,
+            truncated=bool(budget.reasons),
+            truncation_reasons=tuple(sorted(budget.reasons)),
+            continuation_hints=context_continuation_hints(
+                tuple(sorted(budget.reasons))
+            ),
         )
+
+    @contextmanager
+    def _guarded_read(
+        self,
+        expected_source_digest: str | None,
+        expected_graph_revision: int | None,
+    ) -> Generator[CacheCoordinate]:
+        """Map every cache SQL failure in one guarded query to stable recovery."""
+        try:
+            with self._repository_lock.acquire(
+                "shared", self._lock_timeout_seconds
+            ):
+                yield self.cache_guard.require_current(
+                    expected_source_digest, expected_graph_revision
+                )
+        except CodeCortexError:
+            raise
+        except (OSError, sqlite3.Error) as error:
+            raise _rebuild_required(
+                "Fact or cognitive cache became unreadable during the query"
+            ) from error
 
     def _resolve_mapping(
         self, mapping: Mapping[str, object], refs: Mapping[str, Mapping[str, object]]
@@ -663,12 +733,19 @@ class QueryService:
             last_known_location=last_known,
         )
 
-    def _bounded_limit(self, limit: int) -> int:
+    def _bounded_limit(self, limit: int, configured_maximum: int) -> int:
         if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
             raise ValueError("Query limit must be a positive integer")
-        if limit > self._max_limit:
+        if limit > configured_maximum:
             raise ValueError("Query limit exceeds the configured maximum")
         return limit
+
+
+def _configured_limit(value: int | None, fallback: int, label: str) -> int:
+    configured = fallback if value is None else value
+    if type(configured) is not int or isinstance(configured, bool) or configured < 1:
+        raise ValueError(f"Query {label} maximum must be a positive integer")
+    return configured
 
 
 def _required_text(value: object, label: str) -> str:
@@ -763,10 +840,69 @@ def _optional_reference_text(reference: Mapping[str, object], field: str) -> str
     return value
 
 
-def _object_sequence(value: object) -> tuple[Mapping[str, object], ...]:
+def _object_sequence(value: object) -> Iterable[Mapping[str, object]]:
     if not isinstance(value, (list, tuple)):
         return ()
-    return tuple(item for item in value if isinstance(item, Mapping))
+    return (item for item in value if isinstance(item, Mapping))
+
+
+class _InspectionBudget:
+    """Bound projection memory; evidence budget is shared by all nested owners."""
+
+    def __init__(self, node_limit: int, evidence_limit: int) -> None:
+        self.node_limit = node_limit
+        self.remaining_evidence = evidence_limit
+        self.remaining_capabilities = node_limit
+        self.reasons: set[str] = set()
+
+    def select(
+        self,
+        items: Iterable[Mapping[str, object]],
+        limit: int,
+        reason: str,
+        *,
+        order_field: str = "id",
+    ) -> tuple[Mapping[str, object], ...]:
+        rows = nsmallest(
+            limit + 1,
+            items,
+            key=lambda item: (
+                str(item.get(order_field, "")).zfill(20)
+                if order_field == "order"
+                else str(item.get(order_field, "")),
+                str(item.get("id", "")),
+            ),
+        )
+        if len(rows) > limit:
+            self.reasons.add(reason)
+        return tuple(rows[:limit])
+
+    def project(self, item: Mapping[str, object]) -> dict[str, object]:
+        result = dict(item)
+        if "evidence" in result:
+            evidence = self.select(
+                _object_sequence(result["evidence"]),
+                self.remaining_evidence,
+                "max_evidence",
+            )
+            self.remaining_evidence -= len(evidence)
+            result["evidence"] = [dict(value) for value in evidence]
+        for field, limit, reason in (
+            ("aliases", self.node_limit, "max_nodes:aliases"),
+            (
+                "uses_capabilities",
+                self.remaining_capabilities,
+                "max_nodes:capability_references",
+            ),
+        ):
+            values = result.get(field)
+            if isinstance(values, (list, tuple)):
+                if len(values) > limit:
+                    self.reasons.add(reason)
+                result[field] = list(values[:limit])
+                if field == "uses_capabilities":
+                    self.remaining_capabilities -= min(len(values), limit)
+        return result
 
 
 def _inspection_evidence(

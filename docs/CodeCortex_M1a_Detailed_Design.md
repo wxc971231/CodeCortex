@@ -603,11 +603,43 @@ candidate_nodes: []
 candidate_edges: []
 candidate_flows: []
 candidate_mappings: []
+# reinitialize 或对已有 M0 对象修改时必须显式提供；首次纯 add 报告可省略
+change_operations:
+  - kind: update_node
+    target_id: behavior.answer-question
+    before_revision: 3
+    change_kind: update
+    change_group: refresh-answering
 evidence: []
 uncertainties: []
 unmapped_regions: []
 diagnostics: []
 ```
+
+`change_operations` 是唯一的差异意图。`kind` 使用
+`add_node/update_node/remove_node`、`add_edge/update_edge/remove_edge`、
+`set_logical_flow/remove_logical_flow`、
+`add_mapping/update_mapping/remove_mapping`。非删除操作的 after value 必须由
+同一报告内同 stable ID 的 candidate 提供；每个 candidate 必须恰好被一个
+operation 引用。`remove_logical_flow` 由 Core 确定性转换为
+`set_logical_flow(null)`。
+
+`before_revision=null` 只表示目标必须不存在；update/remove 必须携带当前
+对象的正整数 revision。Core 在 pending Proposal 写入前与 apply 时各核验一次，
+且 Proposal `base_graph_revision` 覆盖整个图坐标。因此未出现在 candidate 或
+operation 中的已有对象保持不变；绝不从“全局报告中未出现”推断删除。
+
+`change_kind` 是 `add/update/remove/move/merge/split/conflict` 之一，
+`change_group` 是组合原语的稳定小写 slug。它们是审计/展示分类，不是隐式
+图操作：move 必须列出实际 edge/mapping 更新，merge 必须至少列出
+一个 `remove_node` 和一个保留/重连原语，split 必须至少列出一个
+`add_node` 和一个更新/重连原语；conflict 只能标注报告已提出的具体
+解决原语。无完整原语的合并、拆分或冲突必须留在 `uncertainties`，不得
+伪装成可 apply 操作。
+
+向后兼容只限于 `cognition_initialized=false` 的首次初始化：此时可省略
+`change_operations`，Core 会将所有 candidate 解释为 add-only。已初始化图的
+AnalysisReport 省略该字段必须 fail closed。
 
 报告不保存到独立 analysis database，也没有 analysis lifecycle。Main 收到后立即调用 `create_cognitive_proposal`；Proposal 成为唯一临时工作状态。
 
@@ -628,6 +660,13 @@ $codecortex init
 → 用户批准 current patch_digest
 → apply 产生当前 revision + 1 和 cognition baseline
 ```
+
+Main 的普通认知查询仍必须执行 M1b Fact Preflight。首次初始化是唯一例外：
+`repository_facts` 与 `analysis_scope` 可以在
+`cognition_initialized=false` 时继续，但仍必须通过既有 QueryService
+CacheGuard；因此只有 `sync_repository_facts(mode="full")` 已准备好与当前
+revision 一致的 facts 和 cognitive replica 后才能读取。跳过 Fact Sync、
+cache 缺失/损坏/错 revision，或调用其他 M1b/认知入口时一律 fail closed。
 
 Analyzer 顺序：项目文档/入口 → package/module 分区 → 分区职责行为 → 跨区依赖 → 关键 Capability → 全局汇总。初始化优先生成 L0/L1 和关键 L2，不为每个函数制造 Capability。
 
@@ -650,7 +689,10 @@ set_logical_flow
 add_mapping / update_mapping / remove_mapping
 ```
 
-每个操作按稳定 ID 寻址，包含 before precondition 和 after value。删除节点必须显式处理相关 edge、flow、mapping，Core 不执行不可见级联。
+每个操作按稳定 ID 寻址。AnalysisReport 的 `before_revision` 在转换时被保留为
+Proposal operation 的 `expected_revision`（新增对象为 `absent`）并进入 canonical
+patch digest；after value 来自显式 candidate。删除节点必须显式处理相关
+edge、flow、mapping，Core 不执行不可见级联。
 
 完整 Proposal 包含：base revision、AnalysisReport source digest、细粒度 source preconditions、operations、结构化 before/after summary、affected nodes、evidence、uncertainties、revision log 和 canonical patch digest。
 

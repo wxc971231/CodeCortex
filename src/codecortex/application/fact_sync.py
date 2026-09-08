@@ -38,6 +38,7 @@ from codecortex.infrastructure.python.parser import (
     parse_python_file,
 )
 from codecortex.infrastructure.repository import Repository
+from codecortex.telemetry import span, traced
 
 SyncMode = Literal["auto", "full"]
 
@@ -92,6 +93,7 @@ class FactSyncService:
         source_config: SourceConfig | None = None,
         digest_profile: DigestProfile | None = None,
         managed_source_set_version: int = 1,
+        lock_timeout_seconds: float = 10,
         max_retries: int = 3,
         parse_file: Callable[[SourceFileDigest, Sequence[EntityIdentityHint]], ParsedFile] = parse_python_file,
     ) -> None:
@@ -99,6 +101,11 @@ class FactSyncService:
             raise ValueError("Managed source set version must be a positive integer")
         if type(max_retries) is not int or max_retries < 0:
             raise ValueError("Fact Sync max retries must be a non-negative integer")
+        if (
+            type(lock_timeout_seconds) not in (int, float)
+            or lock_timeout_seconds < 0
+        ):
+            raise ValueError("Fact Sync lock timeout must be non-negative")
         self.repository = repository
         self.database = database or FactsDatabase(
             repository.root / ".codecortex" / ".cache" / "facts.sqlite3"
@@ -108,15 +115,34 @@ class FactSyncService:
         self.source_config = SourceConfig() if source_config is None else source_config
         self.digest_profile = DigestProfile() if digest_profile is None else digest_profile
         self.managed_source_set_version = managed_source_set_version
+        self.lock_timeout_seconds = lock_timeout_seconds
         self.max_retries = max_retries
         self._parse_file = parse_file
 
-    def sync(self, mode: SyncMode = "auto") -> FactSyncResult:
+    @traced("fact_sync", result=lambda value: {
+        "repository_source_digest": value.repository_source_digest,
+        "graph_revision": value.graph_revision, "index_generation": value.index_generation,
+        "parsed_files": value.parsed_files, "added_files": value.added_files,
+        "changed_files": value.changed_files, "deleted_files": value.deleted_files,
+        "retry_count": value.retry_count, "rebuilt": value.rebuilt,
+        "diagnostic_count": len(value.diagnostics),
+    })
+    def sync(
+        self,
+        mode: SyncMode = "auto",
+        *,
+        identity_hints: Sequence[EntityIdentityHint] = (),
+    ) -> FactSyncResult:
         """Synchronize facts, retrying if source content changes during parsing."""
         if mode not in ("auto", "full"):
             raise ValueError("Fact Sync mode must be 'auto' or 'full'")
+        if any(not isinstance(hint, EntityIdentityHint) for hint in identity_hints):
+            raise TypeError("Fact Sync identity hints must be EntityIdentityHint records")
 
         for retry_count in range(self.max_retries + 1):
+            if retry_count:
+                with span("fact_sync.retry", level="DEBUG") as metrics:
+                    metrics["retry_count"] = retry_count
             snapshot = self._source_snapshot()
             cache = self._cache_metadata_or_none()
             current_digests = self._cache_digests_or_empty(cache)
@@ -127,9 +153,12 @@ class FactSyncService:
                 snapshot,
                 current_digests,
                 full_rebuild=full_rebuild,
+                identity_hints=identity_hints,
             )
 
-            with self.repository_lock.acquire("exclusive", 10):
+            with self.repository_lock.acquire(
+                "exclusive", self.lock_timeout_seconds
+            ):
                 verified = self._source_snapshot()
                 if not self._same_snapshot(snapshot, verified):
                     if retry_count == self.max_retries:
@@ -154,6 +183,14 @@ class FactSyncService:
                 changed_paths, deleted_paths, counts = self._changes(
                     verified, current_digests, full_rebuild=full_rebuild
                 )
+                parsed_paths = {item.source.source.relative_path for item in parsed}
+                if not set(changed_paths) <= parsed_paths:
+                    # Another writer may have changed facts even if live source
+                    # returned to our original snapshot (A -> B -> A). Every
+                    # newly required path must be parsed before publishing A.
+                    if retry_count == self.max_retries:
+                        raise FactSyncError("Fact cache changed repeatedly during incremental sync")
+                    continue
                 if not full_rebuild and not changed_paths and not deleted_paths:
                     assert cache is not None
                     return FactSyncResult(
@@ -173,10 +210,15 @@ class FactSyncService:
                     metadata = self._metadata(
                         verified, graph_revision, cache, facts_changed=not self._same_fact_input(cache, verified)
                     )
-                    self._replace_with_full_snapshot(parsed, metadata, verified.diagnostics)
+                    self._replace_with_full_snapshot(
+                        parsed,
+                        metadata,
+                        verified.diagnostics,
+                        checkpoint_existing=cache is not None,
+                    )
                 else:
-                    # The first parse set was derived from the verified snapshot;
-                    # it is safe only because the digest check above succeeded.
+                    # Both the source snapshot and required parse coverage were
+                    # verified against the cache coordinate under this lock.
                     selected = tuple(
                         item
                         for item in parsed
@@ -205,6 +247,13 @@ class FactSyncService:
                 )
         raise AssertionError("Fact Sync retry loop unexpectedly exhausted")
 
+    def probe_source_digest(self) -> str:
+        """Hash the live managed source set without reading or writing cache state."""
+        return self._source_snapshot().repository_source_digest
+
+    @traced("fact_sync.snapshot", level="DEBUG", result=lambda value: {
+        "file_count": len(value.files), "repository_source_digest": value.repository_source_digest,
+    })
     def _source_snapshot(self) -> _SourceSnapshot:
         discovered = discover_python_source_set(self.repository, self.source_config)
         files: list[SourceFileDigest] = []
@@ -230,24 +279,33 @@ class FactSyncService:
             diagnostics=tuple(diagnostics),
         )
 
+    @traced("fact_sync.parse", level="DEBUG", result=lambda value: {"parsed_files": len(value[0])})
     def _parse_required_files(
         self,
         snapshot: _SourceSnapshot,
         current_digests: dict[str, str],
         *,
         full_rebuild: bool,
+        identity_hints: Sequence[EntityIdentityHint],
     ) -> tuple[tuple[ParsedFile, ...], tuple[str, ...], dict[str, int]]:
         changed_paths, deleted_paths, counts = self._changes(
             snapshot, current_digests, full_rebuild=full_rebuild
         )
-        try:
-            hints = (
-                self.database.identity_hints((*changed_paths, *deleted_paths))
-                if self.database.path.exists()
-                else ()
+        if full_rebuild and identity_hints:
+            hints = tuple(
+                hint
+                for hint in identity_hints
+                if hint.relative_path in set(changed_paths)
             )
-        except (OSError, sqlite3.DatabaseError):
-            hints = ()
+        else:
+            try:
+                hints = (
+                    self.database.identity_hints((*changed_paths, *deleted_paths))
+                    if self.database.path.exists()
+                    else ()
+                )
+            except (OSError, sqlite3.DatabaseError):
+                hints = ()
         hints_by_path: dict[str, list[EntityIdentityHint]] = {}
         for hint in hints:
             hints_by_path.setdefault(hint.relative_path, []).append(hint)
@@ -364,11 +422,14 @@ class FactSyncService:
             built_at=_utc_now(),
         )
 
+    @traced("fact_sync.replace", level="DEBUG")
     def _replace_with_full_snapshot(
         self,
         parsed: Sequence[ParsedFile],
         metadata: CacheMetadata,
         diagnostics: Sequence[SourceDiagnostic],
+        *,
+        checkpoint_existing: bool,
     ) -> None:
         path = self.database.path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -381,20 +442,31 @@ class FactSyncService:
                 metadata=metadata,
                 global_diagnostics=_global_diagnostics(diagnostics),
             )
+            if checkpoint_existing:
+                staging.copy_baseline_entity_snapshots_from(self.database)
             if not staging.integrity_ok() or staging.cache_metadata() != metadata:
                 raise FactSyncError("Full fact-cache replacement failed validation")
-            with staging.open_write() as connection:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(f"{path}{suffix}")
-                if sidecar.exists():
-                    sidecar.unlink()
+            self._checkpoint_cache(staging, "Staging")
+            if checkpoint_existing:
+                self._checkpoint_cache(self.database, "Existing")
             os.replace(staging_path, path)
+            for suffix in ("-wal", "-shm"):
+                Path(f"{path}{suffix}").unlink(missing_ok=True)
             _fsync_directory(path.parent)
         finally:
             for candidate in (staging_path, Path(f"{staging_path}-wal"), Path(f"{staging_path}-shm")):
                 if candidate.exists():
                     candidate.unlink()
+
+    @staticmethod
+    def _checkpoint_cache(database: FactsDatabase, label: str) -> None:
+        """Merge and close one healthy WAL coordinate before replacement."""
+        with database.open_write() as connection:
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+        if checkpoint is None or checkpoint[0] != 0:
+            raise FactSyncError(f"{label} fact-cache checkpoint remained busy")
 
     def _graph_revision(self) -> int:
         if self.formal_store is None:

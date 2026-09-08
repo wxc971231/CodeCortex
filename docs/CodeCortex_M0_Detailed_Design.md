@@ -126,6 +126,12 @@ tool_timeout_sec = 120
 approval_mode = "prompt"
 ```
 
+`prompt` 是安装器唯一写入的值：展示 Proposal 后，Main 用精确 `proposal_id` 和
+`patch_digest` 调用 apply，由 Codex host 审批。用户无需在对话中重复输入 ID 或
+摘要。用户选择 Codex 自己的 “approve for me” 或 Guardian review 时，host 可以
+自动处理同一个审批；CodeCortex 不提供绕过 host review 的安装开关。Core 始终校验
+Proposal、摘要和前置条件。
+
 Analyzer profile 写在自定义 Agent 配置中，不作为 Main 默认可见的第二套服务，避免 Main 混淆工具来源。
 
 `install-codex` 不修改认证文件，不打印 Codex config 中的 secret 值。
@@ -206,7 +212,7 @@ Analyzer profile 到此结束。
 | `create_cognitive_proposal(input)` | 校验并保存 pending Proposal |
 | `revise_cognitive_proposal(proposal_id, revision)` | 产生新 patch digest，旧批准失效 |
 | `cognitive_proposal(proposal_id)` | 分页/有界读取当前 Proposal |
-| `apply_cognitive_proposal(proposal_id, approval_record)` | 原子提交并返回 Event ID、graph revision |
+| `apply_cognitive_proposal(proposal_id, patch_digest)` | 原生 host 工具确认后原子提交；MCP 生成绑定的 audit approval，并返回 Event ID、graph revision |
 
 M1a/M1b 增加的工具在各自文档定义。profile 工具列表使用测试锁定，防止写工具意外出现在 Analyzer。
 
@@ -346,16 +352,16 @@ M0 的最小 Proposal 只验证技术链路，即使 graph revision 变为 1，�
 
 ### 14.3 真实 Codex E2E
 
-在临时 Git 仓库运行独立 Child Codex。单轮场景使用 `codex exec --ephemeral --json`；需要第二轮批准的场景不能使用 `--ephemeral`，而是在测试专用临时 Codex home 中运行 `codex exec --json`、记录 thread ID，完成 resume 后清理整个测试 home。自动化专用隔离配置把 `apply_cognitive_proposal` 的 host `approval_mode` 设为 `approve`，因为非交互执行无法弹出新的 host approval；产品默认配置仍为 `prompt`：
+在临时 Git 仓库运行独立 Child Codex。单轮场景使用 `codex exec --ephemeral --json`；需要第二轮批准的场景不能使用 `--ephemeral`，而是在测试专用临时 Codex home 中运行 `codex exec --json`、记录 thread ID，完成 resume 后清理整个测试 home。非交互验收只在隔离测试 home 中让 host 自动处理审批；产品安装配置始终为 `prompt`：
 
 1. `$codecortex status` 能调用 Main MCP；
 2. Main 能派生 Analyzer；
 3. Analyzer 能读 overview，不能写；
-4. 未给用户批准时 graph revision 保持不变；
-5. 第一轮未给 CodeCortex 对话级用户批准时不 apply；用 `codex exec resume` 在第二轮提供明确批准后，Main 生成 `approval_record` 并 apply 成功；
+4. 默认 `prompt` 安装中，host 拒绝原生工具确认时 graph revision 保持不变；
+5. 测试专用 `approve` 配置中，Main 以精确 Proposal ID/digest 调用 apply 后，MCP 生成 `approval_record` 并 apply 成功；
 6. 禁用/破坏 CodeCortex MCP 后普通 Codex 任务仍能完成。
 
-测试配置中的 host `approve` 只消除非交互环境无法展示弹窗这一技术障碍，不跳过 CodeCortex 自己的对话级批准和 Core `approval_record` 校验，也不得复制到产品安装配置。M0 发布前另用默认 `prompt` 配置完成一次人工 VS Code 验收。
+测试 home 的 host 自动审批只消除非交互环境无法展示交互审批这一技术障碍，不得复制到默认产品安装配置。它不绕过 Core 的精确 ID/digest、revision、源码前置条件和 audit `approval_record` 校验。M0 发布前另用默认 `prompt` 配置完成一次人工 VS Code 验收；若该会话由 Guardian review 处理，不得将其描述成 CodeCortex 提供的人类确认按钮。
 
 ## 15. M0 完成条件
 

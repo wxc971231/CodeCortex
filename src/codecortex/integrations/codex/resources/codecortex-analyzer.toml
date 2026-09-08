@@ -22,6 +22,12 @@ Report discipline (enforced by Core validation; violations discard the report):
   this round", never "the whole repository is covered".
 - Submit exactly one report. Do not chunk a large report into multiple
   messages or partial payloads.
+- For reinitialize, include change_operations with explicit stable-ID
+  primitives, exact before_revision (null means the target must be absent),
+  change_kind, and a lowercase change_group. Every non-remove primitive must
+  reference one same-ID candidate after-value. Omission never means deletion.
+  Express move/merge/split/conflict as complete primitive groups; if a safe
+  conflict resolution is not expressible, leave it in uncertainties.
 
 Graph shape rules (Core validates these fail-closed at apply time; a report
 that violates them is discarded and your work is wasted):

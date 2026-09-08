@@ -38,6 +38,9 @@ class FactSyncPort(Protocol):
     def sync(self, mode: Literal["auto", "full"] = "auto") -> FactSyncResult:
         """Return the committed cache-generation result for one source snapshot."""
 
+    def probe_source_digest(self) -> str:
+        """Hash the live managed source set without mutating cache state."""
+
 
 ViewRendererPort = Callable[[CognitiveGraph], Mapping[str, bytes]]
 """Render the deterministic view set for one committed graph revision."""
@@ -78,6 +81,11 @@ class FormalStorePort(Protocol):
         views: Mapping[str, bytes],
     ) -> None:
         """Commit one validated formal revision as a journaled transaction."""
+
+    def commit_baseline_advance(
+        self, state: FormalState, event: Mapping[str, object]
+    ) -> None:
+        """Commit a formal source-baseline advance without a graph revision change."""
 
     def recover(self) -> RecoveryResult:
         """Resolve interrupted transactions to a complete old or new revision."""

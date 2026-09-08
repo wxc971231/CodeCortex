@@ -145,7 +145,11 @@ def _config_checks(path: Path, executable: Path) -> tuple[DoctorCheck, DoctorChe
         and _approval_is_prompt(parsed)
     )
     if valid:
-        return config, _ok("CODEX_MCP_COMMAND", "The Main CodeCortex MCP registration matches this installation.")
+        return config, _ok(
+            "CODEX_MCP_COMMAND",
+            "The Main CodeCortex MCP registration matches this installation "
+            "(proposal approval mode: prompt).",
+        )
     return config, _error(
         "CODEX_MCP_COMMAND",
         "The Main CodeCortex MCP registration does not match this installation.",
@@ -192,17 +196,18 @@ def _profile_allowlist_check() -> DoctorCheck:
         "repository_overview", "cognitive_graph", "inspect_node", "history_event", "validate_graph",
         "repository_facts", "analysis_scope", "resolve_entity_context",
         "get_discussion_context", "search_cognitive_graph",
+        "cognitive_freshness", "pending_changes", "effective_query_freshness",
     }
     expected_main = {
         "initialize_repository", "create_cognitive_proposal", "revise_cognitive_proposal",
         "cognitive_proposal", "apply_cognitive_proposal", "sync_repository_facts",
-        "create_cognitive_proposal_from_analysis",
+        "create_cognitive_proposal_from_analysis", "advance_cognition_baseline",
     }
     if READ_TOOL_NAMES == expected_read and MAIN_ONLY_TOOL_NAMES == expected_main:
-        return _ok("MCP_PROFILE_ALLOWLIST", "Main and Analyzer MCP tool allowlists match the M1a contract.")
+        return _ok("MCP_PROFILE_ALLOWLIST", "Main and Analyzer MCP tool allowlists match the M1b contract.")
     return _error(
         "MCP_PROFILE_ALLOWLIST",
-        "Main and Analyzer MCP tool allowlists do not match the M1a contract.",
+        "Main and Analyzer MCP tool allowlists do not match the M1b contract.",
         "Reinstall a compatible CodeCortex version.",
     )
 

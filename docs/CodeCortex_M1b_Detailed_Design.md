@@ -158,6 +158,18 @@ unknown_source_first
 
 结果附带 matched affected nodes、unmapped changes 和依据，Main 不自行重算。
 
+### 7.3 Main 报告契约
+
+对每次显式 `$codecortex ask`、`inspect` 或 `sync`，Main 在 Preflight 后读取
+`pending_changes`，并按返回值分别报告 `changed_files` 和 `unmapped_changes`。
+前者才是 baseline 确定的 added/modified/deleted/renamed 文件；后者是无法归属的
+变化或依赖，必须保留原始 path 和 reason，不能叙述成“已修改”或“已刷新”的源码文件。
+输出截断时，Main 必须继续分页后才可声称文件清单完整。
+
+`affected_source_first` 的当前源码结论只可引用 `changed_files` 中的位置；
+`unmapped_changes` 只能作为未解决范围单独披露。`scope_confidence=partial` 或
+`unknown` 是结论边界，Main 必须明确说明，不能通过自然语言把它升级成 complete。
+
 ## 8. Semantic Cognition Sync
 
 Fact Preflight 不自动触发 Analyzer。语义同步发生在：
@@ -224,6 +236,8 @@ B. 暂不持久化，基于已有认知 + 代码事实 + 源码回答
 
 选择 B 时立即回答，不写正式认知。本次 CodeCortex 工作流中不重复询问同一 Behavior。Core 不识别 Codex thread；“已询问”由 Skill/Main 在当前对话上下文维护。
 
+已经记录的 A/B 决定先于通用 affected/unknown 路由生效：A 先执行语义同步，再按最新事实/源码回答；B 直接 source-first。只有尚未回答的选择才展示一次询问。
+
 ### 10.4 没有 Responsibility/Behavior/Capability 锚点
 
 才进入 Native Codex fallback：`rg`、目录探索、源码、配置、测试和文档。回答后可以建议未来增加认知覆盖，但不能强迫先建图。
@@ -270,6 +284,34 @@ continuation_hints: []
 
 Main 选择下一局部，不允许自动把剩余图全部拉入上下文。所有 query tools 同样有 hard limit。
 
+实现的 collection budget 对应关系（每类独立上限，跨所选 owner 累计）：
+
+| Budget | Collections |
+| --- | --- |
+| `max_nodes` | nodes、semantic edges、aliases、所有 Flow steps、所有 step capability references；Flow 数量最多为选中的 Behavior 数量 |
+| `max_entities` | implementation mapping **行数**（即使重复引用同一 entity），以及 distinct entity refs |
+| `max_evidence` | 当前保留 owner 的 evidence 总数 |
+
+SQL 在 materialize 前用 `LIMIT cap + 1` 探测溢出；anchor owner expansion 与 BFS
+也只 fetch 有界的 distinct nodes。BFS 按 edge type、neighbor stable ID 排序，
+edges 按 type/ID，steps 按 Behavior/order/ID，mappings/evidence 按 ID 排序。
+未保留的 step/edge/mapping 不会额外展开其 evidence 或 mappings。
+`include_flows=false` 不加载 Flow/steps/capability references，也不包含 step mappings
+及其 evidence；这属于请求过滤，不单独设置 truncated。缓存将 Flow 顶层 evidence
+归属到 Behavior node，因此这些 node evidence 仍保留。
+
+`truncation_reasons` 使用 budget 名或 `budget:collection`（例如
+`max_nodes:flow_steps`、`max_entities:mappings`）。`continuation_hints` 给出缩小
+node/entity anchors、提高到 configured maximum、或直接读取相关 formal graph/source
+文件的建议。兼容 `cursor`/`continuation` 仅编码有限的 omitted node anchors，不是
+可提交的分页 cursor，也不保证枚举所有 omitted nodes；child collections 没有分页端点。
+
+`inspect_node` 使用配置的 `query_max_nodes` / `query_max_entities` /
+`query_max_evidence` 按上述映射裁剪。正式文件的 snapshot 仍须完整解析以校验坐标；
+projection 采用有界选择，只有保留 mappings 才执行源码 resolution。
+所有嵌套 owner 共享 evidence allowance，顶层 `evidence` 是其有界索引副本
+（因此序列化最多包含两份该 allowance）。裁剪不修改正式 snapshot。
+
 ## 13. 回答契约
 
 Skill 要求 Main 按问题需要组织，而非机械模板；但事实性回答应能给出：
@@ -311,6 +353,8 @@ cache 缺失或不匹配时：
 
 恢复 cache 是确定性操作；此时未被正式引用的历史实体可能无法恢复，因此 ChangeSet 明确标记 `entity_diff_completeness=partial`。判断源码变化是否改变认知是之后按需执行的独立语义任务。
 
+若 revision-0 正式骨架已经存在但 cache 缺失，Main 在显式 full Fact Sync 后只重建 bootstrap replica，不重复 initialize。恢复返回前必须再次探测 live Managed Source digest；发生竞争变化时 fail closed。Analyzer 只使用不创建、不修复的只读 handles，并在打开数据库和 sidecar 前逐级拒绝符号链接、越界路径和非普通文件。`-wal` 与 `-shm` 必须成对存在；WAL-only、孤立 `-shm` 或损坏数据库都返回 `CACHE_REBUILD_REQUIRED`，由 Main 恢复，Analyzer 不得创建 SHM、checkpoint、删除或改写文件。
+
 ## 16. M1b MCP 增量
 
 两个 profile 可读：
@@ -328,6 +372,13 @@ cache 缺失或不匹配时：
 | `advance_cognition_baseline(change_set_id, reason, decision_record, approval_record?)` | 无图修改推进 baseline 并写 Event |
 
 `sync_repository_facts` 由 M1a 提供并在所有 CodeCortex 工作前调用。MCP 不提供 `ask` 工具；回答由 Main Codex 完成。
+
+第 4 节的 `cognition_initialized=true` 门槛适用于本节全部 M1b 工具及普通
+认知查询，不因 M1a 首次初始化而放宽。M1a 仅为
+`repository_facts`/`analysis_scope` 定义一个受 CacheGuard 约束的 bootstrap
+读阶段；它不允许 freshness、graph、search、context 或 discussion 路由绕过
+M1b Fact Preflight。该 bootstrap 例外在同一个 repository shared lock 内重读
+正式状态并执行实际查询；任何并发初始化完成都会使例外立即失效。
 
 `decision_record` 对 no_semantic_change 保存 decided_by、证据摘要、Analyzer/Main 来源和时间；user_accepted 额外要求与当前 digest 匹配的 approval record。
 
@@ -351,7 +402,7 @@ Native 运行忽略 CodeCortex 用户配置；CodeCortex 运行使用测试 MCP 
 
 JSONL trace 保存：MCP calls、源码/命令访问、最终回答、turn result、token usage 和耗时。日志清除认证信息和机器绝对路径。
 
-非交互验收专用 MCP 配置把 apply 的 host `approval_mode` 设为 `approve`，避免无法展示新 host prompt 导致命令直接失败；产品安装配置仍为 `prompt`。审批测试单独使用隔离的临时 Codex home，第一轮运行不带 `--ephemeral` 的 `codex exec --json` 并保存 thread ID，验证没有 CodeCortex 对话级明确批准时 graph 不变；再用 `codex exec resume <thread_id>` 发送第二轮批准，检查 Main 生成的 `approval_record` 和 Core 校验，最后清理临时 home。真实 VS Code 则使用产品默认 `prompt` 另做人工 smoke test。测试专用设置不得进入安装资源。
+非交互验收可在隔离测试 home 中由 host 自动处理审批，避免无法展示交互审批导致命令失败；产品安装始终写入 `prompt`。Main 只调用携带精确 Proposal ID/digest 的 apply，MCP 生成 `approval_record`，Core 再校验当前 patch、revision 和源码前置条件。真实 VS Code 使用产品默认 `prompt`：若用户选择 Codex 的 “approve for me” 或 Guardian review，记录宿主处理的 review，而不是宣称出现了 CodeCortex 自定义的人类确认按钮。测试专用设置不得进入默认安装资源。
 
 ## 18. Benchmark 问题集
 
@@ -381,7 +432,7 @@ JSONL trace 保存：MCP calls、源码/命令访问、最终回答、turn resul
 - 回答可理解性；
 - 输入/输出 token；
 - 首次回答延迟；
-- Analyzer 启动次数；
+- Analyzer MCP tool-call 次数（trace 没有进程启动事件时不得表述为启动次数）；
 - 不必要审批/展开提示次数。
 
 Native 与 CodeCortex 进行盲化人工抽查。产品约束是固定 Benchmark 上图外问题不出现系统性或统计显著退化，不承诺逐题必胜。
