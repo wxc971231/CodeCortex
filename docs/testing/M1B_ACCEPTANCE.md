@@ -149,11 +149,21 @@ Also perform one VS Code host-prompt smoke test using product installation:
 
 | Date | Environment | Benchmark | Blind review | VS Code host prompt | Notes |
 |---|---|---|---|---|---|
-| Not yet run | — | Not yet run (opt-in required) | Not yet run | Not yet run | Deterministic harness only; do not claim M1b completion. |
+| 2026-09-08 | VS Code product host, `approval_mode = prompt` | Not run (opt-in required) | Not run | Passed smoke: manually confirmed the native MCP card, including the create/apply flow; observed Codex “approve for me”/Guardian automatic review; checked the application Event and `codecortex validate --json` | The dedicated approval/resume benchmark remains not run. The Child Codex benchmark and blind review remain not run; this smoke record does not complete M1b. |
+
+The 2026-09-08 smoke used the product installation and confirmed the native
+MCP card through both proposal creation and application. The host approval was
+observed through Codex “approve for me”/Guardian automatic review. The emitted
+application Event and `codecortex validate --json` output were checked. This
+manual smoke does not provide evidence for the separate approval/resume
+benchmark, Child Codex benchmark, or blinded review; each remains explicitly
+unexecuted.
 
 ## Completion gate status
 
 The repository must additionally pass the full M1b deterministic suite,
 Ruff, Mypy, build, `codecortex validate --json`, the opt-in Child Codex
-benchmark, blinded review, and the VS Code host-prompt smoke test before M1b
-can be declared complete.
+benchmark, blinded review, the dedicated approval/resume benchmark, and the
+VS Code host-prompt smoke test before M1b can be declared complete. The
+host-prompt smoke test is recorded above, but the Child Codex benchmark,
+blinded review, and dedicated approval/resume benchmark remain unexecuted.
