@@ -63,7 +63,9 @@ UNEXPECTED_ERROR_EXIT = 10
 class InstallCodexCommand(Protocol):
     """Install or update the user-level Codex integration."""
 
-    def __call__(self, *, dry_run: bool, force: bool) -> int: ...
+    def __call__(
+        self, *, dry_run: bool, force: bool, approval_mode: Literal["prompt", "approve"]
+    ) -> int: ...
 
 
 class DoctorCommand(Protocol):
@@ -83,14 +85,17 @@ def _command_not_available(name: str) -> int:
     return USAGE_ERROR_EXIT
 
 
-def _install_codex_unavailable(*, dry_run: bool, force: bool) -> int:
+def _install_codex_unavailable(
+    *, dry_run: bool, force: bool, approval_mode: Literal["prompt", "approve"]
+) -> int:
     from codecortex.integrations.codex.install import install_codex
 
     executable = shutil.which("codecortex")
     if executable is None:
         return _command_not_available("install-codex")
     result = install_codex(
-        Path.home(), Path(executable), dry_run=dry_run, force=force
+        Path.home(), Path(executable), dry_run=dry_run, force=force,
+        approval_mode=approval_mode,
     )
     action = "would update" if result.dry_run else "updated"
     if not result.changed:
@@ -294,6 +299,12 @@ def build_parser() -> ArgumentParser:
     install_codex.add_argument(
         "--force", action="store_true", help="overwrite CodeCortex-managed resources"
     )
+    install_codex.add_argument(
+        "--approval-mode",
+        choices=("prompt", "approve"),
+        default="prompt",
+        help="use Codex native confirmation (prompt) or opt in to automatic host approval",
+    )
 
     doctor = commands.add_parser("doctor", help="check the local CodeCortex setup")
     doctor.add_argument("--json", action="store_true", help="print JSON results")
@@ -390,7 +401,11 @@ def _execute(
             return _validate(arguments, services_factory or _default_services)
         if arguments.command == "install-codex":
             run_install = install_codex or _install_codex_unavailable
-            return run_install(dry_run=arguments.dry_run, force=arguments.force)
+            return run_install(
+                dry_run=arguments.dry_run,
+                force=arguments.force,
+                approval_mode=arguments.approval_mode,
+            )
         if arguments.command == "doctor":
             return (doctor or _doctor_unavailable)(as_json=arguments.json)
         if arguments.command == "mcp":

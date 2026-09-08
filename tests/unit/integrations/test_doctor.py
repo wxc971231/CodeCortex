@@ -46,6 +46,24 @@ def test_doctor_reports_clean_install_without_writing(
     } == before
 
 
+def test_doctor_accepts_and_reports_opt_in_automatic_approval(
+    tmp_path: Path, codecortex_executable: Path
+) -> None:
+    install_codex(
+        tmp_path,
+        codecortex_executable,
+        dry_run=False,
+        force=False,
+        approval_mode="approve",
+    )
+
+    report = run_doctor(tmp_path, codecortex_executable, repository=None)
+
+    check = report.by_code("CODEX_MCP_COMMAND")
+    assert check.status is DoctorStatus.OK
+    assert "approval mode: approve" in check.summary
+
+
 def test_doctor_reports_actionable_mcp_mismatch(
     tmp_path: Path, codecortex_executable: Path
 ) -> None:

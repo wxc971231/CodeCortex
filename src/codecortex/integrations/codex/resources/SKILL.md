@@ -17,8 +17,13 @@ Codex coding depend on CodeCortex.
 3. Treat every formal cognition change as a discussion: create a Proposal,
    show its affected scope and current `patch_digest`, and allow the user to
    discuss or revise it.
-4. Call `apply_cognitive_proposal` only after the user explicitly approves the
-   exact current patch digest. Never infer approval from an earlier message.
+4. When you present a pending Proposal, show its affected scope and current
+   `patch_digest`, then call `apply_cognitive_proposal` with exactly that
+   `proposal_id` and `patch_digest`. The default host configuration uses
+   Codex's native MCP tool confirmation as the approval action; do not ask the
+   user to retype an ID or digest. If the user explicitly installed with
+   `codecortex install-codex --approval-mode approve`, the host auto-approves
+   that exact tool call instead. Core still rejects stale or mismatched patches.
 5. If CodeCortex is unavailable or the graph does not cover the question, use
    normal Codex source search and explain the limitation. Do not block ordinary
    work while waiting for CodeCortex.
@@ -37,7 +42,7 @@ sync_repository_facts(mode="full")
 → create_cognitive_proposal_from_analysis
 → show Big Picture + operation diff + affected scope + uncertainties
 → discuss/revise if requested
-→ apply only after explicit approval of the current patch_digest
+→ apply with the displayed proposal_id and current patch_digest through native tool confirmation
 ```
 
 The Analyzer must use its read-only profile, read only bounded fact/context
@@ -109,9 +114,11 @@ omit `change_operations` only while `cognition_initialized=false`, in which
 case Core retains the legacy add-only interpretation.
 
 The user approving analysis or an Analyzer dispatch is not Proposal approval.
-Apply only if the user explicitly approves the exact, currently displayed
-`proposal_id` and `patch_digest`; a changed/revised/stale patch needs fresh
-approval.
+After displaying the current `proposal_id` and `patch_digest`, invoke the
+apply tool with both exact values. In the default `prompt` mode Codex displays
+its native tool confirmation; that confirmation is the approval. A
+changed/revised/stale patch needs a fresh tool call and remains subject to
+Core's exact digest checks.
 
 M1a supports deterministic Python facts, bounded Analyzer reports,
 analysis-backed aggregate Proposals, source baselines, rendering/inspection,
@@ -145,8 +152,8 @@ invocation**:
 ```text
 A. Expand it now: analyze the current bounded scope, then show one aggregate
    Proposal. This authorizes analysis only; it is not approval of an unknown
-   patch. Apply only after the user explicitly approves the displayed current
-   patch_digest.
+   patch. After displaying a resulting proposal, invoke the exact-digest apply
+   tool so the host can present its native confirmation.
 B. Keep it transient: answer now from current graph coverage, indexed facts,
    and source. Create no Proposal and do not repeat this question for the same
    Behavior during this invocation.
@@ -161,7 +168,7 @@ For explicit `$codecortex sync`, use a small, complete, single-Responsibility
 scope for Main Codex analysis. Use the read-only `codecortex-analyzer` for a
 large, cross-Responsibility, unresolved, or otherwise unbounded scope. Either
 path may produce an aggregate Proposal only after analysis; semantic changes
-still require exact user approval to apply. A no-semantic-change conclusion may
+use native exact-digest tool confirmation to apply. A no-semantic-change conclusion may
 use the audited baseline-advance path described by Core.
 
 Summarize pending Proposals at most once per explicit CodeCortex invocation.

@@ -3,6 +3,7 @@
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -78,25 +79,6 @@ class ProposalRevisionInput(_Dto):
     affected_nodes: list[str] | None = Field(default=None, max_length=100)
     evidence: list[dict[str, Any]] | None = Field(default=None, max_length=500)
     uncertainties: list[Any] | None = Field(default=None, max_length=100)
-
-
-class ApprovalRecordInput(_Dto):
-    """The structured approval Main Codex derives from explicit user consent."""
-
-    proposal_id: str = Field(min_length=1, max_length=256)
-    patch_digest: str = Field(min_length=1, max_length=80)
-    approved_by: str = Field(min_length=1, max_length=64)
-    approved_at: str = Field(min_length=1, max_length=64)
-    approval_summary: str = Field(min_length=1, max_length=4_000)
-
-    def to_domain(self) -> ApprovalRecord:
-        return ApprovalRecord(
-            proposal_id=self.proposal_id,
-            patch_digest=self.patch_digest,
-            approved_by=self.approved_by,
-            approved_at=self.approved_at,
-            approval_summary=self.approval_summary,
-        )
 
 
 class RepositoryOverviewOutput(_Dto):
@@ -361,16 +343,27 @@ def cognitive_proposal(services: ApplicationServices, proposal_id: str) -> Propo
 def apply_cognitive_proposal(
     services: ApplicationServices,
     proposal_id: str,
-    approval_record: ApprovalRecordInput,
+    patch_digest: str,
 ) -> ApplyProposalOutput:
-    """Atomically apply the explicitly approved current proposal snapshot."""
-    result = services.apply_cognitive_proposal(proposal_id, approval_record.to_domain())
+    """Apply one exact patch after Codex confirms this native MCP tool call."""
+    approval = ApprovalRecord(
+        proposal_id=proposal_id,
+        patch_digest=patch_digest,
+        approved_by="user",
+        approved_at=_utc_now_rfc3339(),
+        approval_summary="Approved through Codex native tool confirmation.",
+    )
+    result = services.apply_cognitive_proposal(proposal_id, approval)
     return ApplyProposalOutput(
         event_id=result.event_id,
         graph_revision=result.graph_revision,
         applied_proposal_id=result.applied_proposal_id,
         cache_warnings=list(result.cache_warnings),
     )
+
+
+def _utc_now_rfc3339() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def advance_cognition_baseline(

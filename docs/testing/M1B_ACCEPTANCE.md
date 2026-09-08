@@ -117,12 +117,11 @@ retained in the arm's digest-bound trace artifact. Usage and latency include
 both turns; final-answer quality, route and evidence are scored from the second
 turn, while prohibited tools and state mutations cover the whole discussion.
 The separate M1b approval/resume run remains a manual acceptance
-step: use a temporary test home with host MCP approval only for the throwaway
-run, first confirm that an unapproved Proposal leaves graph revision unchanged,
-then resume the same session with the exact current proposal digest and verify
-the resulting `cognitive_proposal_applied` event and user approval record.
-Delete that test home afterward.  Product resources must remain
-`approval_mode = "prompt"`.
+step: use a temporary test home with host MCP `approval_mode = "approve"` only
+for the throwaway run, then verify that the exact-digest apply call writes the
+resulting `cognitive_proposal_applied` event and user approval record. Delete
+that test home afterward. Product resources remain `approval_mode = "prompt"`,
+where the same call uses Codex's native tool-confirmation UI.
 
 The harness exposes that proof separately; it is still paid-model opt-in and
 is not part of ordinary one-shot score results:
@@ -139,11 +138,11 @@ Also perform one VS Code host-prompt smoke test using product installation:
 
 1. In a disposable repository, run `codecortex install-codex` without test
    overrides and open it in VS Code Codex.
-2. Ask `$codecortex` to prepare one safe Proposal.  Confirm it displays scope
-   and digest but does not apply before explicit approval.
-3. Approve the exact displayed digest in the second turn.  Confirm the VS Code
-   host prompt appears, then allow it once and validate the emitted history
-   event.
+2. Ask `$codecortex` to prepare one safe Proposal. Confirm it displays scope
+   and digest, then invokes `apply_cognitive_proposal` with those exact values.
+3. Confirm the VS Code native host prompt appears, allow it once, and validate
+   the emitted history event. No follow-up message repeating the ID or digest
+   is required.
 4. Record date, Codex version, result and any host-prompt mismatch below.
 
 | Date | Environment | Benchmark | Blind review | VS Code host prompt | Notes |

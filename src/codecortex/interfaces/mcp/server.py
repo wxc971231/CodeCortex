@@ -542,10 +542,10 @@ def _register_main_tools(server: MCPServer, services: ApplicationServices) -> No
     @traced("mcp.apply_cognitive_proposal", profile="main", root=True)
     async def apply_cognitive_proposal(
         proposal_id: str,
-        approval_record: tools.ApprovalRecordInput,
+        patch_digest: str,
     ) -> tools.ApplyProposalOutput:
         try:
-            return tools.apply_cognitive_proposal(services, proposal_id, approval_record)
+            return tools.apply_cognitive_proposal(services, proposal_id, patch_digest)
         except CodeCortexError as error:
             raise tools.as_tool_error(error) from error
         except ValueError as error:

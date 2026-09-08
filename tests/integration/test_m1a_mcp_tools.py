@@ -513,3 +513,59 @@ async def test_cognitive_graph_compatibility_cap(
     assert payload["error"]["code"] == "CONTEXT_LIMIT_EXCEEDED"
     assert "search_cognitive_graph" in payload["error"]["message"]
     assert "get_discussion_context" in payload["error"]["message"]
+
+
+@pytest.mark.anyio
+async def test_apply_tool_uses_native_confirmation_with_exact_digest(m1a_repo) -> None:
+    proposal = m1a_repo.create_cognitive_proposal(
+        operations=(_add_node("behavior.native-tool-approval"),),
+        affected_nodes=("behavior.native-tool-approval",),
+        reason="Verify native MCP approval",
+    )
+    server = build_server("main", m1a_repo)
+    apply_tool = next(
+        tool for tool in await server.list_tools() if tool.name == "apply_cognitive_proposal"
+    )
+
+    assert set(apply_tool.input_schema["properties"]) == {"proposal_id", "patch_digest"}
+    assert set(apply_tool.input_schema["required"]) == {"proposal_id", "patch_digest"}
+
+    result = await server.call_tool(
+        "apply_cognitive_proposal",
+        {"proposal_id": proposal.proposal_id, "patch_digest": proposal.patch_digest},
+    )
+
+    assert result.is_error is False
+    payload = result.structured_content
+    event = m1a_repo.formal_store.read_history_event(payload["event_id"])
+    assert event["approval"] == {
+        "proposal_id": proposal.proposal_id,
+        "patch_digest": proposal.patch_digest,
+        "approved_by": "user",
+        "approved_at": event["approval"]["approved_at"],
+        "approval_summary": "Approved through Codex native tool confirmation.",
+    }
+    assert payload["applied_proposal_id"] == proposal.proposal_id
+
+
+@pytest.mark.anyio
+async def test_apply_tool_rejects_mismatched_digest_without_applying(m1a_repo) -> None:
+    proposal = m1a_repo.create_cognitive_proposal(
+        operations=(_add_node("behavior.native-tool-mismatch"),),
+        affected_nodes=("behavior.native-tool-mismatch",),
+        reason="Reject a mismatched digest",
+    )
+    server = build_server("main", m1a_repo)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool(
+            "apply_cognitive_proposal",
+            {
+                "proposal_id": proposal.proposal_id,
+                "patch_digest": "sha256:" + "0" * 64,
+            },
+        )
+
+    assert _tool_error_payload(excinfo)["error"]["code"] == "APPROVAL_MISMATCH"
+    assert m1a_repo.formal_store.load().graph.graph_revision == 1
+    assert m1a_repo.cognitive_proposal(proposal.proposal_id).patch_digest == proposal.patch_digest

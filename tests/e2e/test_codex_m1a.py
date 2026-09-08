@@ -143,8 +143,8 @@ user will approve the exact digest in a follow-up message.""",
             "--json",
             f"""The user now explicitly approves proposal {current["proposal_id"]} with
 current patch_digest {current["patch_digest"]}. Call apply_cognitive_proposal
-immediately with an approval_record using this exact proposal_id and
-patch_digest, approved_by "user", and report the result. If Core rejects the
+immediately with this exact proposal_id and patch_digest, and report the
+result. If Core rejects the
 apply (for example ANALYSIS_REPORT_INVALID), do not give up and do not repair
 the report yourself: discard the rejected proposal, delegate a fresh
 codecortex-analyzer pass that fixes every issue Core reported, submit the new

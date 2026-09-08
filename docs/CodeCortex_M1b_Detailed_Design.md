@@ -390,7 +390,7 @@ Native 运行忽略 CodeCortex 用户配置；CodeCortex 运行使用测试 MCP 
 
 JSONL trace 保存：MCP calls、源码/命令访问、最终回答、turn result、token usage 和耗时。日志清除认证信息和机器绝对路径。
 
-非交互验收专用 MCP 配置把 apply 的 host `approval_mode` 设为 `approve`，避免无法展示新 host prompt 导致命令直接失败；产品安装配置仍为 `prompt`。审批测试单独使用隔离的临时 Codex home，第一轮运行不带 `--ephemeral` 的 `codex exec --json` 并保存 thread ID，验证没有 CodeCortex 对话级明确批准时 graph 不变；再用 `codex exec resume <thread_id>` 发送第二轮批准，检查 Main 生成的 `approval_record` 和 Core 校验，最后清理临时 home。真实 VS Code 则使用产品默认 `prompt` 另做人工 smoke test。测试专用设置不得进入安装资源。
+非交互验收专用 MCP 配置可把 apply 的 host `approval_mode` 设为 `approve`，避免无法展示新 host prompt 导致命令直接失败；这是显式 opt-in，产品安装默认仍为 `prompt`。两种模式都只允许 Main 调用携带精确 Proposal ID/digest 的 apply，MCP 生成 `approval_record`，Core 再校验当前 patch、revision 和源码前置条件。真实 VS Code 使用产品默认 `prompt`，确认宿主的原生工具提示出现并允许一次；测试专用设置不得进入默认安装资源。
 
 ## 18. Benchmark 问题集
 

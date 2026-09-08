@@ -135,6 +135,7 @@ def _config_checks(path: Path, executable: Path) -> tuple[DoctorCheck, DoctorChe
     parsed = _mcp_server(document)
     config = _ok("CODEX_MCP_CONFIG", "Codex MCP configuration parsed successfully.")
     expected_command = str(executable.expanduser().resolve())
+    approval_mode = _approval_mode(parsed) if isinstance(parsed, Table) else None
     valid = (
         isinstance(parsed, Table)
         and parsed.get("command") == expected_command
@@ -142,10 +143,14 @@ def _config_checks(path: Path, executable: Path) -> tuple[DoctorCheck, DoctorChe
         and parsed.get("required") is False
         and parsed.get("startup_timeout_sec") == 10
         and parsed.get("tool_timeout_sec") == 120
-        and _approval_is_prompt(parsed)
+        and approval_mode is not None
     )
     if valid:
-        return config, _ok("CODEX_MCP_COMMAND", "The Main CodeCortex MCP registration matches this installation.")
+        return config, _ok(
+            "CODEX_MCP_COMMAND",
+            "The Main CodeCortex MCP registration matches this installation "
+            f"(proposal approval mode: {approval_mode}).",
+        )
     return config, _error(
         "CODEX_MCP_COMMAND",
         "The Main CodeCortex MCP registration does not match this installation.",
@@ -161,12 +166,13 @@ def _mcp_server(document: Any) -> Table | None:
     return server if isinstance(server, Table) else None
 
 
-def _approval_is_prompt(server: Table) -> bool:
+def _approval_mode(server: Table) -> str | None:
     tools = server.get("tools")
     if not isinstance(tools, Table):
-        return False
+        return None
     apply = tools.get("apply_cognitive_proposal")
-    return isinstance(apply, Table) and apply.get("approval_mode") == "prompt"
+    mode = apply.get("approval_mode") if isinstance(apply, Table) else None
+    return mode if mode in {"prompt", "approve"} else None
 
 
 def _writable_parents_check(home: Path) -> DoctorCheck:
