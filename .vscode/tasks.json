@@ -1,0 +1,35 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Codex Backend: OpenAI Terra",
+            "type": "shell",
+            "command": "${env:HOME}/.local/bin/codex-backend openai",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "silent",
+                "close": true
+            }
+        },
+        {
+            "label": "Codex Backend: Kimi K3 256K",
+            "type": "shell",
+            "command": "${env:HOME}/.local/bin/codex-backend kimi",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "silent",
+                "close": true
+            }
+        },
+        {
+            "label": "Codex Backend: Kimi K3 1M",
+            "type": "shell",
+            "command": "${env:HOME}/.local/bin/codex-backend kimi-1m",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "silent",
+                "close": true
+            }
+        }
+    ]
+}
