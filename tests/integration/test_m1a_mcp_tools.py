@@ -543,7 +543,7 @@ async def test_apply_tool_uses_native_confirmation_with_exact_digest(m1a_repo) -
         "patch_digest": proposal.patch_digest,
         "approved_by": "user",
         "approved_at": event["approval"]["approved_at"],
-        "approval_summary": "Approved through Codex native tool confirmation.",
+        "approval_summary": "Approved through Codex host tool approval.",
     }
     assert payload["applied_proposal_id"] == proposal.proposal_id
 

@@ -71,29 +71,6 @@ def test_dry_run_reports_changes_without_creating_user_files(
     assert not (tmp_path / ".agents").exists()
     assert not (tmp_path / ".codex").exists()
 
-
-def test_install_can_opt_in_to_automatic_host_approval(
-    tmp_path: Path, codecortex_executable: Path
-) -> None:
-    install_codex(
-        tmp_path,
-        codecortex_executable,
-        dry_run=False,
-        force=False,
-        approval_mode="approve",
-    )
-
-    config = tomlkit.parse(
-        (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
-    )
-    assert (
-        config["mcp_servers"]["codecortex"]["tools"][
-            "apply_cognitive_proposal"
-        ]["approval_mode"]
-        == "approve"
-    )
-
-
 def test_rejects_symlinked_managed_target(
     tmp_path: Path, codecortex_executable: Path
 ) -> None:

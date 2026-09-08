@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import tomlkit
 from tomlkit.items import Table
@@ -19,7 +19,6 @@ SKILL_RELATIVE = Path(".agents/skills/codecortex/SKILL.md")
 AGENT_RELATIVE = Path(".codex/agents/codecortex-analyzer.toml")
 CONFIG_RELATIVE = Path(".codex/config.toml")
 INSTALL_LOCK_RELATIVE = Path(".codex/.codecortex-install.lock")
-ApprovalMode = Literal["prompt", "approve"]
 
 
 @dataclass(frozen=True)
@@ -37,7 +36,6 @@ def install_codex(
     executable: Path,
     dry_run: bool,
     force: bool,
-    approval_mode: ApprovalMode = "prompt",
 ) -> InstallResult:
     """Install CodeCortex resources without touching unrelated Codex settings.
 
@@ -49,17 +47,16 @@ def install_codex(
     """
     root = _validated_home(home)
     resolved_executable = _validated_executable(executable)
-    _validate_approval_mode(approval_mode)
     if dry_run:
         _validate_target_paths(root, {path: b"" for path in _managed_paths(root)})
-        targets = _desired_targets(root, resolved_executable, approval_mode)
+        targets = _desired_targets(root, resolved_executable)
         changes = _changed_targets(targets)
         _require_force_for_modified_resources(changes, targets, force)
         changed_paths = _relative_paths(root, changes)
         return InstallResult(bool(changes), True, changed_paths)
     with _exclusive_install_lock(root):
         _validate_target_paths(root, {path: b"" for path in _managed_paths(root)})
-        targets = _desired_targets(root, resolved_executable, approval_mode)
+        targets = _desired_targets(root, resolved_executable)
         changes = _changed_targets(targets)
         _require_force_for_modified_resources(changes, targets, force)
         changed_paths = _relative_paths(root, changes)
@@ -79,19 +76,17 @@ def install_codex(
                     backups.append(backup.relative_to(root).as_posix())
                 _write_bytes_atomic(path, changes[path])
                 written.append(path)
-            _validate_outputs(root, targets, resolved_executable, approval_mode)
+            _validate_outputs(root, targets, resolved_executable)
         except Exception:
             _restore_previous(root, previous, written)
             raise
     return InstallResult(True, False, changed_paths, tuple(backups))
 
 
-def _desired_targets(
-    root: Path, executable: Path, approval_mode: ApprovalMode
-) -> dict[Path, bytes]:
+def _desired_targets(root: Path, executable: Path) -> dict[Path, bytes]:
     skill = _resource_bytes("SKILL.md")
     agent = _resource_bytes("codecortex-analyzer.toml")
-    config = _merged_config_bytes(root / CONFIG_RELATIVE, executable, approval_mode)
+    config = _merged_config_bytes(root / CONFIG_RELATIVE, executable)
     return {
         root / SKILL_RELATIVE: skill,
         root / AGENT_RELATIVE: agent,
@@ -123,9 +118,7 @@ def _resource_bytes(name: str) -> bytes:
     return resources.files(RESOURCE_PACKAGE).joinpath(name).read_bytes()
 
 
-def _merged_config_bytes(
-    path: Path, executable: Path, approval_mode: ApprovalMode
-) -> bytes:
+def _merged_config_bytes(path: Path, executable: Path) -> bytes:
     if path.exists():
         try:
             document = tomlkit.parse(path.read_text(encoding="utf-8"))
@@ -143,7 +136,7 @@ def _merged_config_bytes(
     server["tool_timeout_sec"] = 120
     tools = tomlkit.table()
     apply = tomlkit.table()
-    apply["approval_mode"] = approval_mode
+    apply["approval_mode"] = "prompt"
     tools["apply_cognitive_proposal"] = apply
     server["tools"] = tools
     servers["codecortex"] = server
@@ -173,11 +166,6 @@ def _validated_executable(executable: Path) -> Path:
     if not candidate.exists() or not candidate.is_file():
         raise ValueError("CodeCortex executable must be an existing regular file")
     return candidate.resolve()
-
-
-def _validate_approval_mode(value: str) -> None:
-    if value not in {"prompt", "approve"}:
-        raise ValueError("Approval mode must be 'prompt' or 'approve'")
 
 
 def _validate_target_paths(root: Path, targets: Mapping[Path, bytes]) -> None:
@@ -271,7 +259,6 @@ def _validate_outputs(
     root: Path,
     targets: Mapping[Path, bytes],
     executable: Path,
-    approval_mode: ApprovalMode,
 ) -> None:
     for path, expected in targets.items():
         if not path.is_file() or path.is_symlink() or path.read_bytes() != expected:
@@ -286,7 +273,7 @@ def _validate_outputs(
         raise ValueError("Installed CodeCortex MCP configuration failed validation")
     tools = server.get("tools")
     apply = tools.get("apply_cognitive_proposal") if isinstance(tools, Table) else None
-    if not isinstance(apply, Table) or apply.get("approval_mode") != approval_mode:
+    if not isinstance(apply, Table) or apply.get("approval_mode") != "prompt":
         raise ValueError("Installed CodeCortex proposal approval mode failed validation")
     tomlkit.parse((root / AGENT_RELATIVE).read_text(encoding="utf-8"))
 

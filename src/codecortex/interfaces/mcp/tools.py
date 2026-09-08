@@ -345,13 +345,13 @@ def apply_cognitive_proposal(
     proposal_id: str,
     patch_digest: str,
 ) -> ApplyProposalOutput:
-    """Apply one exact patch after Codex confirms this native MCP tool call."""
+    """Apply one exact patch after Codex approves this native MCP tool call."""
     approval = ApprovalRecord(
         proposal_id=proposal_id,
         patch_digest=patch_digest,
         approved_by="user",
         approved_at=_utc_now_rfc3339(),
-        approval_summary="Approved through Codex native tool confirmation.",
+        approval_summary="Approved through Codex host tool approval.",
     )
     result = services.apply_cognitive_proposal(proposal_id, approval)
     return ApplyProposalOutput(

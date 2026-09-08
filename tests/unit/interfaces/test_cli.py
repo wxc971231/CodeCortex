@@ -221,23 +221,14 @@ def test_missing_command_prints_usage_and_exits_2(
 def test_install_codex_receives_flags(cli: CliHarness) -> None:
     """The injected installer receives exactly the parsed flags."""
     cli.install_codex.return_value = 0
-    assert (
-        cli.run(
-            ["install-codex", "--dry-run", "--force", "--approval-mode", "approve"]
-        )
-        == 0
-    )
-    cli.install_codex.assert_called_once_with(
-        dry_run=True, force=True, approval_mode="approve"
-    )
+    assert cli.run(["install-codex", "--dry-run", "--force"]) == 0
+    cli.install_codex.assert_called_once_with(dry_run=True, force=True)
 
 
 def test_install_codex_defaults_flags_off(cli: CliHarness) -> None:
     cli.install_codex.return_value = 0
     assert cli.run(["install-codex"]) == 0
-    cli.install_codex.assert_called_once_with(
-        dry_run=False, force=False, approval_mode="prompt"
-    )
+    cli.install_codex.assert_called_once_with(dry_run=False, force=False)
 
 
 def test_doctor_receives_json_flag(cli: CliHarness) -> None:

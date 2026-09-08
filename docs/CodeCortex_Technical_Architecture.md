@@ -147,8 +147,9 @@ Domain 不读取文件、不执行 SQL、不依赖 MCP、Codex 或 Pydantic。Ap
 - 绑定 graph revision、source digest 和细粒度源码前置条件；
 - 计算 canonical `patch_digest`；
 - 在内存应用 Patch 后完整校验；
-- 只在 Codex 原生 apply 工具确认后提交正式认知变化；MCP 从精确 Proposal ID/digest
-  生成结构化 `approval_record`，Core 再校验其绑定关系。
+- 只在 Codex host 批准原生 apply 工具后提交正式认知变化；MCP 从精确 Proposal
+  ID/digest 生成结构化 `approval_record`，Core 再校验其绑定关系。Guardian review
+  可处理 host 审批，但 CodeCortex 不提供绕过该 review 的独立模式。
 
 ### 6.5 Freshness Engine
 

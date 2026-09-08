@@ -117,11 +117,12 @@ retained in the arm's digest-bound trace artifact. Usage and latency include
 both turns; final-answer quality, route and evidence are scored from the second
 turn, while prohibited tools and state mutations cover the whole discussion.
 The separate M1b approval/resume run remains a manual acceptance
-step: use a temporary test home with host MCP `approval_mode = "approve"` only
-for the throwaway run, then verify that the exact-digest apply call writes the
-resulting `cognitive_proposal_applied` event and user approval record. Delete
-that test home afterward. Product resources remain `approval_mode = "prompt"`,
-where the same call uses Codex's native tool-confirmation UI.
+step: use a temporary test home where the host can resolve the exact-digest
+apply call noninteractively, then verify that it writes the resulting
+`cognitive_proposal_applied` event and user approval record. Delete that test
+home afterward. Product resources remain `approval_mode = "prompt"`; a real
+VS Code session may show a native request or have Guardian resolve it, based
+on the user's Codex approval setting.
 
 The harness exposes that proof separately; it is still paid-model opt-in and
 is not part of ordinary one-shot score results:
@@ -140,9 +141,10 @@ Also perform one VS Code host-prompt smoke test using product installation:
    overrides and open it in VS Code Codex.
 2. Ask `$codecortex` to prepare one safe Proposal. Confirm it displays scope
    and digest, then invokes `apply_cognitive_proposal` with those exact values.
-3. Confirm the VS Code native host prompt appears, allow it once, and validate
-   the emitted history event. No follow-up message repeating the ID or digest
-   is required.
+3. Confirm Codex resolves the native host approval, either through its request
+   or the user's “approve for me”/Guardian review behavior, then validate the
+   emitted history event. Do not claim a CodeCortex-specific approval button;
+   no follow-up message repeating the ID or digest is required.
 4. Record date, Codex version, result and any host-prompt mismatch below.
 
 | Date | Environment | Benchmark | Blind review | VS Code host prompt | Notes |

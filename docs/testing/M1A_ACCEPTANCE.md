@@ -34,13 +34,13 @@ apply), asserting real formal state (`cognition_initialized`, revision ≥ 1,
 grounded responsibility nodes). Without every opt-in condition the test is an
 explicit pytest skip; a passing result is never fabricated.
 
-Approval flow: `codex exec` runs with approval policy `never`, so the test
-home explicitly opts into auto-approving CodeCortex MCP tools at the host level
-(`auto_approve_codecortex_tools` in `tests/e2e/conftest.py`); Core's exact
-Proposal/digest and approval-record checks are unaffected. The controlled flow
-keeps two turns: turn 1 builds the proposal and stops without applying; the
-harness reads `proposal_id`/`patch_digest` from the pending-proposal record and
-turn 2 invokes apply with those exact values. If Core rejects an
+Approval flow: the isolated test home lets the Codex host resolve approval
+noninteractively (`auto_approve_codecortex_tools` in `tests/e2e/conftest.py`);
+that is test-only and does not change the installed `prompt` setting. Core's
+exact Proposal/digest and approval-record checks are unaffected. The controlled
+flow keeps two turns: turn 1 builds the proposal and stops without applying;
+the harness reads `proposal_id`/`patch_digest` from the pending-proposal record
+and turn 2 invokes apply with those exact values. If Core rejects an
 apply (e.g. ANALYSIS_REPORT_INVALID), the child must discard the candidate,
 run a fresh analyzer pass fixing the reported issues, and stop at a
 replacement proposal; the harness approves the new digest, up to 3 rounds.
